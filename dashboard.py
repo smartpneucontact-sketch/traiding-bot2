@@ -69,10 +69,15 @@ def _check_auth() -> bool:
 
 
 def _validate_model_name(model_name: str) -> bool:
-    """Validate that model_name is a known registered model."""
+    """Validate that model_name is a known registered model.
+
+    Allows underscores (combo_v1, combo_v2, etc.) — the previous
+    isalnum()-only check silently 400'd any model name with an
+    underscore, which broke manual /run triggers for the combo family.
+    """
     if not model_name or not isinstance(model_name, str):
         return False
-    if not all(c.isalnum() for c in model_name):
+    if not all(c.isalnum() or c == "_" for c in model_name):
         return False
     return model_name in pipeline.MODEL_REGISTRY
 
