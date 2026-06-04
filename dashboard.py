@@ -2512,6 +2512,7 @@ def index():
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
+    <meta charset="utf-8">
     <title>ML Trading Bot</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
@@ -4141,7 +4142,7 @@ def index():
     </script>
 </body>
 </html>"""
-    return Response(html, content_type="text/html")
+    return Response(html, content_type="text/html; charset=utf-8")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
