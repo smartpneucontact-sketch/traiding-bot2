@@ -2850,8 +2850,26 @@ def index():
     }}
 
     async function api(url) {{
-        const r = await fetch(url);
-        if (!r.ok) return null;
+        // Send the Bearer token on every internal API call. GET endpoints
+        // that don't need auth ignore the header; the /run trigger needs
+        // it. Without this, /run silently 401'd and the UI did nothing —
+        // the classic "click does nothing" bug.
+        const r = await fetch(url, {{ headers: getAuthHeader() }});
+        if (r.status === 401) {{
+            clearAuthOn401(r);
+            alert('Unauthorized — the saved auth token was rejected. Reload the page and re-enter the DASHBOARD_AUTH_TOKEN when prompted.');
+            return null;
+        }}
+        if (!r.ok) {{
+            // Surface server errors instead of swallowing them. The cron
+            // trigger sometimes 409s ("Pipeline already running"); the
+            // operator needs to see that.
+            let body = '';
+            try {{ body = await r.text(); }} catch (_) {{}}
+            console.warn(`api(${{url}}) -> HTTP ${{r.status}}`, body);
+            alert(`Request failed: HTTP ${{r.status}}${{body ? ' — ' + body.slice(0, 200) : ''}}`);
+            return null;
+        }}
         return r.json();
     }}
 
