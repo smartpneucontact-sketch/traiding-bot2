@@ -2778,6 +2778,26 @@ def index():
     const fmtN = (v, d=2) => v == null ? '-' : Number(v).toLocaleString('en-US', {{minimumFractionDigits:d, maximumFractionDigits:d}});
     const cls = v => v > 0 ? 'green' : v < 0 ? 'red' : '';
 
+    // Auth helper for state-changing endpoints. When DASHBOARD_AUTH_TOKEN
+    // is set on the server, every POST must carry `Authorization: Bearer
+    // <token>`. We prompt once and stash in localStorage so the user only
+    // types it the first time. If the server returns 401, we clear the
+    // stored token and re-prompt on the next try.
+    function getAuthHeader() {{
+        let t = localStorage.getItem('dashboard_auth_token');
+        if (!t) {{
+            t = prompt('Dashboard auth token (set DASHBOARD_AUTH_TOKEN on the server):');
+            if (t) localStorage.setItem('dashboard_auth_token', t);
+        }}
+        return t ? {{ 'Authorization': 'Bearer ' + t }} : {{}};
+    }}
+    function clearAuthOn401(resp) {{
+        if (resp && resp.status === 401) {{
+            localStorage.removeItem('dashboard_auth_token');
+        }}
+        return resp;
+    }}
+
     // ── Time formatting (always in ET) ────────────────────
     // Accepts: ISO strings, Unix seconds, Unix milliseconds, JS Date.
     function _toDate(input) {{
@@ -4036,11 +4056,15 @@ def index():
 
         statusEl.innerHTML = '<span class="spinner"></span> Testing...';
 
-        const resp = await fetch('/api/config/test-key', {{
+        const resp = clearAuthOn401(await fetch('/api/config/test-key', {{
             method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
+            headers: {{ 'Content-Type': 'application/json', ...getAuthHeader() }},
             body: JSON.stringify({{ key, secret }})
-        }});
+        }}));
+        if (resp.status === 401) {{
+            statusEl.innerHTML = '<span class="red">Unauthorized — wrong DASHBOARD_AUTH_TOKEN; reload and re-enter.</span>';
+            return;
+        }}
         const result = await resp.json();
 
         if (result.ok) {{
@@ -4078,11 +4102,15 @@ def index():
 
         $('save-status').innerHTML = '<span class="spinner"></span> Saving...';
 
-        const resp = await fetch('/api/config/models', {{
+        const resp = clearAuthOn401(await fetch('/api/config/models', {{
             method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
+            headers: {{ 'Content-Type': 'application/json', ...getAuthHeader() }},
             body: JSON.stringify({{ slots }})
-        }});
+        }}));
+        if (resp.status === 401) {{
+            $('save-status').innerHTML = '<span class="red">Unauthorized — wrong DASHBOARD_AUTH_TOKEN; reload and re-enter.</span>';
+            return;
+        }}
         const result = await resp.json();
 
         if (result.ok) {{
