@@ -1774,7 +1774,15 @@ def apiv1_model_detail(model_name):
         "last_rebalance": state.get("last_rebalance"),
         "last_run": state.get("last_run"),
         "portfolio_stop_tripped_date": state.get("portfolio_stop_tripped_date"),
+        "freeze_state": state.get("freeze_state"),
     }
+    # V6 freeze indicator — surface for the /v2 dashboard pill rendering.
+    fs = state.get("freeze_state") or {}
+    if fs.get("active"):
+        result["freeze_state"] = "frozen"
+        result["freeze_since"] = fs.get("since_iso")
+    else:
+        result["freeze_state"] = "normal"
     # Cutloss state — match the tiers from core/risk.py exactly:
     #   Tier 3 (= "tripped" when persisted): daily DD ≤ pstop × 7/3
     #   Tier 2: daily DD ≤ pstop × 5/3 (no trip flag)

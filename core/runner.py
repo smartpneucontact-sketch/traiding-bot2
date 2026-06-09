@@ -181,6 +181,53 @@ def run_single_model(
         logger.info(report.format_summary())
         return
 
+    # V6 bad-period freeze: proactively halt new entries when SPY is in a
+    # ≥12% drawdown from its 21-day peak. The reactive cutloss above fires
+    # AFTER damage; the freeze tries to avoid the damage. Backtested to
+    # improve Sharpe 1.06→1.19 and Max DD -65%→-56% on the 10-year window.
+    # Only fires for `direct_weights` strategies that have a ComboConfig
+    # with `enable_drawdown_freeze=True`. Other models are unaffected.
+    if strategy_type == "direct_weights":
+        config_obj = model_bundle.get("combo_config")
+        if config_obj is not None and getattr(config_obj, "enable_drawdown_freeze", False):
+            from core.combo_strategy import evaluate_spy_drawdown_freeze
+            prior_freeze = state.get("freeze_state")
+            was_frozen = bool((prior_freeze or {}).get("active"))
+            is_frozen, new_freeze, reason = evaluate_spy_drawdown_freeze(
+                macro_data or {}, prior_freeze, config_obj, today_iso,
+            )
+            state["freeze_state"] = new_freeze
+            report.set("freeze_state", new_freeze)
+            report.set("freeze_reason", reason)
+            if is_frozen:
+                if not was_frozen:
+                    # Just-triggered: liquidate everything via a target-empty
+                    # rebalance. The runner's existing rebalance path treats
+                    # target_symbols=[] as "sell all current positions".
+                    logger.warning(f"  [FREEZE] {mc.name}: {reason}")
+                    logger.warning("  [FREEZE] Liquidating all positions to cash.")
+                    if not dry_run and is_market_open():
+                        try:
+                            liquidation = rebalance_portfolio(
+                                target_symbols=[], rankings=[],
+                                mc=mc, journal=journal, logger=logger,
+                                report=report, dry_run=False, target_weights={},
+                            )
+                            report.set("freeze_liquidation", liquidation)
+                        except Exception as e:
+                            logger.error(f"  [FREEZE] liquidation failed: {e}")
+                            report.add_error(f"freeze liquidation failed: {e}")
+                else:
+                    logger.info(f"  [FREEZE] {mc.name}: {reason}")
+                state["last_run"] = datetime.now().isoformat()
+                save_state(state, mc)
+                logger.info(report.format_summary())
+                return
+            elif was_frozen:
+                logger.info(f"  [FREEZE] {mc.name}: UNFROZEN — {reason}")
+            else:
+                logger.info(f"  [freeze check] {reason}")
+
     if not should_rebalance(state, horizon_days=horizon, force=force):
         last = datetime.fromisoformat(state["last_rebalance"])
         days_since = (datetime.now() - last).days

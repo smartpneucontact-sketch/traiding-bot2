@@ -173,6 +173,92 @@ def _spy_drawdown_gate(macro_close: pd.DataFrame, lookback: int = 60,
     return float((dd + cash_dd) / (cash_dd - full_dd))
 
 
+# ───── V6 freeze (added 2026-06-09) ──────────────────────────────────────
+def evaluate_spy_drawdown_freeze(
+    macro_data: dict,
+    freeze_state: dict | None,
+    config: "ComboConfig",
+    today_iso: str,
+) -> tuple[bool, dict, str]:
+    """V6 "bad period" freeze — hard cut to cash when SPY drops ≥X% from
+    its trailing N-day peak. Stays frozen ≥ min_freeze_days, unfreezes
+    only when SPY recovers to within Y% of peak.
+
+    Backtest reference (combo_v2_2x_freeze_dd_v1, 10-yr 2016-04 → 2026-03):
+        mean monthly 5.22 % (+0.26 vs no-freeze baseline)
+        Sharpe       1.19  (+0.13)
+        Max DD      -55.8 % (improved 9.5 pp from -65.3 %)
+        Calmar       1.12  (+0.26)
+        Frozen-day count: 70 / 2 512 (2.8 %)
+    See /Traiding 11/REPORT.md V6 section for the grid search.
+
+    Returns (is_frozen, updated_state_dict, human-readable reason).
+    Stateless w.r.t. caller — pass in old freeze_state, get new one back.
+    """
+    state = dict(freeze_state or {
+        "active": False,
+        "since_iso": None,
+        "since_day": None,
+    })
+
+    if not getattr(config, "enable_drawdown_freeze", False):
+        return False, state, "drawdown freeze disabled in config"
+
+    spy_df = macro_data.get("SPY") if macro_data else None
+    if spy_df is None or "close" not in getattr(spy_df, "columns", []):
+        return state.get("active", False), state, "SPY data unavailable; preserving prior state"
+
+    spy = spy_df["close"].dropna()
+    lookback = getattr(config, "dd_peak_lookback", 21)
+    if len(spy) < lookback + 1:
+        return state.get("active", False), state, "SPY history too short; preserving prior state"
+
+    recent = spy.iloc[-lookback:]
+    peak = float(recent.max())
+    last = float(spy.iloc[-1])
+    dd_pct = last / peak - 1.0  # ≤ 0
+
+    freeze_dd = getattr(config, "dd_freeze_pct", 0.12)
+    unfreeze_within = getattr(config, "dd_unfreeze_within_pct", 0.08)
+    min_days = getattr(config, "dd_min_freeze_days", 14)  # calendar days ≈ 10 trading days
+
+    if not state["active"]:
+        # Currently un-frozen — check if we should freeze
+        if dd_pct <= -freeze_dd:
+            state["active"] = True
+            state["since_iso"] = today_iso
+            state["since_day"] = today_iso  # alias, kept for back-compat
+            state["peak_at_freeze"] = peak
+            return True, state, (
+                f"freeze triggered: SPY DD {dd_pct:+.2%} ≤ -{freeze_dd:.0%} "
+                f"(peak ${peak:.2f}, last ${last:.2f})"
+            )
+        return False, state, f"no freeze; SPY DD {dd_pct:+.2%} > -{freeze_dd:.0%}"
+    else:
+        # Currently frozen — check min duration + unfreeze threshold
+        try:
+            from datetime import date
+            since = date.fromisoformat(state.get("since_iso", today_iso)[:10])
+            today = date.fromisoformat(today_iso[:10])
+            calendar_days_frozen = (today - since).days
+        except Exception:
+            calendar_days_frozen = 0
+        if calendar_days_frozen < min_days:
+            return True, state, (
+                f"freeze locked: {calendar_days_frozen}d / {min_days}d min "
+                f"(SPY DD {dd_pct:+.2%})"
+            )
+        if dd_pct >= -unfreeze_within:
+            state["active"] = False
+            state["since_iso"] = None
+            state["since_day"] = None
+            return False, state, (
+                f"unfreeze: SPY DD {dd_pct:+.2%} within unfreeze threshold "
+                f"-{unfreeze_within:.0%}"
+            )
+        return True, state, f"freeze active: SPY DD {dd_pct:+.2%}, awaiting recovery to -{unfreeze_within:.0%}"
+
+
 # ───── Config ────────────────────────────────────────────────────────────
 @dataclass
 class ComboConfig:
@@ -190,10 +276,19 @@ class ComboConfig:
     adaptive_neutral_leverage: float = 1.0
     adaptive_stress_leverage: float = 0.5
 
-    # SPY drawdown gate
+    # SPY drawdown gate (soft, in-strategy)
     spy_dd_lookback: int = 60
     spy_full_dd: float = 0.08
     spy_cash_dd: float = 0.18
+
+    # V6 "bad period" freeze (hard cut to cash, runner-level)
+    # Tuned via grid search on 10-yr backtest. See /Traiding 11/REPORT.md V6.
+    # Parameters match combo_v2_2x_freeze_dd_v1 (the return-max variant).
+    enable_drawdown_freeze: bool = True
+    dd_freeze_pct: float = 0.12          # freeze when SPY drops ≥ 12% from peak
+    dd_peak_lookback: int = 21           # over trailing 21 trading days
+    dd_unfreeze_within_pct: float = 0.08 # unfreeze when SPY within 8% of peak
+    dd_min_freeze_days: int = 14         # calendar days ≈ 10 trading days
 
     # Cap on pre-leverage gross exposure
     max_gross_exposure: float = 1.0
