@@ -13,11 +13,32 @@ ratchet up coupling for no real safety win.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # avoid circular import at runtime
     from pipeline import ModelConfig
+
+
+# Serialises read-modify-write windows on the state file between the 60s
+# cutloss scanner and the daily pipeline (both run in the dashboard
+# process). Lives here so both core.risk and core.runner can share it
+# without an import cycle.
+state_lock = threading.Lock()
+
+# Keys owned by the cutloss scanner. The pipeline holds its loaded state
+# dict across a multi-minute rebalance; before saving it must re-read the
+# disk copy and adopt these keys, or a stop that fired mid-rebalance gets
+# erased (trip flag, cool-down, sold-today ledger, peaks, daily anchor).
+SCANNER_OWNED_KEYS = (
+    "peak_prices",
+    "daily_portfolio_start",
+    "daily_portfolio_start_date",
+    "portfolio_stop_tripped_date",
+    "reentry_cooldown_until",
+    "cutloss_sold_today",
+)
 
 
 def load_state(mc: "ModelConfig") -> dict:
@@ -33,10 +54,29 @@ def load_state(mc: "ModelConfig") -> dict:
 
 
 def save_state(state: dict, mc: "ModelConfig") -> None:
-    """Save pipeline state to JSON for a specific model. Atomic write would
-    be nicer but a partial-write on this small file is recoverable."""
+    """Save pipeline state to JSON for a specific model."""
     mc.state_path.parent.mkdir(parents=True, exist_ok=True)
     mc.state_path.write_text(json.dumps(state, indent=2, default=str))
+
+
+def merge_scanner_state(state: dict, mc: "ModelConfig") -> dict:
+    """Adopt the scanner-owned keys from the on-disk state into `state`.
+
+    Call (under `state_lock`) right before the pipeline saves a state dict
+    it has held across a long-running rebalance. If a Tier-3 portfolio
+    stop tripped while the pipeline was working, also honor the scanner's
+    last_rebalance=None so the post-cool-down re-entry still happens.
+    """
+    disk = load_state(mc)
+    for key in SCANNER_OWNED_KEYS:
+        if key in disk:
+            state[key] = disk[key]
+        else:
+            state.pop(key, None)
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    if disk.get("portfolio_stop_tripped_date") == today_iso:
+        state["last_rebalance"] = disk.get("last_rebalance")
+    return state
 
 
 def trading_days_between(start: datetime, end: datetime) -> int:

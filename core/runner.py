@@ -34,21 +34,29 @@ from core.inference import predict_rankings
 from core.journal import TradeJournal
 from core.logging_setup import setup_logging
 from core.market import is_market_open
-from core.orders import fetch_inactive_assets, rebalance_portfolio
+from core.orders import (
+    fetch_inactive_assets, liquidate_all_positions, rebalance_portfolio,
+)
 from core.portfolio import (
     compute_live_regime_score, conviction_weights,
     load_sector_map_for_pipeline, regime_to_exposure,
     sector_neutral_weights,
 )
 from core.run_report import RunReport
-from core.state import load_state, save_state, should_rebalance
+from core.state import (
+    load_state, merge_scanner_state, save_state, should_rebalance, state_lock,
+)
 from core.universe import EXCLUDED_SYMBOLS, get_tradeable_symbols
 
 
 # Default config. Equivalent to the legacy pipeline-level constants. Callers
 # can override per-run via kwargs.
 DEFAULT_TOP_N = 20
-DEFAULT_HORIZON = 5
+# 21 trading days (~monthly) — the cadence all three combo_v2 sleeves were
+# backtested at (strategies.py rebal_freq=21 in the research repo). The
+# previous 5-day setting ran the strategy 4.2x faster than anything the
+# champion numbers were computed on.
+DEFAULT_HORIZON = 21
 # 365 days (was 300) so combo_v1's 12-month momentum lookback has full
 # history with margin. v4/v6/v8/v9 only need 252 + some buffer; the extra
 # 65 days adds negligible download cost.
@@ -101,6 +109,20 @@ def load_model_bundle(model_path) -> dict:
 
     with open(model_path, "rb") as fh:
         return _PipelineUnpickler(fh).load()
+
+
+def _save_state_merged(state: dict, mc: ModelConfig) -> None:
+    """Persist pipeline state without clobbering scanner-owned keys.
+
+    The pipeline holds its state dict across a multi-minute run while the
+    60s cutloss scanner (same process) keeps writing the trip flag, peaks,
+    cool-down and sold-today ledger. A blind save here would erase a stop
+    that fired mid-run — re-opening the same-day-rebuy cascade. Re-read
+    the disk copy under the shared lock and adopt the scanner's keys.
+    """
+    with state_lock:
+        merge_scanner_state(state, mc)
+        save_state(state, mc)
 
 
 def run_single_model(
@@ -160,7 +182,8 @@ def run_single_model(
     report.end_step("load_model")
 
     # -- Step 2: Check state ------------------------------------------------
-    state = load_state(mc)
+    with state_lock:
+        state = load_state(mc)
     logger.info(
         f"\n  State: run #{state.get('run_count', 0) + 1}, "
         f"last rebalance: {state.get('last_rebalance', 'never')}"
@@ -177,7 +200,7 @@ def run_single_model(
             f"earlier today ({today_iso}). Staying in cash until next session."
         )
         state["last_run"] = datetime.now().isoformat()
-        save_state(state, mc)
+        _save_state_merged(state, mc)
         logger.info(report.format_summary())
         return
 
@@ -201,32 +224,88 @@ def run_single_model(
             report.set("freeze_reason", reason)
             if is_frozen:
                 if not was_frozen:
-                    # Just-triggered: liquidate everything via a target-empty
-                    # rebalance. The runner's existing rebalance path treats
-                    # target_symbols=[] as "sell all current positions".
                     logger.warning(f"  [FREEZE] {mc.name}: {reason}")
                     logger.warning("  [FREEZE] Liquidating all positions to cash.")
-                    if not dry_run and is_market_open():
-                        try:
-                            liquidation = rebalance_portfolio(
-                                target_symbols=[], rankings=[],
-                                mc=mc, journal=journal, logger=logger,
-                                report=report, dry_run=False, target_weights={},
-                            )
-                            report.set("freeze_liquidation", liquidation)
-                        except Exception as e:
-                            logger.error(f"  [FREEZE] liquidation failed: {e}")
-                            report.add_error(f"freeze liquidation failed: {e}")
                 else:
                     logger.info(f"  [FREEZE] {mc.name}: {reason}")
+                # Liquidate on EVERY frozen run, not just the trigger run —
+                # idempotent (no positions → no orders) and self-healing if
+                # an earlier liquidation partially failed or the freeze
+                # triggered while the market was closed. The previous code
+                # called rebalance_portfolio(target_symbols=[]), which
+                # aborts on an empty target list — a frozen bot silently
+                # kept its full levered book.
+                if not dry_run and is_market_open():
+                    try:
+                        liquidation = liquidate_all_positions(
+                            mc, journal, logger, report,
+                            reason="freeze_liquidation",
+                        )
+                        report.set("freeze_liquidation", liquidation)
+                        if liquidation["n_closed"] or liquidation["n_failed"]:
+                            logger.warning(
+                                f"  [FREEZE] liquidation: "
+                                f"{liquidation['n_closed']} closed, "
+                                f"{liquidation['n_failed']} failed"
+                            )
+                    except Exception as e:
+                        logger.error(f"  [FREEZE] liquidation failed: {e}")
+                        report.add_error(f"freeze liquidation failed: {e}")
+                elif not dry_run:
+                    logger.warning(
+                        "  [FREEZE] Market closed — liquidation deferred to "
+                        "the next run during market hours."
+                    )
                 state["last_run"] = datetime.now().isoformat()
-                save_state(state, mc)
+                _save_state_merged(state, mc)
                 logger.info(report.format_summary())
                 return
             elif was_frozen:
                 logger.info(f"  [FREEZE] {mc.name}: UNFROZEN — {reason}")
+                # The freeze liquidated the book; without this the 21-day
+                # horizon (counted from the PRE-freeze rebalance) would
+                # leave the bot 100% cash for up to ~2 more weeks. The
+                # freeze's own min_freeze_days already served as the
+                # cool-down — re-enter on this run.
+                state["last_rebalance"] = None
             else:
                 logger.info(f"  [freeze check] {reason}")
+
+    # Tier-3 re-entry cool-down: after a full portfolio-stop liquidation the
+    # scanner schedules re-entry `cutloss_reentry_delay_days` trading days
+    # out (core/risk.py). Re-buying the whole book at the very next session
+    # was how 2026-06-05's liquidation became 2026-06-09's stop cascade.
+    # Checked AFTER the freeze block so a frozen book still gets its
+    # liquidation retries during the cool-down. `force=True` (manual /run)
+    # overrides — the operator's deliberate escape hatch.
+    cooldown_until = state.get("reentry_cooldown_until")
+    if cooldown_until and today_iso <= str(cooldown_until) and not force:
+        logger.warning(
+            f"  Skipping rebalance — re-entry cool-down after portfolio stop "
+            f"active through {cooldown_until}."
+        )
+        state["last_run"] = datetime.now().isoformat()
+        _save_state_merged(state, mc)
+        logger.info(report.format_summary())
+        return
+    if cooldown_until:
+        state.pop("reentry_cooldown_until", None)
+        # Write the removal through to disk now — the merged save at the
+        # end of the run would otherwise re-adopt the stale key from the
+        # disk copy. Guarded so a NEW cool-down set by a scanner re-trip
+        # mid-run is never deleted.
+        with state_lock:
+            disk = load_state(mc)
+            if disk.get("reentry_cooldown_until") == cooldown_until:
+                disk.pop("reentry_cooldown_until", None)
+                save_state(disk, mc)
+        if force and today_iso <= str(cooldown_until):
+            logger.warning(
+                f"  FORCE OVERRIDE: re-entry cool-down (through {cooldown_until}) "
+                f"cleared by manual force run."
+            )
+        else:
+            logger.info(f"  Re-entry cool-down expired ({cooldown_until}); resuming.")
 
     if not should_rebalance(state, horizon_days=horizon, force=force):
         last = datetime.fromisoformat(state["last_rebalance"])
@@ -237,7 +316,7 @@ def run_single_model(
             f"next in {days_until}d"
         )
         state["last_run"] = datetime.now().isoformat()
-        save_state(state, mc)
+        _save_state_merged(state, mc)
         logger.info(report.format_summary())
         return
 
@@ -332,11 +411,23 @@ def run_single_model(
             logger.info(f"    ... and {len(sorted_syms) - 8} more")
         report.set("direct_weights", {sym: round(w, 6) for sym, w in target_weights.items()})
 
+        # Surface the strategy's internal regime gating instead of the old
+        # hard-coded regime_exposure=1.0, which hid the actual risk posture
+        # from the dashboard. ComboStrategy publishes its gate values via
+        # `last_diagnostics` after compute_weights().
+        diagnostics = getattr(model, "last_diagnostics", None) or {}
+        if diagnostics:
+            regime_exposure = float(diagnostics.get("exposure_multiplier", 1.0))
+            report.set("strategy_diagnostics", diagnostics)
+            logger.info(
+                f"  Regime gates: spy={diagnostics.get('spy_gate')}, "
+                f"book={diagnostics.get('book_gate')}, "
+                f"applied exposure multiplier={regime_exposure:.2f}"
+            )
+
         # Skip the prediction-quality filters and jump straight to rebalance.
         # (The rest of the function uses `rankings`, `target_symbols`,
-        #  `target_weights` exactly as the rank path does. regime_exposure
-        #  stays at 1.0 — direct-weights strategies handle regime gating
-        #  internally, see combo_strategy._spy_drawdown_gate.)
+        #  `target_weights` exactly as the rank path does.)
 
     else:
         rankings = predict_rankings(
@@ -531,10 +622,31 @@ def run_single_model(
         report.add_warning("Rebalance skipped: market closed")
         result: dict = {"dry_run": False, "skipped_market_closed": True}
     else:
-        result = rebalance_portfolio(
-            target_symbols, rankings, mc, journal, logger, report,
-            dry_run=dry_run, target_weights=target_weights,
-        )
+        # The scanner may have tripped the portfolio stop while this run
+        # was computing (data download + weights can take minutes). The
+        # snapshot loaded in Step 2 is stale by now — re-check the disk
+        # flags before placing a full book of orders into a liquidation.
+        tripped_mid_run = False
+        if not dry_run:
+            with state_lock:
+                fresh = load_state(mc)
+            fresh_cooldown = fresh.get("reentry_cooldown_until")
+            if (fresh.get("portfolio_stop_tripped_date") == today_iso
+                    or (fresh_cooldown and today_iso <= str(fresh_cooldown)
+                        and not force)):
+                tripped_mid_run = True
+        if tripped_mid_run:
+            logger.warning(
+                "  Skipping order submission — portfolio stop tripped while "
+                "this run was computing. Staying in cash."
+            )
+            report.add_warning("Rebalance skipped: portfolio stop tripped mid-run")
+            result = {"dry_run": False, "skipped_portfolio_stop": True}
+        else:
+            result = rebalance_portfolio(
+                target_symbols, rankings, mc, journal, logger, report,
+                dry_run=dry_run, target_weights=target_weights,
+            )
 
     # -- Save state ---------------------------------------------------------
     # Only update last_rebalance if a rebalance actually happened. Skipping
@@ -543,7 +655,9 @@ def run_single_model(
     # next opportunity by making should_rebalance() think it just rebalanced.
     rebalanced = not (
         dry_run
-        or (isinstance(result, dict) and result.get("skipped_market_closed"))
+        or (isinstance(result, dict) and (
+            result.get("skipped_market_closed")
+            or result.get("skipped_portfolio_stop")))
     )
     if rebalanced:
         state["last_rebalance"] = datetime.now().isoformat()
@@ -563,7 +677,13 @@ def run_single_model(
     # (performance API, dashboards) don't misinterpret weights as
     # alpha predictions.
     if strategy_type == "direct_weights":
-        history_entry["weights"] = {s: round(p, 6) for s, p in rankings[:top_n]}
+        # Full book, not [:top_n] — for direct_weights the book IS the
+        # ranking, and redistribution reads this dict to size/select
+        # replacements; truncating to 20 of a 40+ name book starved it.
+        history_entry["weights"] = {s: round(p, 6) for s, p in rankings}
+        diagnostics = getattr(model, "last_diagnostics", None) or {}
+        if diagnostics:
+            history_entry["strategy_diagnostics"] = diagnostics
     else:
         history_entry["predictions"] = {s: round(p, 4) for s, p in rankings[:top_n]}
     if target_weights is not None:
@@ -573,7 +693,7 @@ def run_single_model(
         }
     state["history"].append(history_entry)
     state["history"] = state["history"][-100:]
-    save_state(state, mc)
+    _save_state_merged(state, mc)
 
     summary = report.format_summary()
     logger.info(summary)

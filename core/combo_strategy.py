@@ -153,7 +153,17 @@ def _adaptive_voltarget_momentum_weights(
     return {sym: float(w * lev) for sym, w in base_w.items()}
 
 
-# ───── Risk overlay ──────────────────────────────────────────────────────
+# ───── Risk overlays ─────────────────────────────────────────────────────
+def _linear_dd_ramp(dd: float, full_dd: float, cash_dd: float) -> float:
+    """Map a drawdown (≤ 0) to an exposure multiplier in [0, 1]:
+    1 above -full_dd, 0 below -cash_dd, linear in between."""
+    if dd >= -full_dd:
+        return 1.0
+    if dd <= -cash_dd:
+        return 0.0
+    return float((dd + cash_dd) / (cash_dd - full_dd))
+
+
 def _spy_drawdown_gate(macro_close: pd.DataFrame, lookback: int = 60,
                        full_dd: float = 0.08, cash_dd: float = 0.18) -> float:
     """Exposure multiplier in [0, 1]. ≥18% SPY drawdown → 0 (cash);
@@ -166,11 +176,34 @@ def _spy_drawdown_gate(macro_close: pd.DataFrame, lookback: int = 60,
         return 1.0
     rolling_high = spy.iloc[-lookback:].max()
     dd = float(spy.iloc[-1] / rolling_high - 1.0)
-    if dd >= -full_dd:
-        return 1.0
-    if dd <= -cash_dd:
-        return 0.0
-    return float((dd + cash_dd) / (cash_dd - full_dd))
+    return _linear_dd_ramp(dd, full_dd, cash_dd)
+
+
+def _book_drawdown(stock_px: pd.DataFrame, weights: dict[str, float],
+                   lookback: int = 60) -> float | None:
+    """Weighted average drawdown of the book's own names from their
+    trailing `lookback`-day close highs. Returns None if uncomputable.
+
+    SPY-keyed gates are blind to sector crashes: in June 2026 SPY drew
+    down 3% while this book fell ~20%. The book's own drawdown sees what
+    the index can't.
+    """
+    if not weights or stock_px.empty or len(stock_px) < 2:
+        return None
+    syms = [s for s in weights if s in stock_px.columns]
+    if not syms:
+        return None
+    window = stock_px[syms].iloc[-lookback:]
+    last = window.iloc[-1]
+    high = window.max()
+    dd = (last / high - 1.0).replace([np.inf, -np.inf], np.nan).dropna()
+    if dd.empty:
+        return None
+    w = pd.Series({s: abs(weights[s]) for s in dd.index})
+    total = float(w.sum())
+    if total <= 0:
+        return None
+    return float((dd * w).sum() / total)
 
 
 # ───── V6 freeze (added 2026-06-09) ──────────────────────────────────────
@@ -276,10 +309,25 @@ class ComboConfig:
     adaptive_neutral_leverage: float = 1.0
     adaptive_stress_leverage: float = 0.5
 
-    # SPY drawdown gate (soft, in-strategy)
+    # SPY drawdown gate (soft, in-strategy). Disabled in the 2026-06
+    # calibration: stacked on the book gate it costs 0.40pp/mo for only
+    # 0.16pp of extra MaxDD protection — broad crashes show up in the
+    # book's own drawdown anyway, sector crashes ONLY there.
+    enable_spy_dd_gate: bool = False
     spy_dd_lookback: int = 60
     spy_full_dd: float = 0.08
     spy_cash_dd: float = 0.18
+
+    # Book drawdown gate (soft, in-strategy) — keyed to the weighted
+    # drawdown of the book's OWN names from their 60-day highs, because
+    # SPY-keyed gates cannot see a sector crash (June 2026: SPY -3%,
+    # book -20%). 12%→30% backtested 2016-2026: 4.72%/mo, Sharpe 1.16,
+    # MaxDD -47.2% vs baseline 4.96%/mo / -65.3%
+    # (validation/BOOK_GATE_REPORT.md in the research repo).
+    enable_book_dd_gate: bool = True
+    book_dd_lookback: int = 60
+    book_full_dd: float = 0.12
+    book_cash_dd: float = 0.30
 
     # V6 "bad period" freeze (hard cut to cash, runner-level)
     # Tuned via grid search on 10-yr backtest. See /Traiding 11/REPORT.md V6.
@@ -314,6 +362,10 @@ class ComboStrategy:
 
     def __init__(self, config: ComboConfig | None = None):
         self.config = config or ComboConfig()
+        # Filled by compute_weights(); read by the runner for honest
+        # regime_exposure reporting. Plain instance attribute, so bundles
+        # pickled before this field existed simply start empty.
+        self.last_diagnostics: dict = {}
 
     def compute_weights(
         self,
@@ -348,13 +400,40 @@ class ComboStrategy:
                 combined[sym] = combined.get(sym, 0.0) + sleeve_weight * w
 
         if not combined:
+            self.last_diagnostics = {}
             return {}
 
-        # SPY drawdown gate
-        exposure = _spy_drawdown_gate(
-            macro_px, lookback=c.spy_dd_lookback,
-            full_dd=c.spy_full_dd, cash_dd=c.spy_cash_dd,
-        )
+        gross_pre_gate = sum(abs(w) for w in combined.values())
+
+        # SPY drawdown gate — getattr default True so pre-2026-06 pickled
+        # configs (which lack the flag but were built to use the gate)
+        # keep their original behavior.
+        if getattr(c, "enable_spy_dd_gate", True):
+            spy_gate = _spy_drawdown_gate(
+                macro_px, lookback=c.spy_dd_lookback,
+                full_dd=c.spy_full_dd, cash_dd=c.spy_cash_dd,
+            )
+        else:
+            spy_gate = 1.0
+
+        # Book drawdown gate — getattr-guarded so pre-2026-06 pickled
+        # configs (which lack these fields) still load and behave as before.
+        book_gate = None
+        book_dd = None
+        if getattr(c, "enable_book_dd_gate", False):
+            book_dd = _book_drawdown(
+                stock_px, combined,
+                lookback=getattr(c, "book_dd_lookback", 60),
+            )
+            if book_dd is not None:
+                book_gate = _linear_dd_ramp(
+                    book_dd,
+                    getattr(c, "book_full_dd", 0.15),
+                    getattr(c, "book_cash_dd", 0.30),
+                )
+
+        # Apply the most defensive gate.
+        exposure = spy_gate if book_gate is None else min(spy_gate, book_gate)
         combined = {sym: w * exposure for sym, w in combined.items()}
 
         # Gross-exposure cap (pre-leverage)
@@ -366,6 +445,19 @@ class ComboStrategy:
         # Dust filter
         combined = {sym: w for sym, w in combined.items()
                     if abs(w) >= c.min_position_weight}
+
+        # Published for the runner: real regime posture for the dashboard
+        # (regime_exposure used to be hard-coded to 1.0 for direct-weights
+        # strategies, which hid all of this).
+        self.last_diagnostics = {
+            "spy_gate": round(spy_gate, 4),
+            "book_gate": round(book_gate, 4) if book_gate is not None else None,
+            "book_drawdown": round(book_dd, 4) if book_dd is not None else None,
+            "exposure_multiplier": round(exposure, 4),
+            "gross_pre_gate": round(gross_pre_gate, 4),
+            "gross_final": round(sum(abs(w) for w in combined.values()), 4),
+            "n_positions": len(combined),
+        }
         return combined
 
     def predict(self, X):

@@ -7,6 +7,13 @@ Three stop layers, applied in order per slot every 60s:
        Tier 1 (DD ≤ pstop):       scale to 60% gross exposure
        Tier 2 (DD ≤ pstop·5/3):   scale to 30%
        Tier 3 (DD ≤ pstop·7/3):   liquidate to 0% + trip flag
+     `pstop` is the configured `cutloss_portfolio_stop` scaled by
+     `target_leverage` (unless `cutloss_scale_by_leverage=False`), so the
+     thresholds keep their *underlying-move* meaning at any leverage —
+     a -3% configured stop trips at -6% levered equity on a 2x book.
+     After Tier 3, re-entry waits `cutloss_reentry_delay_days` trading
+     days (the 2026-06-05 cascade re-bought the full book the very next
+     morning and was stopped out again the day after).
 
   2. Per-position **hard stop**: sell if down `cutloss_hard_stop`%
      from average entry price.
@@ -15,21 +22,24 @@ Three stop layers, applied in order per slot every 60s:
      from the position's peak price since entry.
 
 After hard/trailing stops fire, `_redistribute_after_cutloss` replaces
-sold positions with the model's next-best picks. The "topup" pattern
+sold positions with the model's next-best picks, sized from the actual
+stop-sale proceeds and capped at each name's own target weight (the
+2026-06-10 incident put 30% of equity into one stock because sizing
+used the account's whole cash pile / a shrinking divisor). Names already
+stopped out today are never re-bought the same day. The "topup" pattern
 (adding freed cash pro-rata to surviving positions, which caused the
-2026-05-01 / 2026-05-07 redistribute death spirals) is deliberately
-removed — leftover cash now sits as cash until the next scheduled
-rebalance.
+2026-05-01 / 2026-05-07 redistribute death spirals) remains removed —
+leftover cash sits as cash until the next scheduled rebalance.
 
-State (peak prices, daily anchor, trip flag) is persisted per-slot in
-`mc.state_path` so it survives Railway redeploys.
+State (peak prices, daily anchor, trip flag, today's stop-sales,
+re-entry cool-down) is persisted per-slot in `mc.state_path` so it
+survives Railway redeploys.
 """
 
 from __future__ import annotations
 
-import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from core.alpaca import _to_alpaca_symbol, alpaca_request
@@ -38,15 +48,52 @@ from core.journal import TradeJournal, TradeRecord
 from core.logging_setup import get_cutloss_logger
 from core.market import is_market_open
 from core.orders import poll_order_status
-from core.state import load_state, save_state
+from core.state import load_state, save_state, state_lock
 
 if TYPE_CHECKING:
     from core.config import ModelConfig
 
 
-# A single lock serialises read-modify-write windows inside cutloss_scan
-# so back-to-back scheduler ticks don't race on the same state file.
-_cutloss_state_lock = threading.Lock()
+# A single lock serialises read-modify-write windows on the state file —
+# shared with the daily pipeline via core.state so a 9:35 ET rebalance
+# can't clobber scanner-written keys. The old name is kept because
+# pipeline.py re-exports it.
+_cutloss_state_lock = state_lock
+
+
+def _effective_portfolio_stop(mc: "ModelConfig") -> float | None:
+    """Tier-1 threshold on *levered* equity drawdown, in negative percent.
+    None means the portfolio stop is disabled.
+
+    The configured `cutloss_portfolio_stop` is expressed as an underlying
+    market move (the v7-era tuning assumed a ~1x book). On a levered book
+    the same underlying move produces `leverage`× the equity drawdown, so
+    the equity-space threshold is scaled by `target_leverage` unless the
+    slot opts out via `cutloss_scale_by_leverage=False`.
+
+    Sign-safe: a positive configured value is treated as its negative (a
+    positive threshold would otherwise liquidate on every scan); 0/None
+    disables the tiers.
+    """
+    raw = getattr(mc, "cutloss_portfolio_stop", None)
+    if not raw:
+        return None
+    pstop = -abs(float(raw))
+    if getattr(mc, "cutloss_scale_by_leverage", True):
+        pstop *= max(1.0, float(getattr(mc, "target_leverage", 1.0) or 1.0))
+    return pstop
+
+
+def _add_trading_days(start_iso: str, n: int) -> str:
+    """ISO date `n` Mon–Fri days after `start_iso` (holidays not subtracted,
+    matching core.state.trading_days_between — overshooting is harmless)."""
+    d = date.fromisoformat(start_iso[:10])
+    added = 0
+    while added < n:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            added += 1
+    return d.isoformat()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -92,7 +139,21 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
         state = load_state(mc)
 
         # Trip-flag short-circuit: portfolio_stop already fired today.
+        # Don't return blindly — if the Tier-3 liquidation partially
+        # failed (per-position close errors are swallowed), the leftovers
+        # would otherwise sit unprotected all session with every stop
+        # layer disabled. Retry until flat.
         if state.get("portfolio_stop_tripped_date") == today_iso:
+            try:
+                leftovers = alpaca_request("GET", "v2/positions", mc, logger=logger)
+            except Exception:
+                return
+            if leftovers:
+                logger.warning(
+                    f"[CUTLOSS] {mc.name}: Tier-3 tripped today but "
+                    f"{len(leftovers)} positions remain — retrying liquidation."
+                )
+                _liquidate_all(mc, leftovers, "portfolio_stop", logger)
             return
 
         try:
@@ -127,22 +188,34 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
         start_equity = state.get("daily_portfolio_start", last_equity)
 
         # ── Portfolio-level soft tiered scaler ───────────────────────
-        if start_equity > 0 and current_equity > 0:
+        # None disables the tiers; e.g. -4.0 configured → -8.0 effective
+        # on a 2x book.
+        pstop = _effective_portfolio_stop(mc)
+        if pstop is not None and start_equity > 0 and current_equity > 0:
             daily_drawdown_pct = (current_equity / start_equity - 1) * 100
-            pstop = float(mc.cutloss_portfolio_stop)  # negative, e.g. -3.0
 
             if daily_drawdown_pct <= pstop * (7.0 / 3.0):
                 # Tier 3 — hard liquidation, preserves original behavior.
                 logger.warning(
                     f"[CUTLOSS] {mc.name}: PORTFOLIO STOP TIER 3! "
                     f"Daily drawdown: {daily_drawdown_pct:.2f}% <= "
-                    f"{pstop * 7.0 / 3.0:.2f}%. "
+                    f"{pstop * 7.0 / 3.0:.2f}% "
+                    f"(configured {mc.cutloss_portfolio_stop}% × leverage). "
                     f"Liquidating ALL {n_positions} positions "
                     f"(equity=${current_equity:,.2f})."
                 )
                 state["portfolio_stop_tripped_date"] = today_iso
                 state["peak_prices"] = {}
                 state["last_rebalance"] = None
+                # Re-entry cool-down: wiping last_rebalance alone forced a
+                # full re-levered rebuy at the very next session's cron
+                # (2026-06-05 → 06-08 → stopped out again 06-09). The
+                # runner now waits this many trading days before
+                # rebuilding the book.
+                reentry_days = int(getattr(mc, "cutloss_reentry_delay_days", 2))
+                state["reentry_cooldown_until"] = _add_trading_days(
+                    today_iso, reentry_days
+                )
                 save_state(state, mc)
                 _liquidate_all(mc, positions, "portfolio_stop", logger)
                 logger.warning(
@@ -181,6 +254,13 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
                 )
 
         # ── Per-position hard + trailing stops ───────────────────────
+        # None (or 0) disables a stop. The 2026-06 calibration ships both
+        # disabled: every trailing value tested on the 10-yr backtest cost
+        # 0.6-2.3pp/mo, and hard stops were dominated by the portfolio
+        # tiers (validation/STOP_GRID_REPORT.md).
+        hard_stop = mc.cutloss_hard_stop or None
+        trailing_stop = mc.cutloss_trailing_stop or None
+
         peak_prices = state.setdefault("peak_prices", {})
         held_symbols = {p["symbol"] for p in positions}
         # Prune peaks for positions no longer held.
@@ -208,35 +288,59 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
 
             # Hard stop: down X% from entry
             pct_from_entry = (current_price / avg_entry - 1) * 100
-            if pct_from_entry <= mc.cutloss_hard_stop:
+            if hard_stop is not None and pct_from_entry <= hard_stop:
                 logger.warning(
                     f"[CUTLOSS] {mc.name}: HARD STOP on {sym}! "
-                    f"{pct_from_entry:.2f}% from entry (threshold: {mc.cutloss_hard_stop}%)"
+                    f"{pct_from_entry:.2f}% from entry (threshold: {hard_stop}%)"
                 )
                 symbols_to_sell.append((sym, qty, "hard_stop", pct_from_entry))
                 continue
 
             # Trailing stop: down X% from peak
             pct_from_peak = (current_price / current_peak - 1) * 100
-            if pct_from_peak <= mc.cutloss_trailing_stop:
+            if trailing_stop is not None and pct_from_peak <= trailing_stop:
                 logger.warning(
                     f"[CUTLOSS] {mc.name}: TRAILING STOP on {sym}! "
                     f"{pct_from_peak:.2f}% from peak ${current_peak:.2f} "
-                    f"(threshold: {mc.cutloss_trailing_stop}%)"
+                    f"(threshold: {trailing_stop}%)"
                 )
                 symbols_to_sell.append((sym, qty, "trailing_stop", pct_from_peak))
                 continue
 
-        # Execute the sells
+        # Execute the sells. When the fill poll can't resolve a price
+        # (rate-limited bursts during exactly the sessions where stops
+        # batch), fall back to the position's last market value so the
+        # redistribution budget isn't silently zeroed.
+        mv_estimate = {p["symbol"]: float(p.get("market_value", 0) or 0)
+                       for p in positions}
         sold_symbols: list[str] = []
+        sold_proceeds = 0.0
         for sym, qty, reason, pct in symbols_to_sell:
             try:
-                _execute_cutloss_sell(mc, sym, qty, reason, pct, logger)
+                notional = _execute_cutloss_sell(mc, sym, qty, reason, pct, logger)
+                if notional <= 0 and mv_estimate.get(sym, 0) > 0:
+                    notional = mv_estimate[sym]
+                    logger.warning(
+                        f"[CUTLOSS] {mc.name}: {sym} fill unknown — using "
+                        f"market-value estimate ${notional:,.2f} for proceeds"
+                    )
+                sold_proceeds += notional
                 sold_symbols.append(sym)
                 if peak_prices.pop(sym, None) is not None:
                     state_dirty = True
             except Exception as e:
                 logger.error(f"[CUTLOSS] {mc.name}: failed to sell {sym}: {e}")
+
+        # Ledger of everything stopped out today — redistribution must never
+        # re-buy these the same day (on 2026-06-09 seven just-stopped names
+        # were re-bought and re-stopped within two hours).
+        if sold_symbols:
+            ledger = state.get("cutloss_sold_today") or {}
+            if ledger.get("date") != today_iso:
+                ledger = {"date": today_iso, "symbols": []}
+            ledger["symbols"] = sorted(set(ledger["symbols"]) | set(sold_symbols))
+            state["cutloss_sold_today"] = ledger
+            state_dirty = True
 
         if state_dirty:
             save_state(state, mc)
@@ -250,7 +354,9 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
             f"equity=${current_equity:,.2f}"
         )
         try:
-            _redistribute_after_cutloss(mc, sold_symbols, logger, top_n=top_n)
+            _redistribute_after_cutloss(
+                mc, sold_symbols, logger, top_n=top_n, proceeds=sold_proceeds
+            )
         except Exception as e:
             logger.error(f"[CUTLOSS] {mc.name}: redistribution failed: {e}")
 
@@ -260,17 +366,28 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _redistribute_after_cutloss(mc: "ModelConfig", sold_symbols: list[str],
-                                logger, top_n: int = 20) -> None:
-    """Replace sold positions with next-best stocks from the model's latest
-    predictions.
+                                logger, top_n: int = 20,
+                                proceeds: float | None = None) -> None:
+    """Replace sold positions with the model's next-best picks, sized from
+    the actual stop-sale proceeds and capped at each name's target weight.
 
     Flow:
       1. Wait briefly for sells to settle.
-      2. Skip-guard: if drawdown is already within 1.5pp of portfolio_stop,
-         do nothing — the next 60s scan will likely liquidate anyway.
-      3. Look up the model's last predictions from state.
-      4. Pick replacement stocks (top-ranked not currently held / just sold).
-      5. Buy replacements with an equal share of freed cash.
+      2. Skip-guard: if drawdown is already within 1.5pp of the (leverage-
+         scaled) portfolio_stop, do nothing — the next 60s scan will likely
+         liquidate anyway.
+      3. Look up the model's last run from state. Direct-weights strategies
+         store their ranking under "weights"; ML rankers under
+         "predictions" — read whichever exists (the old code read only
+         "predictions", so combo_v2 always fell through to arbitrary
+         set-order picks).
+      4. Pick replacements (top-ranked, not held, not stopped out today).
+      5. Size each buy as its share of THIS scan's sale proceeds, capped at
+         the name's own target allocation (equity × weight × leverage).
+         The old sizing — (total account cash − 1% buffer) ÷ (held +
+         replacements), buying only the replacements — concentrated 30% of
+         equity into one stock on 2026-06-10 and grew per-buy size as the
+         book shrank.
       6. Any leftover cash sits as cash until the next scheduled rebalance
          (the legacy topup-into-survivors path was removed after the
          2026-05-01 / 2026-05-07 cascades).
@@ -285,19 +402,26 @@ def _redistribute_after_cutloss(mc: "ModelConfig", sold_symbols: list[str],
         return
 
     # Skip-guard — see docstring. Widened from 1.0pp to 1.5pp after the
-    # cascades showed the brake firing too late.
+    # cascades showed the brake firing too late. Uses the leverage-scaled
+    # stop so the guard and the tier scaler measure the same thing, and
+    # scales the buffer by the same factor (a fixed 1.5pp would be only
+    # 0.75pp of underlying move at 2x — half the intended brake).
+    pstop_eff = _effective_portfolio_stop(mc)
     try:
         current_eq = float(account.get("equity", 0))
         last_eq = float(account.get("last_equity", 0))
     except (TypeError, ValueError):
         current_eq = last_eq = 0
-    if current_eq > 0 and last_eq > 0:
+    if pstop_eff is not None and current_eq > 0 and last_eq > 0:
         drawdown_pct = (current_eq / last_eq - 1) * 100
-        skip_threshold = mc.cutloss_portfolio_stop + 1.5
+        buffer_scale = (max(1.0, float(getattr(mc, "target_leverage", 1.0) or 1.0))
+                        if getattr(mc, "cutloss_scale_by_leverage", True) else 1.0)
+        buffer_pp = 1.5 * buffer_scale
+        skip_threshold = pstop_eff + buffer_pp
         if drawdown_pct <= skip_threshold:
             logger.warning(
                 f"[REDISTRIBUTE] {mc.name}: SKIPPED — daily drawdown {drawdown_pct:+.2f}% "
-                f"is within 1.5pp of portfolio_stop ({mc.cutloss_portfolio_stop:+.1f}%); "
+                f"is within {buffer_pp:.1f}pp of portfolio_stop ({pstop_eff:+.1f}% effective); "
                 f"funnelling cash into a sinking portfolio is counterproductive."
             )
             return
@@ -309,8 +433,14 @@ def _redistribute_after_cutloss(mc: "ModelConfig", sold_symbols: list[str],
     buffer = equity * 0.01  # keep 1% of equity in cash to avoid over-allocating
     available = max(0, available - buffer)
 
-    if available < 50:
-        logger.info(f"[REDISTRIBUTE] {mc.name}: only ${available:.2f} available, skipping")
+    # Deploy only what THIS scan's stop-sales freed up, never the whole
+    # cash pile (which may hold days of accumulated stop proceeds that the
+    # next scheduled rebalance owns). Fail-closed: a caller that can't
+    # attest proceeds gets a zero budget, not the cash pile.
+    budget = max(0.0, min(available, float(proceeds or 0.0)))
+
+    if budget < 50:
+        logger.info(f"[REDISTRIBUTE] {mc.name}: only ${budget:.2f} available, skipping")
         return
 
     held_symbols: set[str] = set()
@@ -319,71 +449,84 @@ def _redistribute_after_cutloss(mc: "ModelConfig", sold_symbols: list[str],
         if sym not in sold_symbols:
             held_symbols.add(sym)
 
-    n_held = len(held_symbols)
     n_to_replace = len(sold_symbols)
 
     state = load_state(mc)
     history = state.get("history", [])
+
+    # Never re-buy a name that any scan stopped out today — not just the
+    # ones from this scan.
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    ledger = state.get("cutloss_sold_today") or {}
+    stopped_today = set(ledger.get("symbols", [])) if ledger.get("date") == today_iso else set()
+    excluded = held_symbols | stopped_today | set(sold_symbols)
+
+    leverage = max(1.0, float(getattr(mc, "target_leverage", 1.0) or 1.0))
     replacements: list[tuple[str, float]] = []
+    weight_map: dict[str, float] = {}
 
     if history:
         latest = history[-1]
-        predictions = latest.get("predictions", {})
-        ranked = sorted(predictions.items(), key=lambda x: x[1], reverse=True)
-        target_syms = set(latest.get("target_symbols", []))
+        # Target sizing per name: conviction_weights are the run's actual
+        # target weights (pre-leverage fractions of equity); "weights" is
+        # the direct-weights ranking (same fractions); "predictions" are
+        # ML scores (ranking only, no sizing meaning).
+        weight_map = (latest.get("conviction_weights")
+                      or latest.get("weights") or {})
+        ranking_map = weight_map or latest.get("predictions") or {}
+        ranked = sorted(ranking_map.items(), key=lambda x: x[1], reverse=True)
 
-        sold_set = set(sold_symbols)
         for sym, score in ranked:
-            if sym in held_symbols or sym in sold_set:
+            if sym in excluded:
                 continue
-            replacements.append((sym, score))
+            replacements.append((sym, float(score)))
             if len(replacements) >= n_to_replace:
                 break
 
-        if len(replacements) < n_to_replace:
-            for sym in target_syms:
-                if sym in held_symbols or sym in sold_set:
-                    continue
-                if sym not in [r[0] for r in replacements]:
-                    replacements.append((sym, 0))
-                    if len(replacements) >= n_to_replace:
-                        break
+    if not replacements:
+        logger.info(
+            f"[REDISTRIBUTE] {mc.name}: no eligible replacement candidates "
+            f"(not held, not stopped today, present in the last run's ranking); "
+            f"${budget:.2f} stays in cash until the next rebalance."
+        )
+        return
 
-    if replacements:
-        logger.info(
-            f"[REDISTRIBUTE] {mc.name}: replacing {n_to_replace} sold position(s) "
-            f"with {len(replacements)} new: {', '.join(r[0] for r in replacements)}"
-        )
-    else:
-        logger.info(
-            f"[REDISTRIBUTE] {mc.name}: no replacement candidates found in predictions, "
-            f"distributing into {n_held} existing positions"
-        )
+    logger.info(
+        f"[REDISTRIBUTE] {mc.name}: replacing {n_to_replace} sold position(s) "
+        f"with {len(replacements)} new: {', '.join(r[0] for r in replacements)} "
+        f"(budget ${budget:.2f} from stop proceeds)"
+    )
 
     journal = TradeJournal(mc.name)
     n_bought = 0
+    deployed = 0.0
 
-    if replacements:
-        n_targets = len(replacements) + n_held
-        replacement_alloc = available / max(n_targets, 1)
+    # Equal-weight fallback cap when the run carries no weight info
+    # (legacy ML run with target_weights=None).
+    n_book = max(len(held_symbols) + n_to_replace, top_n, 1)
+    fallback_w = 1.0 / n_book
 
-        for sym, score in replacements:
-            alloc = round(replacement_alloc, 2)
-            if alloc < 10:
-                continue
-            n_bought += _place_redistribute_buy(
-                mc, sym, alloc, "replacement", score, journal, logger
-            )
+    share = budget / len(replacements)
+    for sym, score in replacements:
+        # Cap at the strategy's own target allocation for this name —
+        # redistribution must never build a bigger position than the
+        # rebalance itself would.
+        target_cap = equity * weight_map.get(sym, fallback_w) * leverage
+        alloc = round(min(share, target_cap), 2)
+        if alloc < 10:
+            continue
+        bought = _place_redistribute_buy(
+            mc, sym, alloc, "replacement", score, journal, logger
+        )
+        n_bought += bought
+        if bought:
+            deployed += alloc
 
-        used = replacement_alloc * len(replacements)
-        leftover = available - used
-    else:
-        leftover = available
+    leftover = available - deployed
 
     # NOTE: prior versions topped up surviving positions with leftover.
     # That created the redistribute death spiral. Leftover cash now sits
     # idle until the next scheduled rebalance.
-    deployed = available - leftover
     if leftover > 50:
         logger.info(
             f"[REDISTRIBUTE] {mc.name}: ${leftover:.2f} held as cash until next "
@@ -394,7 +537,7 @@ def _redistribute_after_cutloss(mc: "ModelConfig", sold_symbols: list[str],
     logger.info(
         f"[REDISTRIBUTE] {mc.name}: completed — {n_bought} buys placed, "
         f"${deployed:.2f} deployed (${leftover:.2f} held cash), "
-        f"{n_held + len(replacements)}/{top_n} target positions"
+        f"{len(held_symbols) + len(replacements)}/{top_n} target positions"
     )
 
 
@@ -464,12 +607,15 @@ def _place_redistribute_buy(mc: "ModelConfig", symbol: str, alloc: float,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _execute_cutloss_sell(mc: "ModelConfig", symbol: str, qty: float,
-                          reason: str, pct: float, logger) -> None:
+                          reason: str, pct: float, logger) -> float:
     """Execute a market sell to close a position triggered by a cut-loss rule.
 
     Uses `DELETE /v2/positions/<symbol>` which closes the entire position
     atomically — handles fractional shares cleanly and never half-fills.
     Caller owns peak-price tracking; we deliberately do not touch state here.
+
+    Returns the filled notional in dollars (0.0 if the fill is unknown) so
+    the caller can size redistribution from actual proceeds.
     """
     logger.info(
         f"[CUTLOSS] {mc.name}: SELLING {symbol} qty={qty:.2f} "
@@ -538,6 +684,7 @@ def _execute_cutloss_sell(mc: "ModelConfig", symbol: str, qty: float,
             fill_price=fill_price,
         )
         journal.log_trade(record)
+        return notional
 
     except Exception as e:
         logger.error(f"[CUTLOSS] {mc.name}: order failed for {symbol}: {e}")

@@ -4,7 +4,7 @@ The bundle is a direct-weights strategy (not an ML model). It carries:
 
   - model: ComboStrategy instance with embedded ComboConfig
   - strategy_type: "direct_weights" (selects runner's compute_weights branch)
-  - horizon: 5 (rebalance every 5 trading days)
+  - horizon: 21 (rebalance every 21 trading days — the backtested cadence)
   - feature_cols: empty (this strategy doesn't go through predict_rankings)
   - version: "combo_v2"
   - backtest_reference: the V5 backtest figures from /Traiding 11/REPORT.md
@@ -38,10 +38,23 @@ def main() -> None:
         adaptive_calm_leverage=1.5,
         adaptive_neutral_leverage=1.0,
         adaptive_stress_leverage=0.5,
-        # SPY drawdown gate (linear ramp from 8 % DD to 18 % cash)
+        # SPY soft drawdown gate DISABLED per the 2026-06 validation: with
+        # the book gate live it costs 0.40 pp/mo for 0.16 pp of extra
+        # MaxDD protection (validation/BOOK_GATE_REPORT.md). The V6 hard
+        # freeze below stays on — it was independently backtested.
+        enable_spy_dd_gate=False,
         spy_dd_lookback=60,
         spy_full_dd=0.08,
         spy_cash_dd=0.18,
+        # Book drawdown gate — keyed to the weighted DD of the book's own
+        # names from their 60-day highs; catches sector crashes the
+        # SPY-keyed gates are blind to (June 2026: SPY -3 %, book -20 %).
+        # 12 % → 30 % backtested 2016-2026: 4.72 %/mo, Sharpe 1.16,
+        # MaxDD -47.2 % (validation/BOOK_GATE_REPORT.md).
+        enable_book_dd_gate=True,
+        book_dd_lookback=60,
+        book_full_dd=0.12,
+        book_cash_dd=0.30,
         # V6 "bad period" freeze — return-max variant (combo_v2_2x_freeze_dd_v1).
         # Backtest 2016-2026: 5.22 %/mo, Sharpe 1.19, MaxDD -55.8 %, Calmar 1.12.
         # See /Traiding 11/REPORT.md V6 section for grid search + alternatives.
@@ -59,9 +72,10 @@ def main() -> None:
         "model": strategy,
         "strategy_type": "direct_weights",
         "feature_cols": [],
-        "horizon": 5,
-        "version": "combo_v2.1_freeze",
-        "tag": "Combo V2.1 — 3-sleeve blend + V6 SPY-drawdown freeze",
+        "horizon": 21,
+        "version": "combo_v2.2_riskfix",
+        "tag": "Combo V2.2 — 3-sleeve blend + V6 freeze + book-DD gate, "
+               "21d cadence (2026-06 risk-layer recalibration)",
         "combo_config": config,
         "saved_at": datetime.now(timezone.utc).isoformat(),
         # Updated backtest reference: combo_v2_2x_freeze_dd_v1 (V6 winner).
@@ -79,6 +93,21 @@ def main() -> None:
             "freeze_design": "SPY drawdown ≥ 12% from 21d peak; min 14 calendar days frozen; unfreeze within 8% of peak",
             "frozen_day_count_in_backtest": 70,
             "total_trading_days_in_backtest": 2512,
+            # 2026-06 risk-layer recalibration (validation/ in the research
+            # repo). Each overlay validated separately against the baseline;
+            # the JOINT effect of book gate + freeze + portfolio tiers was
+            # not backtested as a single configuration.
+            "risk_layer_validation": {
+                "stop_grid": "validation/STOP_GRID_REPORT.md — per-position "
+                             "stops OFF (trailing cost 0.6-2.3pp/mo at any "
+                             "threshold); portfolio tiers at -8% levered "
+                             "equity: 4.77%/mo, Sharpe 1.17, MaxDD -49.6%",
+                "book_gate": "validation/BOOK_GATE_REPORT.md — 12%→30% book-DD "
+                             "ramp: 4.72%/mo, Sharpe 1.16, MaxDD -47.2%; SPY "
+                             "soft ramp disabled (stacking cost 0.40pp/mo)",
+                "as_deployed_june_2026_config": "trailing -5/hard -8/pstop -3 "
+                             "unscaled: 1.80%/mo — destroyed the entire edge",
+            },
             "v5_baseline_no_freeze": {
                 "mean_monthly_return": 0.0496,
                 "sharpe": 1.06,

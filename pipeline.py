@@ -17,8 +17,8 @@ Daily flow (driven by the dashboard's APScheduler):
   4. Rebalance portfolio via Alpaca API (long top 20, conviction-weighted)
   5. Log full run report + structured trade journal
 
-Config: H5_LongOnly20 — 5-day horizon, long top 20, no shorts.
-Rebalances every 5 trading days.
+Config: H21_LongOnly20 — 21-trading-day horizon (matching the combo_v2
+backtest cadence), long-only, no shorts. Rebalances every 21 trading days.
 
 Multi-model: each slot has its own Alpaca account (`MODEL_<name>_ALPACA_KEY`
 / `MODEL_<name>_ALPACA_SECRET` env vars, or per-slot keys in the
@@ -47,7 +47,9 @@ import traceback
 
 # Pipeline-level config constants
 TOP_N = 20
-HORIZON = 5
+# 21 trading days (~monthly) — the cadence the combo_v2 sleeves were
+# backtested at. Was 5 (weekly), which ran 4.2x faster than validated.
+HORIZON = 21
 LOOKBACK_DAYS = 300
 
 # Path constants — used by some dashboard endpoints that build absolute paths
@@ -125,7 +127,7 @@ from core.risk import (  # noqa: E402, F401
     _cutloss_scan_model, _redistribute_after_cutloss,
     _place_redistribute_buy, _execute_cutloss_sell,
     _liquidate_all, _soft_scale_portfolio,
-    _cutloss_state_lock,
+    _cutloss_state_lock, _effective_portfolio_stop,
 )
 
 # Daily-pipeline orchestrator

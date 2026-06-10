@@ -49,15 +49,33 @@ class ModelConfig:
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
     state_path: Path = None     # auto-set if None
     enable_cutloss: bool = False
-    cutloss_hard_stop: float = -8.0
-    cutloss_trailing_stop: float = -5.0
-    cutloss_portfolio_stop: float = -3.0
+    # Stop thresholds, recalibrated 2026-06 from the 10-year combo_v2
+    # backtest grid (validation/STOP_GRID_REPORT.md in the research repo).
+    # Per-position stops are OFF (None): every trailing value tested
+    # (-8..-20%) cost 0.6-2.3pp/mo — a tight trail is inside one day's
+    # noise for momentum names (the v7-era -5% fired 528×/yr modeled,
+    # 90×/5d live) — and hard stops were dominated by the portfolio tier.
+    # None or 0 disables a per-position stop.
+    cutloss_hard_stop: float | None = None
+    cutloss_trailing_stop: float | None = None
+    # Portfolio tier base: -4.0 configured × 2x leverage = Tier 1 at -8%
+    # levered equity (scale book to 60%), Tier 2 -13.3% (→30%), Tier 3
+    # -18.7% (liquidate). Backtested 4.77%/mo, Sharpe 1.17, MaxDD -49.6%
+    # vs baseline 4.96%/mo / -65.3%; ~4 events/yr; the only grid config
+    # whose Calmar beats baseline under all intraday path assumptions.
+    cutloss_portfolio_stop: float = -4.0
+    # Scale the portfolio tiers by target_leverage so the configured value
+    # keeps its *underlying-move* meaning: -4.0 configured trips Tier 1 at
+    # -8% levered equity on a 2x book (same -4% market move either way).
+    cutloss_scale_by_leverage: bool = True
+    # Trading days to wait before rebuilding the book after a Tier-3
+    # portfolio-stop liquidation (next-morning re-entry turned the
+    # 2026-06-05 liquidation into the 2026-06-09 stop cascade).
+    cutloss_reentry_delay_days: int = 2
     # Target portfolio leverage. 1.0 = invest exactly portfolio_value (cash
     # account behavior). 2.0 = use 2× equity via Reg-T margin. Alpaca paper
     # accounts default to ~2.37x buying_power; orders will fail if the
-    # requested leverage exceeds Alpaca's available buying power. Cutloss
-    # thresholds stay in portfolio-% terms — at higher leverage a smaller
-    # market move trips Tier 1 of the soft stop.
+    # requested leverage exceeds Alpaca's available buying power.
     target_leverage: float = 1.0
 
     def __post_init__(self):
@@ -103,17 +121,29 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
                     "60-day realised vol. Macro: SPY close (for DD gate), VIX close (for "
                     "adaptive leverage percentile).",
         "portfolio": "~30-50 stock positions (overlap across the three sleeves keeps the "
-                     "count below 3 × 30). Rebalanced weekly (horizon=5d). Weights sum to "
-                     "≤100 % pre-leverage; target_leverage (default 2.0x) scales the book "
-                     "in rebalance_portfolio().",
-        "risk": "Two overlays inside the strategy:\n"
-                "  1. SPY drawdown gate: 60-day DD ≥8 % → linear ramp toward cash; "
-                "≥18 % → full cash.\n"
-                "  2. dual_momentum sleeve internally vol-targets to 15 %; adaptive "
+                     "count below 3 × 30). Rebalanced every 21 trading days (~monthly), "
+                     "matching the backtest cadence. Weights sum to ≤100 % pre-leverage; "
+                     "target_leverage (default 2.0x) scales the book in "
+                     "rebalance_portfolio().",
+        "risk": "Overlays inside the strategy (2026-06 recalibration, each "
+                "validated on the 10-yr backtest — see validation/ in the "
+                "research repo):\n"
+                "  1. Book drawdown gate: weighted DD of the book's own names "
+                "from their 60-day highs, ramp 12 % → 30 % toward cash — catches "
+                "sector crashes SPY can't see (June 2026: SPY -3 %, book -20 %). "
+                "Backtest: 4.72 %/mo, Sharpe 1.16, MaxDD -47.2 %.\n"
+                "  2. V6 SPY-drawdown freeze: hard cut to cash at SPY ≥12 % below "
+                "its 21-day peak (now actually liquidates — the old code was a "
+                "no-op). SPY soft ramp 8→18 % disabled (redundant with the book "
+                "gate, cost 0.40 pp/mo).\n"
+                "  3. dual_momentum sleeve internally vol-targets to 15 %; adaptive "
                 "sleeve auto-deleverages to 0.5x when VIX is in its top-tercile.\n"
-                "Plus the runner's cut-loss scanner if `enable_cutloss=True` "
-                "(hard -8 % / trailing -5 % / portfolio -3 % tiered).\n"
-                "Reference backtest max-drawdown: -65 % (2022 momentum reversal).",
+                "Plus the runner's cut-loss scanner if `enable_cutloss=True`: "
+                "per-position stops OFF (any trailing value cost 0.6-2.3 pp/mo in "
+                "backtest); portfolio tiers at -4 % × leverage = -8 % levered "
+                "equity at 2x (60 % / 30 % / liquidate at -8 / -13.3 / -18.7 %), "
+                "~4 events/yr, 2-trading-day re-entry cool-down after Tier 3. "
+                "Backtest: 4.77 %/mo, Sharpe 1.17, MaxDD -49.6 %.",
         "training": "No training. Pure-rule allocator. Backtest in /Traiding 11/"
                     "REPORT.md (V5 section) covers 10 years (2016-04 → 2026-03, 1040 "
                     "stocks, 5 bp/side TC, 45 strategies tested) and produced "
@@ -298,6 +328,11 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
 # Dashboard-managed config (model_config.json)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Stamp written into model_config.json once the 2026-06 stop recalibration
+# has been applied to the stored slots. Bump when thresholds are re-tuned.
+CUTLOSS_CALIBRATION_VERSION = "2026-06-riskfix-v1"
+
+
 def _default_config() -> dict:
     """Generate default config — single slot for combo_v2."""
     return {
@@ -314,14 +349,75 @@ def _default_config() -> dict:
                 "alpaca_key": "",
                 "alpaca_secret": "",
                 "enable_cutloss": True,
-                "cutloss_hard_stop": -8.0,
-                "cutloss_trailing_stop": -5.0,
-                "cutloss_portfolio_stop": -3.0,
+                "cutloss_hard_stop": None,
+                "cutloss_trailing_stop": None,
+                "cutloss_portfolio_stop": -4.0,
+                "cutloss_scale_by_leverage": True,
+                "cutloss_reentry_delay_days": 2,
                 "target_leverage": 2.0,
             },
         ],
+        "cutloss_calibration": CUTLOSS_CALIBRATION_VERSION,
         "updated_at": None,
     }
+
+
+def _migrate_cutloss_calibration(config: dict) -> dict:
+    """One-time migration of stored slot configs to the 2026-06 calibrated
+    stop thresholds.
+
+    model_config.json lives on the Railway volume and survives deploys, so
+    changing code defaults alone never reaches a live bot. Slots still
+    carrying the exact v7-era defaults (-8 / -5 / -3) — which were never
+    hand-tuned, only inherited — are moved to the recalibrated values; any
+    other values are treated as operator overrides and left alone. The new
+    behavioral keys (leverage scaling, re-entry delay) are added to every
+    slot that lacks them.
+    """
+    if config.get("cutloss_calibration") == CUTLOSS_CALIBRATION_VERSION:
+        return config
+
+    changed = False
+    for slot in config.get("slots", []):
+        if (slot.get("cutloss_hard_stop") == -8.0
+                and slot.get("cutloss_trailing_stop") == -5.0
+                and slot.get("cutloss_portfolio_stop") == -3.0):
+            slot["cutloss_hard_stop"] = None
+            slot["cutloss_trailing_stop"] = None
+            slot["cutloss_portfolio_stop"] = -4.0
+            print(f"[CONFIG MIGRATE] slot {slot.get('slot_id')}: stop "
+                  f"thresholds moved from v7-era defaults to 2026-06 "
+                  f"calibration (per-position stops OFF, portfolio -4 "
+                  f"scaled by leverage = -8% levered tiers at 2x)", flush=True)
+            changed = True
+        if "cutloss_scale_by_leverage" not in slot:
+            slot["cutloss_scale_by_leverage"] = True
+            changed = True
+        if "cutloss_reentry_delay_days" not in slot:
+            slot["cutloss_reentry_delay_days"] = 2
+            changed = True
+
+    config["cutloss_calibration"] = CUTLOSS_CALIBRATION_VERSION
+    save_model_config(config)
+    if changed:
+        print(f"[CONFIG MIGRATE] model_config.json stamped "
+              f"{CUTLOSS_CALIBRATION_VERSION}", flush=True)
+    return config
+
+
+def _parse_stop_threshold(value) -> float | None:
+    """Normalize a per-position stop threshold from the config file.
+
+    None, empty string, or 0 mean "disabled" (a 0 threshold would fire on
+    every tick that isn't strictly positive). Anything else is a float.
+    """
+    if value in (None, "", 0, 0.0):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v < 0 else None
 
 
 def load_model_config() -> dict:
@@ -339,10 +435,17 @@ def load_model_config() -> dict:
 
 
 def save_model_config(config: dict) -> None:
-    """Save slot config to the persistent JSON file. Sets `updated_at`."""
+    """Save slot config to the persistent JSON file. Sets `updated_at`.
+
+    Atomic (temp file + os.replace): a crash mid-write would otherwise
+    leave unparseable JSON, and load_model_config would then silently fall
+    back to the default config — empty keys, trading disabled.
+    """
     config["updated_at"] = datetime.now().isoformat()
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config, indent=2))
+    os.replace(tmp, CONFIG_PATH)
 
 
 def _resolve_model_path(model_name: str) -> Path:
@@ -375,7 +478,7 @@ def get_active_models() -> list[ModelConfig]:
     bot bootstraps on a fresh container before the dashboard saves
     anything.
     """
-    config = load_model_config()
+    config = _migrate_cutloss_calibration(load_model_config())
     models: list[ModelConfig] = []
     activated_via_config = False
 
@@ -405,9 +508,16 @@ def get_active_models() -> list[ModelConfig]:
                 alpaca_key=key,
                 alpaca_secret=secret,
                 enable_cutloss=slot.get("enable_cutloss", False),
-                cutloss_hard_stop=slot.get("cutloss_hard_stop", -8.0),
-                cutloss_trailing_stop=slot.get("cutloss_trailing_stop", -5.0),
-                cutloss_portfolio_stop=slot.get("cutloss_portfolio_stop", -3.0),
+                cutloss_hard_stop=_parse_stop_threshold(
+                    slot.get("cutloss_hard_stop")),
+                cutloss_trailing_stop=_parse_stop_threshold(
+                    slot.get("cutloss_trailing_stop")),
+                cutloss_portfolio_stop=float(
+                    slot.get("cutloss_portfolio_stop", -4.0) or -4.0),
+                cutloss_scale_by_leverage=bool(
+                    slot.get("cutloss_scale_by_leverage", True)),
+                cutloss_reentry_delay_days=int(
+                    slot.get("cutloss_reentry_delay_days", 2) or 2),
                 target_leverage=float(slot.get("target_leverage", 1.0) or 1.0),
             ))
 

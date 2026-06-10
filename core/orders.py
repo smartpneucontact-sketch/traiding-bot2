@@ -117,6 +117,112 @@ def poll_order_status(order_id: str, mc: "ModelConfig", logger,
         return {"status": "unknown", "id": order_id}
 
 
+def liquidate_all_positions(
+    mc: "ModelConfig",
+    journal: "TradeJournal",
+    logger,
+    report: "RunReport | None" = None,
+    reason: str = "liquidate_all",
+) -> dict:
+    """Close every open position for the slot via `DELETE /v2/positions/<sym>`.
+
+    This is the dedicated liquidation path for the V6 drawdown freeze —
+    `rebalance_portfolio(target_symbols=[])` deliberately aborts on an
+    empty target list, so callers that mean "go to cash" must use this
+    function instead. Idempotent: with no open positions it places no
+    orders and returns n_closed=0.
+
+    Returns {"n_closed": int, "n_failed": int, "closed": [sym], "failed": [sym]}.
+    """
+    run_id = f"{mc.name}_{reason}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
+    positions = get_positions(mc, logger)
+    closed: list[str] = []
+    failed: list[str] = []
+
+    if positions:
+        logger.warning(
+            f"  [LIQUIDATE] {mc.name}: closing all {len(positions)} positions "
+            f"(reason={reason})"
+        )
+
+    for sym, pos in sorted(positions.items()):
+        trade_ts = datetime.now(timezone.utc).isoformat()
+        trade = TradeRecord(
+            trade_id=f"{mc.name}_{trade_ts.replace(':', '').replace('-', '')}_{sym}_sell",
+            run_id=run_id,
+            model=mc.name,
+            timestamp=trade_ts,
+            symbol=sym,
+            side="sell",
+            action=reason,
+            order_type="market",
+            time_in_force="day",
+            notional_usd=round(pos.get("market_value", 0) or 0, 2),
+            entry_price=pos.get("avg_entry"),
+            current_price=pos.get("current_price"),
+            unrealized_pnl_usd=pos.get("unrealized_pl"),
+            unrealized_pnl_pct=pos.get("unrealized_pl_pct"),
+        )
+        try:
+            resp = alpaca_request(
+                "DELETE", f"v2/positions/{_to_alpaca_symbol(sym)}", mc, logger=logger
+            ) or {}
+            order_status = resp.get("status", "accepted")
+            trade.order_id = resp.get("id")
+            trade.order_status = order_status
+            if order_status in ("rejected", "canceled", "expired"):
+                trade.error_message = f"Order {order_status}: {resp.get('reject_reason', '')}"
+                logger.error(
+                    f"  [LIQUIDATE] {mc.name}: {sym} close {order_status}: "
+                    f"{resp.get('reject_reason', 'unknown')}"
+                )
+                failed.append(sym)
+            else:
+                if trade.order_id:
+                    try:
+                        final = poll_order_status(trade.order_id, mc, logger)
+                        trade.order_status = final.get("status", order_status)
+                        fq = final.get("filled_qty")
+                        fp = final.get("filled_avg_price")
+                        if fq and fq != "0":
+                            trade.shares = float(fq)
+                        if fp and fp != "0":
+                            trade.fill_price = float(fp)
+                    except Exception:
+                        pass
+                # The polled FINAL status decides success — an order
+                # accepted then canceled at the venue (e.g. during a halt)
+                # did not close the position.
+                if trade.order_status in ("rejected", "canceled", "expired"):
+                    trade.error_message = f"Close order {trade.order_status} after submit"
+                    logger.error(
+                        f"  [LIQUIDATE] {mc.name}: {sym} close order ended "
+                        f"{trade.order_status}"
+                    )
+                    failed.append(sym)
+                else:
+                    closed.append(sym)
+                    logger.info(f"  [LIQUIDATE] {mc.name}: closed {sym}")
+        except Exception as e:
+            trade.order_status = "failed"
+            trade.error_message = str(e)
+            logger.error(f"  [LIQUIDATE] {mc.name}: failed to close {sym}: {e}")
+            failed.append(sym)
+        journal.log_trade(trade)
+        time.sleep(0.1)
+
+    result = {
+        "n_closed": len(closed), "n_failed": len(failed),
+        "closed": closed, "failed": failed,
+    }
+    if failed:
+        logger.error(
+            f"  [LIQUIDATE] {mc.name}: {len(failed)} positions FAILED to close: "
+            f"{', '.join(failed)} — will retry on the next run."
+        )
+    return result
+
+
 def rebalance_portfolio(
     target_symbols: list[str],
     rankings: list[tuple[str, float]],
@@ -224,12 +330,16 @@ def rebalance_portfolio(
         )
         rb_data["auto_scaled_to_buying_power"] = True
         rb_data["requested_leverage"] = leverage
-        rb_data["realized_leverage"] = realized_leverage
         # Refresh the total for downstream code that reads it
         total_target_notional = sum(sym_allocations.values())
     else:
         rb_data["auto_scaled_to_buying_power"] = False
-        rb_data["realized_leverage"] = leverage
+    # Measured gross actually targeted by this rebalance, not an echo of
+    # target_leverage: weights summing below 1.0 (e.g. the adaptive sleeve
+    # in VIX-stress mode) make true gross < target_leverage.
+    rb_data["realized_leverage"] = (
+        round(total_target_notional / portfolio_value, 4) if portfolio_value else 0.0
+    )
 
     total_positions = max(len(target_set) + len(current_set), 1)
     turnover = (len(to_sell) + len(to_buy)) / total_positions

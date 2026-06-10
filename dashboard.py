@@ -1521,7 +1521,19 @@ def api_config_update():
             if model and model not in pipeline.MODEL_REGISTRY:
                 return jsonify({"error": f"Unknown model: {model}"}), 400
 
-        config["slots"] = new_slots
+        # Merge each incoming slot onto the existing slot with the same
+        # slot_id instead of replacing dicts wholesale — the Settings form
+        # only sends the fields it renders, and a wholesale replace would
+        # silently drop keys it doesn't know about (e.g. the 2026-06
+        # additions cutloss_scale_by_leverage / cutloss_reentry_delay_days),
+        # reverting operator overrides on every save.
+        existing_by_id = {s.get("slot_id"): s for s in config.get("slots", [])}
+        merged_slots = []
+        for slot in new_slots:
+            base = dict(existing_by_id.get(slot.get("slot_id"), {}))
+            base.update(slot)
+            merged_slots.append(base)
+        config["slots"] = merged_slots
         pipeline.save_model_config(config)
 
         # Re-initialize model status in dashboard
@@ -1803,9 +1815,12 @@ def apiv1_model_detail(model_name):
                                                 logger=logger)
             cur_eq = float(acct_live.get("equity", 0))
             start_eq = float(state.get("daily_portfolio_start", 0) or 0)
-            if start_eq > 0 and cur_eq > 0:
+            # Same effective (leverage-scaled) threshold the scanner uses —
+            # raw mc.cutloss_portfolio_stop here would show "tier3" at half
+            # the drawdown the scanner actually liquidates at on a 2x book.
+            pstop = pipeline._effective_portfolio_stop(mc)
+            if start_eq > 0 and cur_eq > 0 and pstop is not None:
                 dd_pct = (cur_eq / start_eq - 1.0) * 100.0
-                pstop = float(mc.cutloss_portfolio_stop)  # negative
                 if dd_pct <= pstop * (7.0 / 3.0):
                     result["cutloss_state"] = "tier3"
                 elif dd_pct <= pstop * (5.0 / 3.0):
@@ -1843,10 +1858,14 @@ def apiv1_model_detail(model_name):
     if mc:
         result["enable_cutloss"] = mc.enable_cutloss
         if mc.enable_cutloss:
+            eff_pstop = pipeline._effective_portfolio_stop(mc)
             result["cutloss_config"] = {
                 "hard_stop": mc.cutloss_hard_stop,
                 "trailing_stop": mc.cutloss_trailing_stop,
                 "portfolio_stop": mc.cutloss_portfolio_stop,
+                "scale_by_leverage": getattr(mc, "cutloss_scale_by_leverage", True),
+                "portfolio_stop_effective": eff_pstop,
+                "reentry_delay_days": getattr(mc, "cutloss_reentry_delay_days", 2),
             }
 
         # Account
@@ -3959,7 +3978,10 @@ def index():
         let html = '';
 
         for (let i = 0; i < nSlots; i++) {{
-            const slot = slots[i] || {{ slot_id: i+1, model: '', enabled: true, alpaca_key: '', alpaca_secret: '' }};
+            // Filler cards (no slot in the config yet) start DISABLED so a
+            // Settings save can't silently activate phantom slots that
+            // would then trade with default stops.
+            const slot = slots[i] || {{ slot_id: i+1, model: '', enabled: false, alpaca_key: '', alpaca_secret: '' }};
             const enabled = slot.enabled !== false;
             const hasKey = slot.alpaca_key && slot.alpaca_key.length > 0;
             const modelExists = slot.model_file_exists !== false;
@@ -4042,20 +4064,20 @@ def index():
                     <div id="slot-cutloss-config-${{i}}" style="display:${{slot.enable_cutloss ? 'grid' : 'none'}};
                                 grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px">
                         <div>
-                            <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:3px">Hard Stop %</label>
-                            <input type="number" id="slot-hard-${{i}}" value="${{slot.cutloss_hard_stop || -8}}" step="0.5"
+                            <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:3px">Hard Stop % (blank = off)</label>
+                            <input type="number" id="slot-hard-${{i}}" value="${{slot.cutloss_hard_stop ?? ''}}" step="0.5" placeholder="off"
                                    style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
                                           padding:4px 8px;border-radius:4px;font-size:12px;font-family:var(--mono)">
                         </div>
                         <div>
-                            <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:3px">Trailing Stop %</label>
-                            <input type="number" id="slot-trail-${{i}}" value="${{slot.cutloss_trailing_stop || -5}}" step="0.5"
+                            <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:3px">Trailing Stop % (blank = off)</label>
+                            <input type="number" id="slot-trail-${{i}}" value="${{slot.cutloss_trailing_stop ?? ''}}" step="0.5" placeholder="off"
                                    style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
                                           padding:4px 8px;border-radius:4px;font-size:12px;font-family:var(--mono)">
                         </div>
                         <div>
-                            <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:3px">Portfolio Stop %</label>
-                            <input type="number" id="slot-portfolio-${{i}}" value="${{slot.cutloss_portfolio_stop || -3}}" step="0.5"
+                            <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:3px">Portfolio Stop % (× leverage)</label>
+                            <input type="number" id="slot-portfolio-${{i}}" value="${{slot.cutloss_portfolio_stop ?? -4}}" step="0.5"
                                    style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
                                           padding:4px 8px;border-radius:4px;font-size:12px;font-family:var(--mono)">
                         </div>
@@ -4125,9 +4147,11 @@ def index():
                 alpaca_key: $(`slot-key-${{i}}`).value.trim(),
                 alpaca_secret: $(`slot-secret-${{i}}`).value.trim(),
                 enable_cutloss: $(`slot-cutloss-${{i}}`).checked,
-                cutloss_hard_stop: parseFloat($(`slot-hard-${{i}}`).value) || -8.0,
-                cutloss_trailing_stop: parseFloat($(`slot-trail-${{i}}`).value) || -5.0,
-                cutloss_portfolio_stop: parseFloat($(`slot-portfolio-${{i}}`).value) || -3.0,
+                // Blank/invalid per-position stop = disabled (null), NOT a
+                // silent fallback to the old v7-era -8/-5 defaults.
+                cutloss_hard_stop: (v => isNaN(v) ? null : v)(parseFloat($(`slot-hard-${{i}}`).value)),
+                cutloss_trailing_stop: (v => isNaN(v) ? null : v)(parseFloat($(`slot-trail-${{i}}`).value)),
+                cutloss_portfolio_stop: parseFloat($(`slot-portfolio-${{i}}`).value) || -4.0,
                 target_leverage: parseFloat($(`slot-leverage-${{i}}`)?.value) || 1.0,
             }});
         }}
