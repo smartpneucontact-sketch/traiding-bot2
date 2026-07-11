@@ -40,7 +40,7 @@ gh repo create smartpneucontact-sketch/combo-v2-bot --public --source=. --push
 - Add env vars (copy from `.env.example`):
   - `MODEL_COMBO_V2_ALPACA_KEY` — your Alpaca paper key
   - `MODEL_COMBO_V2_ALPACA_SECRET` — your Alpaca paper secret
-  - `DASHBOARD_ADMIN_TOKEN` — long random string for dashboard write protection
+  - `DASHBOARD_AUTH_TOKEN` — long random string for dashboard + internal-API protection (**required**; without it the internal `/api` is unauthenticated). The env var is `DASHBOARD_AUTH_TOKEN`, not `DASHBOARD_ADMIN_TOKEN`.
 
 ### 3. After first deploy
 - Visit `https://<railway-url>/v2` for the clean dashboard

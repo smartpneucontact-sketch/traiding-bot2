@@ -572,6 +572,25 @@ def run_trading_pipeline(force=False, model_filter=None):
 app = Flask(__name__)
 
 
+@app.before_request
+def _require_api_auth():
+    """Gate every internal /api/ route behind the dashboard token.
+
+    Previously only POST handlers called _check_auth(); every GET (positions,
+    account, trades, logs, slot config) was served to anyone with the URL.
+    This closes that hole for the whole internal API. The public, CORS-enabled
+    /api/v1/ read API is intentionally exempt (it exposes read-only data by
+    design); individual handlers keep their own _check_auth() as a backstop.
+    """
+    if flask_request.method == "OPTIONS":
+        return None  # allow CORS preflight through
+    path = flask_request.path
+    if path.startswith("/api/") and not path.startswith("/api/v1/"):
+        if not _check_auth():
+            return jsonify({"error": "Unauthorized"}), 401
+    return None
+
+
 @app.errorhandler(500)
 def handle_500(e):
     import traceback
@@ -1484,16 +1503,37 @@ def api_description(model_name):
 
 @app.route("/api/config/models")
 def api_config_models():
-    """Get current model slot configuration."""
+    """Get current model slot configuration — with Alpaca secrets REDACTED.
+
+    This endpoint used to return alpaca_key/alpaca_secret in plaintext to
+    anyone who hit the URL. It now (a) requires auth and (b) never sends the
+    raw secret over the wire — only a boolean + masked hint. The Settings
+    form submits blank credential fields to keep the stored values (see the
+    POST handler), so redaction here does not break editing.
+    """
+    if not _check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
     config = pipeline.load_model_config()
-    # Enrich with model info
+    # Build a redacted COPY; load_model_config() returns a fresh parse, but we
+    # copy defensively so nothing downstream can leak the raw dict.
+    safe = dict(config)
+    safe_slots = []
     for slot in config.get("slots", []):
-        model_name = slot.get("model", "")
-        slot["model_file_exists"] = pipeline._resolve_model_path(model_name).exists()
-        slot["description"] = pipeline.MODEL_DESCRIPTIONS.get(model_name, {}).get("title", model_name)
-    config["available_models"] = list(pipeline.MODEL_REGISTRY.keys())
-    config["active_models"] = [mc.name for mc in pipeline.get_active_models()]
-    return jsonify(config)
+        s = dict(slot)
+        model_name = s.get("model", "")
+        s["model_file_exists"] = pipeline._resolve_model_path(model_name).exists()
+        s["description"] = pipeline.MODEL_DESCRIPTIONS.get(model_name, {}).get("title", model_name)
+        key = s.get("alpaca_key") or ""
+        s["has_alpaca_key"] = bool(key)
+        s["has_alpaca_secret"] = bool(s.get("alpaca_secret"))
+        s["alpaca_key_masked"] = ("••••" + key[-4:]) if len(key) >= 4 else ("••••" if key else "")
+        s.pop("alpaca_key", None)
+        s.pop("alpaca_secret", None)
+        safe_slots.append(s)
+    safe["slots"] = safe_slots
+    safe["available_models"] = list(pipeline.MODEL_REGISTRY.keys())
+    safe["active_models"] = [mc.name for mc in pipeline.get_active_models()]
+    return jsonify(safe)
 
 
 @app.route("/api/config/models", methods=["POST"])
@@ -1530,8 +1570,17 @@ def api_config_update():
         existing_by_id = {s.get("slot_id"): s for s in config.get("slots", [])}
         merged_slots = []
         for slot in new_slots:
+            incoming = dict(slot)
+            # The GET never returns the real key/secret (only a masked hint),
+            # so a blank or still-masked credential field means "keep what's
+            # stored" — drop it from the merge so it can't wipe live creds.
+            for cred in ("alpaca_key", "alpaca_secret"):
+                v = incoming.get(cred)
+                if v is None or (isinstance(v, str) and
+                                 (not v.strip() or v.strip().startswith("••••"))):
+                    incoming.pop(cred, None)
             base = dict(existing_by_id.get(slot.get("slot_id"), {}))
-            base.update(slot)
+            base.update(incoming)
             merged_slots.append(base)
         config["slots"] = merged_slots
         pipeline.save_model_config(config)
@@ -2121,7 +2170,49 @@ def apiv1_docs():
 
 @app.route("/health")
 def health():
+    # Pure liveness: 200 as long as the process is up. Intentionally does NOT
+    # reflect trading health — Railway's healthcheck restarts ON_FAILURE, and
+    # a deterministic data crash would otherwise crashloop the container (and
+    # take the cut-loss scanner down with it). Use /ready for trading health.
     return jsonify({"status": "ok", "uptime_since": bot_status["started_at"]})
+
+
+@app.route("/ready")
+def ready():
+    """Deep readiness of the TRADING loop — wire external alerting to this.
+
+    Returns 503 (with a list of problems) when the pipeline is actually
+    broken: the last run errored, the persistent state dir is empty (risk-layer
+    memory lost to an unmounted volume), or no run has completed in days.
+    """
+    problems = []
+    if bot_status.get("last_run_status") == "error":
+        problems.append(f"last run errored: {bot_status.get('last_error')}")
+    # Ephemeral-storage guard: an empty state dir means trailing-stop peaks and
+    # re-entry timers were wiped (no persistent volume mounted at DATA_DIR).
+    try:
+        state_files = list(STATE_DIR.glob("*.json"))
+    except Exception:
+        state_files = []
+    if not state_files:
+        problems.append(f"state dir empty ({STATE_DIR}) — persistent volume may be missing")
+    # Staleness: the pipeline runs every weekday; >4 days without a completed
+    # run means the scheduler stalled or the container was asleep at fire time.
+    last = bot_status.get("last_run_at")
+    if last:
+        try:
+            age = (datetime.now() - datetime.fromisoformat(last)).total_seconds()
+            if age > 4 * 86400:
+                problems.append(f"last run {age / 86400:.1f} days ago (stale)")
+        except Exception:
+            pass
+    ok = not problems
+    return jsonify({
+        "ready": ok,
+        "problems": problems,
+        "last_run_at": bot_status.get("last_run_at"),
+        "last_run_status": bot_status.get("last_run_status"),
+    }), (200 if ok else 503)
 
 
 @app.route("/api/v1/market-status", methods=["GET", "OPTIONS"])
@@ -3983,7 +4074,8 @@ def index():
             // would then trade with default stops.
             const slot = slots[i] || {{ slot_id: i+1, model: '', enabled: false, alpaca_key: '', alpaca_secret: '' }};
             const enabled = slot.enabled !== false;
-            const hasKey = slot.alpaca_key && slot.alpaca_key.length > 0;
+            // GET now returns has_alpaca_key (bool) instead of the raw key.
+            const hasKey = slot.has_alpaca_key === true;
             const modelExists = slot.model_file_exists !== false;
 
             html += `<div class="card" style="margin-bottom:12px;border-color:${{enabled && hasKey ? 'var(--green)' : 'var(--card-border)'}}">
@@ -4022,15 +4114,15 @@ def index():
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
                     <div>
                         <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">ALPACA API KEY</label>
-                        <input type="text" id="slot-key-${{i}}" value="${{slot.alpaca_key || ''}}"
-                               placeholder="PK..."
+                        <input type="text" id="slot-key-${{i}}" value=""
+                               placeholder="${{slot.has_alpaca_key ? (slot.alpaca_key_masked || '••••') + ' — blank keeps current' : 'PK...'}}"
                                style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
                                       padding:6px 10px;border-radius:6px;font-size:12px;font-family:var(--mono)">
                     </div>
                     <div>
                         <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">ALPACA SECRET KEY</label>
-                        <input type="password" id="slot-secret-${{i}}" value="${{slot.alpaca_secret || ''}}"
-                               placeholder="Secret..."
+                        <input type="password" id="slot-secret-${{i}}" value=""
+                               placeholder="${{slot.has_alpaca_secret ? '•••••••• — blank keeps current' : 'Secret...'}}"
                                style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
                                       padding:6px 10px;border-radius:6px;font-size:12px;font-family:var(--mono)">
                     </div>
@@ -4212,6 +4304,21 @@ if __name__ == "__main__":
     )
     logger = logging.getLogger("dashboard")
 
+    # -- Startup sanity warnings (both are silent-failure modes) -----------
+    if not DASHBOARD_AUTH_TOKEN:
+        logger.warning(
+            "SECURITY: DASHBOARD_AUTH_TOKEN is not set — all write endpoints "
+            "and the internal /api are UNAUTHENTICATED. Set DASHBOARD_AUTH_TOKEN "
+            "(note: the env var is DASHBOARD_AUTH_TOKEN, not DASHBOARD_ADMIN_TOKEN)."
+        )
+    if not list(STATE_DIR.glob("*.json")):
+        logger.warning(
+            f"PERSISTENCE: state dir {STATE_DIR} is empty at boot. If no Railway "
+            f"volume is mounted at DATA_DIR ({DATA_DIR}), trailing-stop peaks, "
+            f"re-entry timers and the portfolio-stop flag are wiped on every "
+            f"redeploy — the risk layer loses its memory. Mount a volume."
+        )
+
     _initialize_model_status()
 
     scheduler = BackgroundScheduler(timezone=TZ)
@@ -4220,6 +4327,10 @@ if __name__ == "__main__":
         CronTrigger(hour=9, minute=35, day_of_week="mon-fri", timezone=TZ),
         id="trading_pipeline",
         name="Daily ML Trading Pipeline",
+        # Survive a container that was asleep/redeploying at 09:35 ET: still
+        # fire if we come up within the hour, and collapse missed runs into one.
+        misfire_grace_time=3600,
+        coalesce=True,
     )
     # Cut-loss scanner: runs every 60 seconds during market hours for V7+
     cutloss_models = [mc for mc in pipeline.get_active_models() if mc.enable_cutloss]

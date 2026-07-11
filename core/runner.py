@@ -730,25 +730,38 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
     # -- Download data once (shared across models) --------------------------
     report = RunReport()
 
-    logger.info("\n[1/2] DOWNLOADING MARKET DATA (shared)")
-    symbols = get_tradeable_symbols(logger, report)
-    if not symbols:
-        logger.error("No symbols found - cannot proceed")
-        return
+    # The shared data phase is wrapped so a single upstream glitch (a
+    # malformed Wikipedia table, a yfinance hiccup) logs a FULL traceback to
+    # the pipeline log and aborts cleanly, instead of raising an opaque
+    # one-line error to the dashboard. Historically a `float < str` crash in
+    # get_tradeable_symbols killed every run here with no traceback in the log.
+    try:
+        logger.info("\n[1/2] DOWNLOADING MARKET DATA (shared)")
+        symbols = get_tradeable_symbols(logger, report)
+        if not symbols:
+            logger.error("No symbols found - cannot proceed")
+            return
 
-    stock_data = download_bars(symbols, lookback_days, logger, report)
-    macro_data = download_macro(lookback_days, logger, report)
+        stock_data = download_bars(symbols, lookback_days, logger, report)
+        macro_data = download_macro(lookback_days, logger, report)
 
-    if not stock_data:
-        logger.error("No stock data downloaded - cannot proceed")
-        return
+        if not stock_data:
+            logger.error("No stock data downloaded - cannot proceed")
+            return
 
-    logger.info("\n[2/2] COMPUTING MACRO FEATURES (shared)")
-    macro_features = compute_macro_features(macro_data)
-    logger.info(
-        f"  Macro features: {len(macro_features.columns)} columns, "
-        f"{len(macro_features)} days"
-    )
+        logger.info("\n[2/2] COMPUTING MACRO FEATURES (shared)")
+        macro_features = compute_macro_features(macro_data)
+        logger.info(
+            f"  Macro features: {len(macro_features.columns)} columns, "
+            f"{len(macro_features)} days"
+        )
+    except Exception as e:
+        logger.error(
+            f"Shared data phase FAILED — no model will run this cycle: {e}\n"
+            f"{traceback.format_exc()}"
+        )
+        report.add_error(f"Shared data phase failed: {e}")
+        raise
 
     # -- Run each model -----------------------------------------------------
     for mc in models:
