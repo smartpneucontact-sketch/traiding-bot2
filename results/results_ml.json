@@ -1,0 +1,23 @@
+{
+  "ml_lgb_xs": {
+    "name": "ml_lgb_xs",
+    "start": "2016-04-01",
+    "end": "2026-03-27",
+    "n_days": 2512,
+    "final_equity": 12729552.887691123,
+    "cagr": 0.6247956194002986,
+    "ann_vol": 2.7513897664891664,
+    "sharpe": 0.43893334566691594,
+    "sortino": 4.156139016333146,
+    "max_drawdown": -0.5521507623134162,
+    "calmar": 1.1315670683537826,
+    "mean_monthly": 0.12612814846307932,
+    "median_monthly": 0.0,
+    "hit_rate_monthly": 0.48739495798319327,
+    "worst_month": -0.3264588335628057,
+    "best_month": 11.838855704560372,
+    "turnover_annualized": 43.050000000000004,
+    "avg_gross_exposure": 0.7770700636942673,
+    "avg_n_positions": 23.312101910828027
+  }
+}

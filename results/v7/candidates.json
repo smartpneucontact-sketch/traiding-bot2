@@ -1,0 +1,91 @@
+{
+  "meta": {
+    "generated": "2026-06-11",
+    "family": "ASSEMBLY",
+    "window": "dev (2016-04..2022-12-31) ONLY — validation untouched",
+    "engine": "engine_v2; freeze-only candidates: run_trial next_open; tier candidates: generalized E5 tier loop (close-to-close daily-bar approx, phi=0), leverage_cap=2.0",
+    "scripts": ["assemble_candidates.py", "assemble_added_cell.py"],
+    "ledgers": ["results/v7/trials/ASSEMBLY.csv", "results/v7/trials/ASSEMBLY_tier.csv"],
+    "gate_G2": "mean>=4.5%/mo, MaxDD>=-40%, Calmar>=1.3, turnover<=30x/yr, 20bp Calmar drop<25%, covid/2026Q1 episode DD within 5pp of champion",
+    "gate_G2_outcome": "ZERO strict passes. Every candidate fails the MaxDD>=-40% leg; binding episode is the Sep-Dec 2018 slide in all cases. The (mean>=4.5, DD>=-40) corner is unreachable from the pre-registered component set (added book-gate cell confirms: DD -41.7% only at mean 4.28%). Finalists below are ranked by dev Calmar and pass all OTHER legs as annotated.",
+    "champion_reference_dev": {"mean_monthly_pct": 4.555, "sharpe": 1.044, "max_dd_pct": -60.2, "calmar": 0.858, "ep_covid_dd_pct": -60.2},
+    "warning": "Tier-track numbers are close-to-close phi=0 daily-bar approximations (mildly optimistic intraday); re-run validation/stop_grid.py phi-stress before any promotion. 2026Q1 episode is outside the dev window — must be checked in the one-shot validation phase."
+  },
+  "candidates": [
+    {
+      "rank": 1,
+      "name": "ASM_Bst_TF1",
+      "g2_pass": false,
+      "g2_failed_legs": ["max_dd >= -40% (actual -46.9%)"],
+      "g2_passed_legs": ["mean 5.013>=4.5", "calmar 1.334>=1.3", "turnover 15.8<=30", "tc20 calmar drop 7.1%<25%", "covid dd -24.1% vs champ -60.2%"],
+      "components": {
+        "base_sleeves": ["sleeve_residual_mom_market_sector_raw_n30 (E3 winner, replaces xs)", "sleeve_dual_momentum_voltarget_n30", "sleeve_adaptive_voltarget_n30"],
+        "allocation": "static 1/3 (union dates/cols, sum/3)",
+        "leverage": 2.0,
+        "overlays": {
+          "freeze_dd_v1": {"fn": "strategies.freeze_signal_spy_drawdown", "peak_lookback": 21, "freeze_dd_pct": 0.12, "unfreeze_within_pct": 0.08, "min_freeze_days": 10},
+          "tier_stop": {"pstop_eff": -0.08, "tiers": [-0.08, -0.13333, -0.18667], "fractions": [0.6, 0.3, 0.0], "reentry_delay": 2, "phi": 0.0, "reset": "at scheduled base rebalances"}
+        },
+        "exec": "tier_loop_cc (untiered frame: next_open)", "tc_bps": 5.0, "leverage_cap": 2.0
+      },
+      "rebuild": "import sys; sys.path.insert(0,'.')\nimport pandas as pd\nfrom engine_v2 import apply_gate\nfrom assemble_candidates import TierEnv, build_blend, F1_MULT  # module is DEV-bound (idx/prices <= 2022-12-31); re-instantiate its data section on the full index for other windows\nblend = build_blend('B', 'st')  # = mean of the 3 sleeve parquets on union dates/cols, .loc[:'2022-12-31']\nenv = TierEnv(blend)            # W2_daily = expand_daily(blend*2.0, idx); held/gaps/reset-days from un-gated base\nW = apply_gate(env.W2_daily, F1_MULT)  # freeze dd_v1 days -> 0\nnet, events, traded, gross = env.tier_loop(W, P=-0.08, delay=2, tc_bps=5.0)\neq = (1.0 + pd.Series(net, index=env.W2_daily.index)).cumprod() * 100_000.0\n# verified dev: mm 5.013%/mo, Sharpe 1.350, MaxDD -46.86%, Calmar 1.334, events 15/0/0",
+      "dev_metrics": {
+        "tc5":  {"mean_monthly_pct": 5.013, "sharpe": 1.350, "sortino": 1.745, "max_dd_pct": -46.86, "calmar": 1.334, "ann_vol_pct": 42.8, "worst_month_pct": -28.6, "turnover_ann": 15.8, "avg_gross": 1.49, "tier_events": {"tier1": 15, "tier2": 0, "tier3": 0}},
+        "tc10": {"mean_monthly_pct": 4.943, "sharpe": 1.331, "max_dd_pct": -47.02, "calmar": 1.302},
+        "tc20": {"mean_monthly_pct": 4.804, "sharpe": 1.293, "max_dd_pct": -47.34, "calmar": 1.239}
+      },
+      "episodes_tc5": {"2018Q4": {"ret_pct": -44.7, "dd_pct": -44.7}, "covid": {"ret_pct": -24.1, "dd_pct": -24.1}, "2022": {"ret_pct": 1.0, "dd_pct": -29.1}, "2026Q1": "outside dev — check at validation"},
+      "stability": "single-component-toggle neighbors: Ast_TF1 1.177, Bsx_TF1 1.222, Bst_T 1.297, Bst_F1 1.152 -> median 1.200 = 0.90x winner (>=0.85 PASS)"
+    },
+    {
+      "rank": 2,
+      "name": "ASM_Bst_BTF1 (ADDED CELL, pre-registered rationale in ASSEMBLY_REPORT.md)",
+      "g2_pass": false,
+      "g2_failed_legs": ["mean 4.276 < 4.5", "max_dd >= -40% (actual -41.7%)", "calmar 1.234 < 1.3"],
+      "g2_passed_legs": ["turnover 20.8<=30", "tc20 calmar drop 11.1%<25%", "covid dd -20.4%"],
+      "role": "lowest-DD profile in the assembly; the only candidate near the -40% bar; alternative if the validation phase weights DD over mean",
+      "components": {
+        "base_sleeves": ["sleeve_residual_mom_market_sector_raw_n30", "sleeve_dual_momentum_voltarget_n30", "sleeve_adaptive_voltarget_n30"],
+        "allocation": "static 1/3",
+        "leverage": 2.0,
+        "overlays": {
+          "book_gate": {"fn": "engine_v2.book_drawdown_gate", "full_dd": 0.12, "cash_dd": 0.30, "lookback": 60, "computed_on": "un-gated base daily frame (scalar-gate invariant)"},
+          "freeze_dd_v1": {"peak_lookback": 21, "freeze_dd_pct": 0.12, "unfreeze_within_pct": 0.08, "min_freeze_days": 10},
+          "tier_stop": {"pstop_eff": -0.08, "tiers": [-0.08, -0.13333, -0.18667], "fractions": [0.6, 0.3, 0.0], "reentry_delay": 2, "phi": 0.0}
+        },
+        "exec": "tier_loop_cc", "tc_bps": 5.0, "leverage_cap": 2.0
+      },
+      "rebuild": "import sys; sys.path.insert(0,'.')\nfrom engine_v2 import book_drawdown_gate, apply_gate\nfrom assemble_candidates import TierEnv, build_blend, F1_MULT, panel, cutoff, idx\nblend = build_blend('B', 'st'); env = TierEnv(blend)\ng = book_drawdown_gate(env.W2_daily, panel['close'].loc[:cutoff], full_dd=0.12, cash_dd=0.30, lookback=60).reindex(idx).fillna(1.0).clip(0.0, 1.0)\nW = apply_gate(apply_gate(env.W2_daily, g), F1_MULT)\nnet, events, traded, gross = env.tier_loop(W, P=-0.08, delay=2, tc_bps=5.0)\n# verified dev: mm 4.276%/mo, Sharpe 1.251, MaxDD -41.74%, Calmar 1.234, events 14/0/0",
+      "dev_metrics": {
+        "tc5":  {"mean_monthly_pct": 4.276, "sharpe": 1.251, "sortino": 1.572, "max_dd_pct": -41.74, "calmar": 1.234, "ann_vol_pct": 39.5, "worst_month_pct": -27.3, "turnover_ann": 20.8, "avg_gross": 1.41, "tier_events": {"tier1": 14, "tier2": 0, "tier3": 0}},
+        "tc10": {"mean_monthly_pct": 4.186, "sharpe": 1.224, "max_dd_pct": -42.05, "calmar": 1.187},
+        "tc20": {"mean_monthly_pct": 4.007, "sharpe": 1.171, "max_dd_pct": -42.67, "calmar": 1.097}
+      },
+      "episodes_tc5": {"2018Q4": {"ret_pct": -39.4, "dd_pct": -39.4}, "covid": {"ret_pct": -20.4, "dd_pct": -20.4}, "2022": {"ret_pct": -13.9, "dd_pct": -31.9}, "2026Q1": "outside dev — check at validation"},
+      "stability": "available neighbors (book off -> Bst_TF1 1.334; base A equivalent = E5 B+T+F1 1.044) -> median 1.189 = 0.96x (PASS on available evidence; only 2 neighbors exist)"
+    },
+    {
+      "rank": 3,
+      "name": "ASM_Bst_T",
+      "g2_pass": false,
+      "g2_failed_legs": ["max_dd >= -40% (actual -48.6%)", "calmar 1.297 < 1.3 (by 0.003)"],
+      "g2_passed_legs": ["mean 5.099>=4.5", "turnover 15.1<=30", "tc20 calmar drop 6.5%<25%", "covid dd -41.6%"],
+      "role": "highest mean; simplest stack (no freeze); covid DD -41.6% is materially worse than rank 1/2 — keep only as a simplicity fallback",
+      "components": {
+        "base_sleeves": ["sleeve_residual_mom_market_sector_raw_n30", "sleeve_dual_momentum_voltarget_n30", "sleeve_adaptive_voltarget_n30"],
+        "allocation": "static 1/3",
+        "leverage": 2.0,
+        "overlays": {"tier_stop": {"pstop_eff": -0.08, "tiers": [-0.08, -0.13333, -0.18667], "fractions": [0.6, 0.3, 0.0], "reentry_delay": 2, "phi": 0.0}},
+        "exec": "tier_loop_cc", "tc_bps": 5.0, "leverage_cap": 2.0
+      },
+      "rebuild": "import sys; sys.path.insert(0,'.')\nfrom assemble_candidates import TierEnv, build_blend\nblend = build_blend('B', 'st'); env = TierEnv(blend)\nnet, events, traded, gross = env.tier_loop(env.W2_daily, P=-0.08, delay=2, tc_bps=5.0)\n# verified dev: mm 5.099%/mo, Sharpe 1.320, MaxDD -48.59%, Calmar 1.297, events 15/1/0",
+      "dev_metrics": {
+        "tc5":  {"mean_monthly_pct": 5.099, "sharpe": 1.320, "sortino": 1.746, "max_dd_pct": -48.59, "calmar": 1.297, "ann_vol_pct": 44.6, "worst_month_pct": -28.6, "turnover_ann": 15.1, "avg_gross": 1.53, "tier_events": {"tier1": 15, "tier2": 1, "tier3": 0}},
+        "tc10": {"mean_monthly_pct": 5.032, "sharpe": 1.303, "max_dd_pct": -48.70, "calmar": 1.269},
+        "tc20": {"mean_monthly_pct": 4.898, "sharpe": 1.268, "max_dd_pct": -48.93, "calmar": 1.213}
+      },
+      "episodes_tc5": {"2018Q4": {"ret_pct": -38.6, "dd_pct": -46.5}, "covid": {"ret_pct": -32.6, "dd_pct": -41.6}, "2022": {"ret_pct": -5.6, "dd_pct": -36.6}, "2026Q1": "outside dev — check at validation"},
+      "stability": "neighbors: Ast_T 1.128, Bsx_T 1.213, Bst_TF1 1.334, Bst_base 0.962 -> median 1.170 = 0.90x (PASS)"
+    }
+  ]
+}

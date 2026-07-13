@@ -1,0 +1,9 @@
+# Data and caches (regenerable / machine-specific)
+data_cache.pkl
+__pycache__/
+*.pyc
+.DS_Store
+
+# Binary artifact caches (regenerable from code + data_cache)
+*.parquet
+ml_track/cache/

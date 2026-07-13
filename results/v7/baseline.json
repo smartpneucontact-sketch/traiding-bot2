@@ -1,0 +1,18 @@
+{
+  "dev": {
+    "mean_monthly": 0.045546739999310346,
+    "sharpe": 1.0440033129817838,
+    "max_drawdown": -0.6019153206391645,
+    "calmar": 0.8580186751301543,
+    "turnover_annualized": 14.141159725477893,
+    "avg_gross_exposure": 1.618903825373896
+  },
+  "full": {
+    "mean_monthly": 0.052207632894468656,
+    "sharpe": 1.1404418365909104,
+    "max_drawdown": -0.6019153206391645,
+    "calmar": 1.0266539167903612,
+    "turnover_annualized": 15.115970772012059,
+    "avg_gross_exposure": 1.7152688721978495
+  }
+}
