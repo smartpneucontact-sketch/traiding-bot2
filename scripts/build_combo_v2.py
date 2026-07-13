@@ -40,8 +40,7 @@ def main() -> None:
         adaptive_stress_leverage=0.5,
         # SPY soft drawdown gate DISABLED per the 2026-06 validation: with
         # the book gate live it costs 0.40 pp/mo for 0.16 pp of extra
-        # MaxDD protection (validation/BOOK_GATE_REPORT.md). The V6 hard
-        # freeze below stays on — it was independently backtested.
+        # MaxDD protection (validation/BOOK_GATE_REPORT.md).
         enable_spy_dd_gate=False,
         spy_dd_lookback=60,
         spy_full_dd=0.08,
@@ -55,10 +54,12 @@ def main() -> None:
         book_dd_lookback=60,
         book_full_dd=0.12,
         book_cash_dd=0.30,
-        # V6 "bad period" freeze — return-max variant (combo_v2_2x_freeze_dd_v1).
-        # Backtest 2016-2026: 5.22 %/mo, Sharpe 1.19, MaxDD -55.8 %, Calmar 1.12.
-        # See /Traiding 11/REPORT.md V6 section for grid search + alternatives.
-        enable_drawdown_freeze=True,
+        # V6 "bad period" freeze — RETRACTED 2026-07-12, disabled. dd_v1 was
+        # grid-searched in-sample (135 cells, full window, no holdout); under
+        # corrected execution it is worse than no freeze (Calmar 0.987 vs
+        # 1.027). See /Traiding 11/REPORT.md Validity Notice §5. Params kept
+        # below for provenance only; the flag gates everything.
+        enable_drawdown_freeze=False,
         dd_freeze_pct=0.12,
         dd_peak_lookback=21,
         dd_unfreeze_within_pct=0.08,
@@ -73,25 +74,36 @@ def main() -> None:
         "strategy_type": "direct_weights",
         "feature_cols": [],
         "horizon": 21,
-        "version": "combo_v2.2_riskfix",
-        "tag": "Combo V2.2 — 3-sleeve blend + V6 freeze + book-DD gate, "
-               "21d cadence (2026-06 risk-layer recalibration)",
+        "version": "combo_v2.3_nofreeze",
+        "tag": "Combo V2.3 — 3-sleeve blend + book-DD gate, 21d cadence "
+               "(V6 freeze retracted 2026-07-12; corrected-engine reference)",
         "combo_config": config,
         "saved_at": datetime.now(timezone.utc).isoformat(),
-        # Updated backtest reference: combo_v2_2x_freeze_dd_v1 (V6 winner).
-        # See /Traiding 11/REPORT.md (V5 + V6 sections).
+        # Backtest reference: combo_v2_2x NO-FREEZE baseline under the
+        # corrected engine (engine_v2 next_open, 5 bp/side, 6 %/yr margin on
+        # borrowed notional). The previous reference (freeze_dd_v1: 5.22 %/mo,
+        # Sharpe 1.19) was produced by the stale legacy engine AND an
+        # in-sample-fitted overlay — retracted; see /Traiding 11/REPORT.md
+        # Validity Notice. geo_monthly is the compounded rate an account
+        # actually earns; the survivorship-biased universe still inflates
+        # ALL of these numbers by an unquantified amount.
         "backtest_reference": {
             "window": "2016-04-01..2026-03-27",
             "universe_size": 1040,
             "tc_bps_per_side": 5,
+            "margin_bps_annual": 600,
             "leverage_for_reference": 2.0,
-            "mean_monthly_return": 0.0522,    # V6 (was 0.0496 in V5 baseline)
-            "sharpe": 1.19,                    # V6 (was 1.06)
-            "max_drawdown": -0.5577,           # V6 (was -0.6528)
-            "calmar": 1.123,                   # V6 (was 0.87)
-            "rank_among_strategies_tested": 1,
-            "freeze_design": "SPY drawdown ≥ 12% from 21d peak; min 14 calendar days frozen; unfreeze within 8% of peak",
-            "frozen_day_count_in_backtest": 70,
+            "engine": "engine_v2 next_open (corrected execution)",
+            "mean_monthly_return": 0.0480,     # arithmetic; legacy-engine free-margin figure was 0.0496
+            "geo_monthly_return": 0.0368,      # compounded — the honest headline
+            "sharpe": 1.06,
+            "max_drawdown": -0.603,
+            "calmar": 0.90,
+            "survivorship_bias": "universe is survivors-only (0 in-window "
+                                 "delistings); results inflated by an "
+                                 "unquantified amount — treat as upper bound",
+            "freeze_design": "RETRACTED 2026-07-12 (in-sample grid; worse than "
+                             "baseline under corrected execution) — disabled",
             "total_trading_days_in_backtest": 2512,
             # 2026-06 risk-layer recalibration (validation/ in the research
             # repo). Each overlay validated separately against the baseline;

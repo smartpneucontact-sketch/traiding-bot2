@@ -330,9 +330,14 @@ class ComboConfig:
     book_cash_dd: float = 0.30
 
     # V6 "bad period" freeze (hard cut to cash, runner-level)
-    # Tuned via grid search on 10-yr backtest. See /Traiding 11/REPORT.md V6.
-    # Parameters match combo_v2_2x_freeze_dd_v1 (the return-max variant).
-    enable_drawdown_freeze: bool = True
+    # RETRACTED 2026-07-12 — disabled. The dd_v1 parameters were selected by
+    # an in-sample 135-cell grid search on the full reporting window; under
+    # corrected execution (engine_v2 next_open) the variant is WORSE than no
+    # freeze at all (Calmar 0.987 vs baseline 1.027). See /Traiding 11/
+    # REPORT.md Validity Notice §5. Machinery retained: any future freeze
+    # must be re-selected on the dev window (≤2022-12-31) and validated
+    # one-shot on 2023+ before this flag is turned back on.
+    enable_drawdown_freeze: bool = False
     dd_freeze_pct: float = 0.12          # freeze when SPY drops ≥ 12% from peak
     dd_peak_lookback: int = 21           # over trailing 21 trading days
     dd_unfreeze_within_pct: float = 0.08 # unfreeze when SPY within 8% of peak

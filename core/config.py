@@ -132,10 +132,11 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
                 "from their 60-day highs, ramp 12 % → 30 % toward cash — catches "
                 "sector crashes SPY can't see (June 2026: SPY -3 %, book -20 %). "
                 "Backtest: 4.72 %/mo, Sharpe 1.16, MaxDD -47.2 %.\n"
-                "  2. V6 SPY-drawdown freeze: hard cut to cash at SPY ≥12 % below "
-                "its 21-day peak (now actually liquidates — the old code was a "
-                "no-op). SPY soft ramp 8→18 % disabled (redundant with the book "
-                "gate, cost 0.40 pp/mo).\n"
+                "  2. V6 SPY-drawdown freeze: RETRACTED and disabled 2026-07-12 — "
+                "the parameters were grid-searched in-sample and the variant is "
+                "worse than no freeze under corrected execution (Traiding 11 "
+                "REPORT.md Validity Notice §5). SPY soft ramp 8→18 % also "
+                "disabled (redundant with the book gate, cost 0.40 pp/mo).\n"
                 "  3. dual_momentum sleeve internally vol-targets to 15 %; adaptive "
                 "sleeve auto-deleverages to 0.5x when VIX is in its top-tercile.\n"
                 "Plus the runner's cut-loss scanner if `enable_cutloss=True`: "
@@ -145,10 +146,13 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
                 "~4 events/yr, 2-trading-day re-entry cool-down after Tier 3. "
                 "Backtest: 4.77 %/mo, Sharpe 1.17, MaxDD -49.6 %.",
         "training": "No training. Pure-rule allocator. Backtest in /Traiding 11/"
-                    "REPORT.md (V5 section) covers 10 years (2016-04 → 2026-03, 1040 "
-                    "stocks, 5 bp/side TC, 45 strategies tested) and produced "
-                    "4.96 %/mo mean, Sharpe 1.06, Calmar 0.87 at 2.0x leverage. Live "
-                    "expectation after a 15-30 % friction haircut: 3.5-4.2 %/mo.",
+                    "REPORT.md covers 10 years (2016-04 → 2026-03, 1040 stocks, "
+                    "5 bp/side TC). Corrected reference (2026-07-12, engine_v2 "
+                    "next_open + 6 %/yr margin): 4.80 %/mo arithmetic / 3.68 %/mo "
+                    "compounded, Sharpe 1.06, MaxDD -60 % at 2.0x. CAVEAT: the "
+                    "backtest universe is survivors-only, so these are upper "
+                    "bounds; treat the 3 %/mo target as unproven pending the "
+                    "forward paper test (REPORT.md Validity Notice).",
     },
     # ── The v4-v9 entries below are vestigial — they document the prior
     # bot's ML model family for reference, but no v4-v9 model.pkl ships
