@@ -117,7 +117,8 @@ def xs_momentum_concentrated(
     """High-conviction: top-15 by 12-1 momentum, with quality screens:
       - Price ≥ $5 (avoid penny stocks)
       - 20d avg dollar volume ≥ $10M
-      - Idiosyncratic vol over last 60d in the bottom 80% (drop the wildest)
+      - TOTAL realised vol over last 60d in the bottom 80% (drop the wildest;
+        not idiosyncratic vol — no factor model is fitted)
     Bi-weekly rebalance for tighter capture."""
     px = prices
     mom = px.shift(21) / px.shift(252) - 1.0
@@ -234,9 +235,15 @@ def trend_following(
     breakout_lookback: int = 100,
     n_long: int = 30,
     rebal_freq: int = 21,
+    cash_when_no_signal: bool = False,
 ) -> pd.DataFrame:
     """Long stocks that are above their 200-SMA AND making new 100-day highs.
-    Rank by relative strength (50-SMA over 200-SMA gap). Equal-weight top N."""
+    Rank by relative strength (50-SMA over 200-SMA gap). Equal-weight top N.
+
+    Legacy default: when NO stock qualifies on a decision date, no row is
+    emitted, so the backtester's forward-fill HOLDS the previous book (it does
+    not go to cash). Pass cash_when_no_signal=True to emit an explicit
+    all-zero row on those dates instead."""
     px = prices
     sma50 = px.rolling(sma_fast).mean()
     sma200 = px.rolling(sma_slow).mean()
@@ -254,6 +261,8 @@ def trend_following(
         eligible = is_uptrend.loc[dt] & new_high.loc[dt]
         scores = rel_strength.loc[dt][eligible].dropna()
         if len(scores) == 0:
+            if cash_when_no_signal:
+                w_list.append(pd.Series(0.0, index=px.columns).rename(dt))
             continue
         k = min(n_long, len(scores))
         top = scores.nlargest(k).index
@@ -266,6 +275,46 @@ def trend_following(
     return pd.concat(w_list, axis=1).T
 
 
+# ─── Helper: portfolio vol estimate for vol-targeting sleeves ────────────
+def _est_portfolio_vol(
+    w: pd.Series,
+    name_vol: pd.Series,
+    daily: pd.DataFrame,
+    dt: pd.Timestamp,
+    vol_lookback: int,
+    vol_est: str,
+) -> float:
+    """Annualised portfolio-vol estimate for weights `w` (index = tickers held).
+
+    vol_est="diag_legacy": sqrt(sum((w_i * sigma_i)^2)) — assumes ZERO
+        cross-correlation. For a diversified long book of correlated names this
+        understates true vol so badly that min(1, target/est) never binds:
+        the vol-targeting is a NO-OP. Retained only to reproduce the published
+        record bit-for-bit.
+    vol_est="cov": sqrt(w' Sigma w * 252) with Sigma the sample covariance of
+        the same trailing `vol_lookback` daily-return window already used for
+        the per-name sigmas. Use this for new research.
+
+    `name_vol` is the per-name annualised vol Series at `dt` (used only by
+    diag_legacy); `daily` is the full daily-returns frame (used only by cov).
+
+    If the covariance is undefined at `dt` (a held name has <2 observations in
+    the window), the cov path falls back to the diagonal estimate for that
+    decision date — explicit, rather than letting NaN leak through the
+    caller's min()/max() (whose result depends on argument order).
+    """
+    if vol_est == "diag_legacy":
+        return float(np.sqrt(np.sum((w * name_vol[w.index]) ** 2)))
+    if vol_est == "cov":
+        window = daily.loc[:dt, w.index].tail(vol_lookback)
+        sigma = window.cov()
+        var = float(w.values @ sigma.values @ w.values)
+        if not np.isfinite(var):
+            return float(np.sqrt(np.sum((w * name_vol[w.index]) ** 2)))
+        return float(np.sqrt(max(var, 0.0) * 252.0))
+    raise ValueError(f"unknown vol_est: {vol_est!r}")
+
+
 # ─── Strategy 5: Volatility-targeted dual momentum ──────────────────────
 def dual_momentum_voltarget(
     prices: pd.DataFrame,
@@ -275,10 +324,22 @@ def dual_momentum_voltarget(
     target_vol: float = 0.15,     # 15% annualized
     vol_lookback: int = 60,
     rebal_freq: int = 21,
+    vol_est: str = "diag_legacy",
+    cash_when_no_signal: bool = False,
 ) -> pd.DataFrame:
-    """Dual momentum: pick top-N by 6-month return *and* require absolute return > 0
-    (else hold cash). Size each holding inversely to its 60-day volatility, then
-    scale the portfolio to target_vol.
+    """Dual momentum: pick top-N by 6-month return *and* require absolute return > 0.
+    Size each holding inversely to its 60-day volatility, then scale the
+    portfolio to target_vol.
+
+    Caveats of the legacy defaults (kept for published-record reproduction):
+    - vol_est="diag_legacy" ignores cross-correlation, so the estimated
+      portfolio vol is far below target_vol and the scale never binds in
+      practice — the vol-targeting is a NO-OP. New research should pass
+      vol_est="cov" (full sample-covariance estimate; see _est_portfolio_vol).
+    - When no name qualifies on a decision date the legacy code emits NO row,
+      so the backtester's forward-fill silently HOLDS the previous book — it
+      does NOT go to cash despite the "else hold cash" intent. Pass
+      cash_when_no_signal=True to emit an explicit all-zero row instead.
     """
     px = prices
     ret = px.pct_change(lookback, fill_method=None)
@@ -294,16 +355,20 @@ def dual_momentum_voltarget(
         # Absolute filter: must be positive
         row = row[row > 0]
         if len(row) == 0:
+            if cash_when_no_signal:
+                w_list.append(pd.Series(0.0, index=px.columns).rename(dt))
             continue
         top = row.nlargest(min(n_long, len(row))).index
         # Inverse-vol weights inside the top set
         v = vol.loc[dt][top].replace(0.0, np.nan).dropna()
         if v.empty:
+            if cash_when_no_signal:
+                w_list.append(pd.Series(0.0, index=px.columns).rename(dt))
             continue
         raw_w = 1.0 / v
         raw_w = raw_w / raw_w.sum()  # normalise to sum=1
         # Portfolio realized vol at these weights
-        port_vol_est = float(np.sqrt(np.sum((raw_w * vol.loc[dt][raw_w.index]) ** 2)))
+        port_vol_est = _est_portfolio_vol(raw_w, vol.loc[dt], daily, dt, vol_lookback, vol_est)
         scale = min(1.0, target_vol / max(port_vol_est, 1e-6))
         wrow = pd.Series(0.0, index=px.columns)
         wrow.loc[raw_w.index] = raw_w.values * scale
@@ -320,10 +385,15 @@ def ts_momentum_multiasset(
     rebal_freq: int = 21,
     target_vol: float = 0.20,
     vol_lookback: int = 60,
+    vol_est: str = "diag_legacy",
 ) -> pd.DataFrame:
     """Classic AQR-style time-series momentum applied to ALL the macro/sector
     ETFs (22 of them). For each ETF: long if 12-month return > 0, else cash.
     Inverse-vol weights, then scaled to target_vol.
+
+    The default vol_est="diag_legacy" assumes zero cross-correlation, so the
+    scale never binds in practice (a no-op, retained only to reproduce the
+    published record). New research should pass vol_est="cov".
 
     Returns weights indexed by macro tickers — caller must project onto the
     full pricing universe.
@@ -347,7 +417,7 @@ def ts_momentum_multiasset(
             if inv_v.empty:
                 continue
             inv_v = inv_v / inv_v.sum()
-            est_vol = float(np.sqrt(np.sum((inv_v * vol_d.loc[dt][inv_v.index]) ** 2)))
+            est_vol = _est_portfolio_vol(inv_v, vol_d.loc[dt], daily, dt, vol_lookback, vol_est)
             scale = min(1.0, target_vol / max(est_vol, 1e-6))
             wrow = pd.Series(0.0, index=px.columns)
             wrow.loc[inv_v.index] = inv_v.values * scale
@@ -368,8 +438,10 @@ def xs_momentum_fast(
     volume: pd.DataFrame | None = None,
     min_dollar_vol: float = 5e6,
 ) -> pd.DataFrame:
-    """Top-N by 3-1 week momentum, weekly rebal. Faster turnover; literature
-    shows shorter momentum lookbacks can capture more rapid trend rotations."""
+    """Top-N by 63-day (~3-month) momentum skipping the most recent 5 days,
+    weekly rebal. (Despite the "fast" name this is a 3-month lookback, not
+    "3-1 week".) Faster turnover; literature shows shorter momentum lookbacks
+    can capture more rapid trend rotations."""
     px = prices
     mom = px.shift(lookback_skip) / px.shift(lookback_long) - 1.0
     if volume is not None:
@@ -537,7 +609,7 @@ def market_regime(macro: pd.DataFrame) -> pd.Series:
 
     Inputs (all available in `macro`):
       - SPY: trend (above/below 200-SMA, 50/200 cross)
-      - VIX: scaled (40 = full risk-off, 10 = full risk-on)
+      - VIX: scaled (50 = full risk-off, 10 = full risk-on; (30-VIX)/20 clipped)
       - HYG: high-yield trend (above 200-SMA = risk-on)
     """
     if "SPY" not in macro.columns:
@@ -685,9 +757,19 @@ def donchian_breakout(
             if len(scores) > 0:
                 top = scores.nlargest(n_long).index
                 held = (held | set(top))
-                # Cap at 2 × n_long to avoid runaway turnover
+                # Cap at 2 × n_long to avoid runaway turnover. Truncation is
+                # deterministic: keep the names freshest today, ties (and
+                # missing freshness) broken by ticker. NOTE: the published
+                # donchian number was produced by the old `list(set)` slice —
+                # nondeterministic hash order — and is not exactly reproducible.
                 if len(held) > 2 * n_long:
-                    held = set(list(held)[:2 * n_long])
+                    fresh_today = freshness.loc[dt]
+
+                    def _trunc_key(t: str) -> tuple[float, str]:
+                        f = fresh_today.get(t, np.nan)
+                        return (-f if pd.notna(f) else np.inf, t)
+
+                    held = set(sorted(held, key=_trunc_key)[:2 * n_long])
             wrow = pd.Series(0.0, index=px.columns)
             if held:
                 w = 1.0 / len(held)
@@ -751,10 +833,15 @@ def risk_parity_etf(
     vol_lookback: int = 60,
     target_vol: float = 0.12,
     rebal_freq: int = 21,
+    vol_est: str = "diag_legacy",
 ) -> pd.DataFrame:
     """Equal-risk-contribution across a fixed multi-asset basket. Approximated
     by inverse-vol weights then scaled to target_vol. Classic Bridgewater
     all-weather idea without the leverage.
+
+    The default vol_est="diag_legacy" assumes zero cross-correlation, so the
+    scale never binds in practice (a no-op, retained only to reproduce the
+    published record). New research should pass vol_est="cov".
     """
     available = [t for t in tickers if t in macro.columns]
     if not available:
@@ -772,7 +859,7 @@ def risk_parity_etf(
             continue
         inv = 1.0 / v
         wnorm = inv / inv.sum()
-        est_vol = float(np.sqrt(np.sum((wnorm * v[wnorm.index]) ** 2)))
+        est_vol = _est_portfolio_vol(wnorm, v, daily, dt, vol_lookback, vol_est)
         scale = min(1.0, target_vol / max(est_vol, 1e-6))
         wrow = pd.Series(0.0, index=macro.columns)
         wrow.loc[wnorm.index] = wnorm.values * scale
@@ -828,7 +915,7 @@ def calendar_tom(
     macro: pd.DataFrame,
     n_long: int = 30,
 ) -> pd.DataFrame:
-    """Turn-of-month + first-week-of-month seasonality. Long top-N by 60d
+    """Turn-of-month + first-week-of-month seasonality. Long top-N by 63d
     momentum on the last 3 trading days of each month and the first 3 of
     the next; cash otherwise. Captures the well-documented TOM effect.
     """
@@ -1020,7 +1107,7 @@ def freeze_signal_vix_spike(
     """
     if vix_col not in macro.columns:
         return pd.Series(False, index=macro.index)
-    vix = macro[vix_col].fillna(method="ffill")
+    vix = macro[vix_col].ffill()
 
     # Rolling pctile rank
     roll_pctile = vix.rolling(pctile_lookback, min_periods=60).rank(pct=True)
@@ -1073,7 +1160,7 @@ def freeze_signal_spy_drawdown(
     """
     if spy_col not in macro.columns:
         return pd.Series(False, index=macro.index)
-    spy = macro[spy_col].fillna(method="ffill")
+    spy = macro[spy_col].ffill()
     roll_peak = spy.rolling(peak_lookback, min_periods=5).max()
     dd = spy / roll_peak - 1.0  # ≤ 0
 
@@ -1104,12 +1191,33 @@ def combo_v2_with_freeze(
     use_vix_channel: bool = True,
     use_dd_channel: bool = True,
     return_freeze_series: bool = False,
+    daily_freeze: bool = True,
 ) -> pd.DataFrame:
     """combo_v2 3-sleeve blend (xs_momentum + dual_momentum_voltarget +
     adaptive_voltarget_momentum) with the v6 freeze applied on top.
 
+    Blend warm-up caveat (known property of the published record): the blend
+    always divides by 3, but the three sleeves start emitting weights at
+    different dates, so for roughly the first ~6 months the combo runs at
+    reduced exposure (1/3 or 2/3 of full) until all sleeves are live.
+
+    Freeze granularity: `daily_freeze=True` (default, corrected) expands the
+    blend onto the freeze signal's daily calendar (reindex+ffill), zeroes the
+    frozen days, and returns a DAILY weights frame — this matches how the
+    published V6 numbers were produced (run_v6.py builds the base blend itself
+    and applies its own daily `apply_freeze`; it never called this function).
+    `daily_freeze=False` reproduces this function's old buggy behavior — the
+    freeze was applied only on the sparse monthly decision index, so the stale
+    book was held through frozen days between decisions (the exact bug
+    REPORT.md V6 describes). That sparse path produced NO published number;
+    it is kept only for forensic comparison.
+
+    Callers passing the daily frame to engine_v2.run_backtest_v2 should set
+    weights_are_daily=True (backtest.run_backtest handles either shape).
+
     Returns weights DataFrame. When `return_freeze_series=True`, also
-    returns the boolean Series of frozen dates as the second tuple element.
+    returns the boolean Series of frozen dates (same index as the returned
+    frame) as the second tuple element.
     """
     # Sleeves
     w_xs = xs_momentum(prices, macro, n_long=30)
@@ -1124,20 +1232,31 @@ def combo_v2_with_freeze(
     w_adapt = w_adapt.reindex(index=dates, columns=cols, fill_value=0.0)
     blended = (w_xs + w_dual + w_adapt) / 3.0
 
-    # Compute freeze series — daily index (not just decision dates) so
-    # the forward-fill in the backtester picks the latest freeze state.
-    freeze_total = pd.Series(False, index=blended.index)
+    # Freeze channels live on macro's daily calendar.
+    channel_freeze = pd.Series(False, index=macro.index)
     if use_vix_channel:
-        vix_freeze = freeze_signal_vix_spike(macro).reindex(blended.index, method="ffill").fillna(False)
-        freeze_total = freeze_total | vix_freeze
+        channel_freeze = channel_freeze | freeze_signal_vix_spike(macro)
     if use_dd_channel:
-        dd_freeze = freeze_signal_spy_drawdown(macro).reindex(blended.index, method="ffill").fillna(False)
-        freeze_total = freeze_total | dd_freeze
+        channel_freeze = channel_freeze | freeze_signal_spy_drawdown(macro)
 
-    # Apply freeze: zero all weights on frozen dates
-    frozen_mask = freeze_total.values
-    if frozen_mask.any():
-        blended.loc[freeze_total[freeze_total].index] = 0.0
+    if daily_freeze:
+        # Expand the sparse decision-date blend to the daily calendar, then
+        # zero the frozen days — the live bot skips its rebalance cron on
+        # every frozen day, which is what a daily zero simulates.
+        all_dates = sorted(set(blended.index) | set(channel_freeze.index))
+        blended = blended.reindex(all_dates).ffill().fillna(0.0)
+        freeze_total = channel_freeze.reindex(all_dates).fillna(False).astype(bool)
+        if freeze_total.any():
+            blended.loc[freeze_total[freeze_total].index] = 0.0
+    else:
+        # Legacy sparse bug path: zeroes weights only on the monthly decision
+        # index; the ffill in the backtester holds the stale book through
+        # frozen days between decisions.
+        freeze_total = (
+            channel_freeze.reindex(blended.index, method="ffill").fillna(False).astype(bool)
+        )
+        if freeze_total.any():
+            blended.loc[freeze_total[freeze_total].index] = 0.0
 
     if return_freeze_series:
         return blended, freeze_total

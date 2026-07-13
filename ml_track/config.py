@@ -3,6 +3,10 @@
 DEV_END = "2022-12-31"
 HORIZON = 21            # forward-return horizon in trading days
 EMBARGO = 21            # trading days dropped before each test fold start
+                        # (2026-07 audit: a NO-OP — fully subsumed by the
+                        # label-end purge in cv.py, which already removes
+                        # every row it would remove. Kept as pre-registered;
+                        # changing it would change the registered folds.)
 TRAIN_GRID = 5          # row-sampling grid for TRAINING rows (trading days)
 REBAL = 21              # portfolio decision grid (trading days)
 COST_BPS = 5

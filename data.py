@@ -3,6 +3,34 @@
 Reads daily OHLCV parquet bars from the prior Trading bot 6 cache. Builds a
 panel (date x ticker) of closing prices, returns, and volume. Macro ETFs and
 sector ETFs are loaded separately for regime / sector-rotation strategies.
+
+Known limitations / survivorship bias
+-------------------------------------
+The local bar cache is survivors-only. An audit found that 0 of the ~1,040
+tickers stop trading before the window end, and known in-window delistings
+(SIVB, FRC, TWTR, BBBY, ATVI, CERN, ...) are entirely absent: the universe
+was snapshotted at cache-build time, so every name in it is a company that
+survived (or was never removed from) the listing through ~2026. This is NOT
+correctable from this cache.
+
+Why it matters: momentum backtests are structurally inflated by this bias.
+Names that blew up, were acquired at a discount, or delisted mid-window are
+exactly the ones a long-momentum book would have held into the drawdown (or
+a short book would have profited from); removing them retroactively deletes
+their losses from the sample. Over a 10-year window the inflation compounds
+and affects the whole strategy chain built on load_panel.
+
+A real fix requires (a) point-in-time index/universe constituent lists and
+(b) bars for delisted names including terminal delisting returns (e.g. CRSP
+delisting-adjusted returns). Neither is available in the local cache, so
+results built on this data layer must be read as upper bounds.
+
+A related — and correctable — issue is the outlier filter: see the
+`outlier_mode` parameter of load_panel. The published-record default
+("full_window") drops a ticker from the whole window if ANY single-day
+|return| > threshold occurs ANYWHERE in the window, i.e. future information
+conditions the past. "point_in_time" instead truncates the series at the
+first offending date, like a delisting.
 """
 from __future__ import annotations
 
@@ -47,6 +75,42 @@ def list_stock_tickers() -> tuple[str, ...]:
     return tuple(p.stem for p in files)
 
 
+def _apply_outlier_filter(
+    df: pd.DataFrame,
+    mode: str,
+    threshold: float,
+) -> tuple[pd.DataFrame | None, pd.Timestamp | None]:
+    """Outlier handling for one ticker's bar frame.
+
+    Returns (frame, first_event_date):
+      - "full_window": (df, None) if no single-day |close-to-close return|
+        exceeds `threshold`; otherwise (None, first_event_date) and the
+        caller drops the ticker for the whole window (published-record
+        behavior — note this conditions the past on future information).
+      - "point_in_time": keeps all rows strictly BEFORE the first offending
+        date and drops everything from that date onward, as a delisting
+        would appear; returns the truncated frame and the event date
+        (or (df, None) if clean). NOTE: the event-day return itself is
+        excluded — a real delisting delivers the crash to the holder, so
+        this is optimistic for genuine blow-ups and correct only for data
+        errors; the two are indistinguishable from bars alone. Backtests in
+        PIT mode still understate blow-up losses for held names.
+    Frames without a "close" column pass through untouched.
+    """
+    if mode not in ("full_window", "point_in_time"):
+        raise ValueError(f"unknown outlier_mode: {mode!r}")
+    if "close" not in df.columns:
+        return df, None
+    daily = df["close"].pct_change(fill_method=None)
+    bad = daily.abs() > threshold
+    if not bad.any():
+        return df, None
+    first_bad = bad.idxmax()
+    if mode == "full_window":
+        return None, first_bad
+    return df.loc[df.index < first_bad], first_bad
+
+
 @lru_cache(maxsize=1)
 def load_panel(
     fields: tuple[str, ...] = ("close", "open", "high", "low", "volume"),
@@ -54,8 +118,13 @@ def load_panel(
     end: str = "2026-03-27",
     min_obs: int = 500,
     max_daily_abs_ret: float = 0.80,
+    outlier_mode: str = "full_window",
 ) -> dict[str, pd.DataFrame]:
     """Return dict[field] -> DataFrame indexed by date, columns = ticker.
+
+    NOTE: the universe is survivors-only regardless of parameters — see the
+    "Known limitations / survivorship bias" section of the module docstring.
+    Results are structurally inflated for momentum-style strategies.
 
     Drops tickers with:
       - fewer than `min_obs` valid closes inside the window (filters out
@@ -64,10 +133,19 @@ def load_panel(
         (likely a corporate-action discontinuity / data error). Default 80%
         rules out CHRD-style +25733% blips while leaving real meme-stock
         moves like GME +90% in place.
+
+    outlier_mode:
+      - "full_window" (default, reproduces the published record): a ticker
+        with any offending return anywhere in the window is dropped entirely,
+        which lets future events remove a name from the past.
+      - "point_in_time": the ticker's series is instead truncated at the
+        first offending date (all fields), as if it delisted there; the
+        `min_obs` check is re-applied after truncation.
     """
     tickers = list_stock_tickers()
     panels: dict[str, dict[str, pd.Series]] = {f: {} for f in fields}
     dropped_outlier = []
+    truncated: list[tuple[str, str]] = []
     for t in tickers:
         df = _read_one(BARS_DIR / f"{t}.parquet")
         if df is None:
@@ -75,10 +153,13 @@ def load_panel(
         df = df.loc[(df.index >= start) & (df.index <= end)]
         if len(df) < min_obs:
             continue
-        if "close" in df.columns:
-            daily = df["close"].pct_change(fill_method=None)
-            if (daily.abs() > max_daily_abs_ret).any():
-                dropped_outlier.append(t)
+        df, event_date = _apply_outlier_filter(df, outlier_mode, max_daily_abs_ret)
+        if df is None:
+            dropped_outlier.append(t)
+            continue
+        if event_date is not None:
+            truncated.append((t, event_date.date().isoformat()))
+            if len(df) < min_obs:  # re-check after truncation
                 continue
         for f in fields:
             if f in df.columns:
@@ -86,6 +167,10 @@ def load_panel(
     if dropped_outlier:
         print(f"[load_panel] dropped {len(dropped_outlier)} tickers with |daily ret| > {max_daily_abs_ret:.0%}: "
               f"{dropped_outlier[:10]}{'...' if len(dropped_outlier)>10 else ''}")
+    if truncated:
+        preview = ", ".join(f"{t}@{d}" for t, d in truncated[:10])
+        print(f"[load_panel] point-in-time truncated {len(truncated)} tickers at first |daily ret| > "
+              f"{max_daily_abs_ret:.0%}: {preview}{'...' if len(truncated) > 10 else ''}")
     out = {f: pd.DataFrame(series_dict).sort_index() for f, series_dict in panels.items()}
     # Align all field DataFrames to the union of dates and intersection of tickers
     common_tickers = sorted(set.intersection(*[set(df.columns) for df in out.values()]))

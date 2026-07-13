@@ -5,6 +5,38 @@
 
 ---
 
+## ⚠️ VALIDITY NOTICE (2026-07-12) — read before the numbers below
+
+A full audit (44-agent review, findings adversarially verified against the source) found that the record below was produced under four compounding validity problems. The body of this report is preserved as originally written; interpret it through this notice.
+
+**1. Survivorship-biased universe (NOT corrected — the biggest issue).** All 1,040 tickers in the data cache survive to the window end; zero in-window delistings (SIVB, FRC, TWTR, BBBY, ATVI, CERN etc. are absent entirely). A 10-year top-30 momentum backtest on an all-survivors universe is structurally inflated, and this cannot be fixed from the local cache (needs point-in-time constituents + delisted-name bars). **Every number in this report, including the corrected ones below, carries this bias.**
+
+**2. Stale execution engine.** All numbers below came from `backtest.py`, which executes every decision one full rebalance period (~21 days) late. Fixed in `engine_v2.py` (`next_open`).
+
+**3. Free leverage.** Neither engine charged margin interest on the 2×–2.5× long books. `engine_v2` now supports `margin_bps_annual`; the table below uses 6%/yr.
+
+**4. Arithmetic-mean headline.** "4.96 %/mo" is the arithmetic monthly mean; at 59% annualized vol, volatility drag means the compounded (geometric) rate — the number that determines what an account actually earns — was 3.80 %/mo. `metrics.summary()` now reports `geo_monthly`.
+
+### Corrected headline (combo_v2, engine_v2 `next_open`, 5bp costs, 6%/yr margin on borrowed notional)
+
+| Variant | Arith mo | **Geo mo** | Sharpe | MaxDD | Calmar |
+|---|---|---|---|---|---|
+| combo_v2_2x — as published (legacy engine, free margin) | 4.96 % | 3.80 % | 1.06 | −65.3 % | 0.87 |
+| combo_v2_2x — corrected execution, free margin | 5.22 % | 4.09 % | 1.14 | −60.2 % | 1.03 |
+| **combo_v2_2x — corrected execution + 6 % margin** | **4.80 %** | **3.68 %** | **1.06** | **−60.3 %** | **0.90** |
+| combo_v2_1.5x — corrected + 6 % margin | 3.75 % | 3.13 % | 1.09 | −48.7 % | 0.92 |
+| combo_v2_1x — corrected + 6 % margin (no borrowing at 1×) | 2.65 % | 2.37 % | 1.14 | −34.9 % | 0.93 |
+
+Notably, the execution fix *helps* (the stale engine was a drag, not a flatterer), and financing takes most of that back. On execution + financing + geometric accounting alone, the 3 %/mo claim survives at 2× (3.68 %/mo geo) and marginally at 1.5× (3.13 %/mo) — **before** the survivorship bias in point 1, which the literature suggests is worth multiple points per year for concentrated momentum and cannot be quantified locally. Treat "3 %/mo live" as **unproven**, not refuted.
+
+**5. Retraction — V6 `freeze_dd_v1` recommendation.** The freeze parameters were grid-searched (135 cells) on the full reporting window with no holdout; under corrected `next_open` execution the recommended `freeze_dd_v1` is *worse* than the un-frozen baseline (Calmar 0.987 vs 1.027). The "improves on every metric / recommended ship" language in the V6 section is retracted; `freeze_dd_v2` happens to hold up but is one surviving cell of an in-sample grid. Any freeze overlay must be re-selected on the dev window (≤ 2022-12-31) and validated once on 2023+, per the V7 protocol.
+
+**6. Selection contamination.** The combo_v2 champion itself was selected on the full 2016–2026 window during V5/V6, so the "locked" 2023–2026 validation window in the V7 program is quasi-out-of-sample at the sleeve level (disclosed in `results/v7/FINAL_VALIDATION_REPORT.md`).
+
+Code fixes accompanying this notice (all published-record reproduction paths preserved bit-exact; see git history from baseline `26764e1`): margin financing in `engine_v2`, `geo_monthly` + LPM2 Sortino + deflated-Sharpe kurtosis fix in `metrics*`, covariance-based vol-targeting (`vol_est="cov"` — the legacy diagonal formula never binds and was a no-op), daily-granularity freeze, deterministic Donchian, point-in-time outlier filtering (`outlier_mode="point_in_time"`), code-hash-versioned weight caches, ML-track calibration-leak fix, and pinned dependencies (`requirements.txt`).
+
+---
+
 ## TL;DR — the 3 %/mo answer (UPDATED 2026-06-04)
 
 | | Mean / mo | Median / mo | Sharpe | Max DD | Calmar | Leverage | What it is |
@@ -202,6 +234,8 @@ Next step suggestion: re-bundle `combo_v1` as `combo_v2` (blend of xs_momentum +
 ---
 
 ## V6 — Bad-period freeze (2026-06-09)
+
+> **RETRACTED 2026-07-12** — see Validity Notice §5: the v1 "recommended ship" variant is worse than baseline under corrected execution; parameters were grid-searched in-sample. Section preserved as originally written.
 
 After combo_v2's first live week produced a -11.1 % drawdown (cutloss tier 3 fired on day 2, individual hard stops thereafter), V6 asked: can we PROACTIVELY freeze the bot to cash on a forward-looking regime signal, BEFORE the reactive cutloss fires?
 

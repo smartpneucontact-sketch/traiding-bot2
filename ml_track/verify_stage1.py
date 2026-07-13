@@ -14,6 +14,15 @@ Checks:
   V5. Raw-score (pre-isotonic) check for B_cls — reproduces the ad-hoc
       verification rows: isotonic ties can change Spearman IC; report both.
 
+NOTE (2026-07 audit): the audit fixes post-date the Stage-1 ledger — the
+core/ES boundary purge in cv.py changes fold training rows, train.py now
+sets deterministic/force_col_wise, and B_cls defaults to RAW scores (the
+pooled-OOF isotonic was a leak; S1_05 rank_ic 0.0326 calibrated vs 0.0246
+raw). V1 therefore re-runs B_cls with legacy_calibrated_metrics=True and is
+reported as an INFORMATIONAL drift check, excluded from the final verdict:
+re-runs of the fixed pipeline are not expected to bit-match the pre-fix
+ledger.
+
 Run:  /opt/anaconda3/bin/python3 -m ml_track.verify_stage1
 """
 from __future__ import annotations
@@ -38,12 +47,15 @@ TOL = 1e-9
 
 def v1_determinism():
     print("── V1 determinism (fresh-process WF re-run vs ledger) ──")
+    print("  [informational since the 2026-07 audit fixes — see module "
+          "docstring; drift vs the pre-fix ledger is expected]")
     led = pd.read_csv(LEDGER)
     ok = True
     for exp_id in ("S1_01_Arank_L1", "S1_05_Bcls_L1"):
         spec = C.STAGE1_EXPERIMENTS[exp_id]
         wf = run_walkforward(spec["arch"], spec["label"], spec["pool"],
-                             spec["grid"], spec["monotone"], spec["hp"])
+                             spec["grid"], spec["monotone"], spec["hp"],
+                             legacy_calibrated_metrics=(spec["arch"] == "B_cls"))
         m = wf["metrics"]
         row = led[led.exp_id == exp_id].iloc[-1]
         for col, key, nd in (("rank_ic", "rank_ic", 5),
@@ -171,5 +183,7 @@ if __name__ == "__main__":
     r3 = v3_label()
     r4 = v4_gate()
     r5 = v5_rawscore()
-    print("\nVERDICT:", "ALL CHECKS PASSED" if (r1 and r2 and r3 and r4)
+    # V1 excluded from the verdict since the 2026-07 audit fixes (expected
+    # drift vs the pre-fix ledger); reported above as informational.
+    print("\nVERDICT:", "ALL CHECKS PASSED" if (r2 and r3 and r4)
           else "CHECK FAILURES — see above")

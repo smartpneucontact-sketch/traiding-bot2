@@ -12,14 +12,17 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# AUDIT NOTE: align_to_stock_cols, buy_hold_spy, mean_reversion and
+# trend_following are imported but never used in this module. Kept as-is —
+# this file is part of the published-record rebuild chain; do not delete.
 from strategies import (
-    align_to_stock_cols,
-    buy_hold_spy,
+    align_to_stock_cols,      # AUDIT: unused (referenced only in a comment)
+    buy_hold_spy,             # AUDIT: unused
     dual_momentum_voltarget,
     market_regime,
-    mean_reversion,
+    mean_reversion,           # AUDIT: unused
     sector_rotation,
-    trend_following,
+    trend_following,          # AUDIT: unused
     xs_momentum,
 )
 
@@ -37,6 +40,8 @@ def regime_gate(weights: pd.DataFrame, macro: pd.DataFrame,
     regime = market_regime(macro)
     # Reindex on weights' index
     r = regime.reindex(weights.index).ffill().fillna(0.0)
+    # AUDIT: dead assignment — unconditionally overwritten by the np.where
+    # below. Kept as-is (published-record rebuild chain).
     exp = pd.Series(min_exposure, index=r.index, dtype=float)
     exp = np.where(r > 0.3, 1.0,
           np.where(r > 0.0, neutral_exposure + (1.0 - neutral_exposure) * r / 0.3,
@@ -89,6 +94,11 @@ def fast_drawdown_gate(weights: pd.DataFrame, macro: pd.DataFrame,
     dd = (spy / rolling_high - 1.0)
     # Map DD (negative number) → exposure in [0, 1]
     exp = ((cash_dd + dd) / (cash_dd - full_dd)).clip(0.0, 1.0)
+    # AUDIT NOTE: the daily exposure series is sampled ONLY on `weights` rows
+    # (the strategy's rebalance dates); the backtester then ffills the gated
+    # weights between rebalances. The gate therefore reacts at the caller's
+    # rebalance frequency, not daily — "fast" is misleading for the monthly
+    # momentum variants below (same sampling applies to vol_target_overlay).
     exp = exp.reindex(weights.index).ffill().fillna(1.0)
     return weights.mul(exp, axis=0)
 
@@ -100,13 +110,21 @@ def regime_gated_momentum(prices: pd.DataFrame, macro: pd.DataFrame, **kwargs) -
 
 
 def fast_dd_momentum(prices: pd.DataFrame, macro: pd.DataFrame) -> pd.DataFrame:
-    """xs_momentum_top30 + fast SPY-drawdown-based gate."""
+    """xs_momentum_top30 + fast SPY-drawdown-based gate.
+
+    AUDIT NOTE: xs_momentum rebalances monthly, and fast_drawdown_gate samples
+    its exposure only on those rows — between rebalances the gate does not
+    update, so the "fast" 60-day DD gate effectively updates monthly here."""
     w = xs_momentum(prices, macro, n_long=30)
     return fast_drawdown_gate(w, macro, lookback=60, full_dd=0.04, cash_dd=0.12)
 
 
 def fast_dd_voltarget_momentum(prices: pd.DataFrame, macro: pd.DataFrame) -> pd.DataFrame:
-    """Best-of-three: momentum + fast DD gate + vol target."""
+    """Best-of-three: momentum + fast DD gate + vol target.
+
+    AUDIT NOTE: both the DD gate and the vol-target overlay are sampled only
+    on xs_momentum's monthly rebalance rows (see fast_drawdown_gate /
+    vol_target_overlay) — neither risk control updates between rebalances."""
     w = xs_momentum(prices, macro, n_long=30)
     w = fast_drawdown_gate(w, macro, lookback=60, full_dd=0.04, cash_dd=0.12)
     return vol_target_overlay(w, prices, target_vol=0.22, max_leverage=1.0, min_leverage=0.2)
@@ -129,6 +147,16 @@ def final_3pct_target(
       - Overlay 2: portfolio vol target ≈ 20% annual.
 
     Trades weekly to keep turnover manageable. Long-only.
+
+    AUDIT NOTE — the description of Overlay 1 above contradicts the code:
+      * Actual gate params are full_dd=0.08, cash_dd=0.18: a LINEAR ramp from
+        100% exposure at 8% SPY DD down to 0% at 18% DD. There is no 0.5 step
+        at 8% and full cash arrives at 18%, not 15%.
+      * The gate multiplies EVERY column, including the 10% SHY sleeve — the
+        "pure cash ballast for COVID-style shocks" is scaled toward zero by
+        the DD gate exactly during crashes, so it provides no ballast when it
+        is supposed to. (Vol-target overlay rescales it too.)
+    Behavior kept as-is: published-record rebuild chain.
     """
     cols = pricing_universe.columns
     union_idx = pricing_universe.index
@@ -143,6 +171,8 @@ def final_3pct_target(
     full[common_dm] = full[common_dm].values + 0.30 * w_dm[common_dm].values
 
     # 10% SHY for the cash buffer (if present in macro/columns)
+    # AUDIT: this "buffer" is NOT exempt from the DD gate / vol target below —
+    # it is scaled away together with the stock sleeves during crashes.
     if "SHY" in cols:
         full["SHY"] = full["SHY"].values + 0.10
     elif "TLT" in cols:
@@ -150,7 +180,7 @@ def final_3pct_target(
     else:
         full["SPY"] = full["SPY"].values + 0.10  # last resort
 
-    # Fast DD gate
+    # Fast DD gate — linear ramp 8%→18% DD (docstring's 0.5-step/15% is wrong)
     full = fast_drawdown_gate(full, macro, lookback=60, full_dd=0.08, cash_dd=0.18)
 
     # Vol-target the whole thing (cap leverage at 1.0)

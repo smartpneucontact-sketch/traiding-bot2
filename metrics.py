@@ -37,6 +37,20 @@ def mean_monthly_return(equity: pd.Series) -> float:
     return float(m.mean()) if len(m) else float("nan")
 
 
+def geo_monthly_return(equity: pd.Series) -> float:
+    """Geometric monthly return: (1+CAGR)**(1/12) - 1.
+
+    This is the correct metric for "X%/month" compounding targets. The
+    arithmetic `mean_monthly` overstates the compounded rate by roughly
+    vol^2/2 per period (~1.2pp/mo at 59% annualized vol); use this instead
+    when quoting a monthly rate. NaN-safe: returns nan when cagr is nan.
+    """
+    c = cagr(equity)
+    if np.isnan(c):
+        return float("nan")
+    return float((1.0 + c) ** (1.0 / 12.0) - 1.0)
+
+
 def median_monthly_return(equity: pd.Series) -> float:
     m = monthly_returns(equity)
     return float(m.median()) if len(m) else float("nan")
@@ -49,18 +63,30 @@ def annualized_vol(equity: pd.Series) -> float:
 
 def sharpe(equity: pd.Series, rf: float = 0.0) -> float:
     r = daily_returns(equity)
-    if r.std() == 0 or len(r) == 0:
+    if len(r) == 0:
         return float("nan")
     excess = r - rf / ANN
-    return float(excess.mean() / r.std() * np.sqrt(ANN))
+    if excess.std() == 0:
+        return float("nan")
+    return float(excess.mean() / excess.std() * np.sqrt(ANN))
 
 
 def sortino(equity: pd.Series, rf: float = 0.0) -> float:
-    r = daily_returns(equity) - rf / ANN
-    downside = r[r < 0]
-    if len(downside) == 0 or downside.std() == 0:
+    """Sortino ratio using the standard downside deviation (LPM2).
+
+    downside_dev = sqrt(mean(min(excess, 0)**2)) over ALL observations —
+    not the sample std of negative returns around their own mean, which the
+    pre-2026-07-12 version used. Values are NOT comparable to ledger rows
+    recorded before 2026-07-12.
+    """
+    r = daily_returns(equity)
+    if len(r) == 0:
         return float("nan")
-    return float(r.mean() / downside.std() * np.sqrt(ANN))
+    excess = r - rf / ANN
+    downside_dev = float(np.sqrt(np.mean(np.minimum(excess, 0.0) ** 2)))
+    if downside_dev == 0:
+        return float("nan")
+    return float(excess.mean() / downside_dev * np.sqrt(ANN))
 
 
 def max_drawdown(equity: pd.Series) -> float:
@@ -96,7 +122,7 @@ def yearly_returns(equity: pd.Series) -> pd.Series:
     return equity.resample("YE").last().pct_change().dropna()
 
 
-def summary(equity: pd.Series, name: str = "strategy") -> dict:
+def summary(equity: pd.Series, name: str = "strategy", rf: float = 0.0) -> dict:
     return {
         "name": name,
         "start": str(equity.index[0].date()) if len(equity) else None,
@@ -105,11 +131,12 @@ def summary(equity: pd.Series, name: str = "strategy") -> dict:
         "final_equity": float(equity.iloc[-1]) if len(equity) else float("nan"),
         "cagr": cagr(equity),
         "ann_vol": annualized_vol(equity),
-        "sharpe": sharpe(equity),
-        "sortino": sortino(equity),
+        "sharpe": sharpe(equity, rf=rf),
+        "sortino": sortino(equity, rf=rf),
         "max_drawdown": max_drawdown(equity),
         "calmar": calmar(equity),
         "mean_monthly": mean_monthly_return(equity),
+        "geo_monthly": geo_monthly_return(equity),
         "median_monthly": median_monthly_return(equity),
         "hit_rate_monthly": hit_rate(equity),
         "worst_month": worst_month(equity),

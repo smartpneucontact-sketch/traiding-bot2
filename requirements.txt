@@ -1,0 +1,12 @@
+# Pinned to the interpreter the campaign actually ran on:
+#   /opt/anaconda3/bin/python  (Python 3.13.5)
+# The validation suite asserts machine-precision reproduction of the published
+# record; pandas/numpy version drift can break those tolerances — install
+# exactly these versions before running validation/ or regenerating results.
+pandas==2.2.3
+numpy==2.1.3
+scipy==1.15.3
+pyarrow==24.0.0
+# ml_track only:
+lightgbm==4.6.0
+scikit-learn==1.6.1

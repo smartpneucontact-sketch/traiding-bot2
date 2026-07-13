@@ -11,6 +11,7 @@ Protocol (binding — see plans/V7):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pickle
 import time
@@ -20,13 +21,20 @@ import numpy as np
 import pandas as pd
 
 from engine_v2 import BTConfigV2, run_backtest_v2
-from metrics_v2 import DEV_END, crash_table
+from metrics_v2 import DEV_END, VAL_START, crash_table
 
 ROOT = Path(__file__).resolve().parent
 TRIALS_DIR = ROOT / "results" / "v7" / "trials"
 WEIGHTS_STORE = ROOT / "weights_store"
 TRIALS_DIR.mkdir(parents=True, exist_ok=True)
 WEIGHTS_STORE.mkdir(exist_ok=True)
+
+# Cache version tag: sha1 over the strategy-defining sources, so cached
+# weight frames are invalidated automatically when strategy code changes.
+_CODE_HASH = hashlib.sha1(
+    b"".join((ROOT / f).read_bytes()
+             for f in ("strategies.py", "strategies_v2.py", "ensemble.py"))
+).hexdigest()[:10]
 
 _CACHE = {}
 
@@ -49,8 +57,15 @@ def union_prices_cached() -> pd.DataFrame:
 
 
 def cached_weights(key: str, builder) -> pd.DataFrame:
-    """Parquet-cache a (slow) sleeve/strategy weight frame by key."""
-    p = WEIGHTS_STORE / f"{key}.parquet"
+    """Parquet-cache a (slow) sleeve/strategy weight frame by key.
+
+    The cache path embeds `_CODE_HASH`: keying by name alone was unsafe
+    because an edit to strategies.py/strategies_v2.py/ensemble.py would
+    silently serve weights built by the OLD code. Pre-existing unversioned
+    {key}.parquet files are left on disk untouched — they are published-record
+    artifacts that other scripts read by explicit path.
+    """
+    p = WEIGHTS_STORE / f"{key}__{_CODE_HASH}.parquet"
     if p.exists():
         return pd.read_parquet(p)
     w = builder()
@@ -107,12 +122,23 @@ def run_trial(
                          weights_are_daily=weights_are_daily)
     eq = bt["equity"]
     if window == "val":
-        eq = eq.loc["2023-01-01":]
+        eq = eq.loc[VAL_START:]
         eq = eq / eq.iloc[0] * 100_000.0
         from metrics import summary as msum
         s = msum(eq, name=name)
-        s["turnover_annualized"] = bt["summary"].get("turnover_annualized")
-        s["avg_gross_exposure"] = bt["summary"].get("avg_gross_exposure")
+        # Exposure/turnover stats recomputed on the val slice (the full-run
+        # summary mixes in the dev burn-in). Slicing convention: effective
+        # daily weights from VAL_START on; diff() row 1 is NaN (no prior row
+        # inside the slice) and would sum to a synthetic 0-turnover day, so
+        # drop it via iloc[1:]. The book itself was established during the
+        # dev burn-in, so its entry cost is charged to dev, not val; a trade
+        # landing exactly on the first val day is invisible to this stat
+        # (its cost still hits val equity) — accepted, sub-bp effect.
+        eff = bt["weights"].loc[VAL_START:]
+        turnover = eff.diff().abs().sum(axis=1).iloc[1:]
+        s["turnover_annualized"] = float(turnover.mean() * 252.0)
+        s["avg_gross_exposure"] = float(eff.abs().sum(axis=1).mean())
+        s["avg_n_positions"] = float((eff.abs() > 1e-6).sum(axis=1).mean())
     else:
         s = bt["summary"]
 
@@ -142,9 +168,20 @@ def run_trial(
             "weights": bt["weights"], "row": row}
 
 
-def trial_count() -> int:
-    """Total logged trials across all families (deflated-Sharpe input)."""
-    n = 0
-    for f in TRIALS_DIR.glob("*.csv"):
-        n += sum(1 for _ in open(f)) - 1
-    return n
+def trial_count(dedupe: bool = True) -> int:
+    """Logged trials across all families (deflated-Sharpe input).
+
+    Ledgers are append-only, so re-running an experiment script re-logs the
+    same configs. Re-runs are not new hypotheses: counting raw rows deflates
+    the Sharpe too aggressively AND makes the count depend on how many times
+    scripts were executed. Default counts UNIQUE trials by the identifying
+    columns; dedupe=False gives the old raw row count.
+    """
+    key_cols = ["family", "name", "window", "exec_model", "tc_bps",
+                "leverage_cap", "params_json"]
+    if not dedupe:
+        return sum(sum(1 for _ in open(f)) - 1 for f in TRIALS_DIR.glob("*.csv"))
+    frames = [pd.read_csv(f, usecols=key_cols) for f in TRIALS_DIR.glob("*.csv")]
+    if not frames:
+        return 0
+    return int(len(pd.concat(frames, ignore_index=True).drop_duplicates()))

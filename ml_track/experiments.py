@@ -91,10 +91,16 @@ def get_dataset(pool: int) -> pd.DataFrame:
 # ───────────────────────────── walk-forward ─────────────────────────────
 
 def run_walkforward(arch: str, label: str, pool: int, grid: int,
-                    monotone: bool, hp_name: str = "HP_S") -> dict:
+                    monotone: bool, hp_name: str = "HP_S",
+                    legacy_calibrated_metrics: bool = False) -> dict:
     """Purged anchored WF -> pooled OOF scores + signal metrics. Memoized on
-    the model key so weighting-only variants reuse the same OOF."""
-    mkey = f"wf_{arch}_{label}_p{pool}_g{grid}_m{int(monotone)}_{hp_name}"
+    the model key so weighting-only variants reuse the same OOF.
+
+    legacy_calibrated_metrics: reproduce the pre-2026-07 (leaky) B_cls
+    isotonic step for ledger reproduction/audits only — see the comment at
+    the calibration block below. Default False = raw scores everywhere."""
+    mkey = (f"wf_{arch}_{label}_p{pool}_g{grid}_m{int(monotone)}_{hp_name}"
+            + ("_legacyiso" if legacy_calibrated_metrics else ""))
     if mkey in _MEM:
         return _MEM[mkey]
     t0 = time.time()
@@ -137,7 +143,19 @@ def run_walkforward(arch: str, label: str, pool: int, grid: int,
         oof_parts.append(sc)
     oof = pd.concat(oof_parts).sort_index()
 
-    if arch == "B_cls":   # isotonic on pooled OOF (monotone; ranks unchanged)
+    # B_cls isotonic calibration — REMOVED from the default path (2026-07
+    # audit, leakage). The original code fit IsotonicRegression on POOLED
+    # out-of-fold scores vs REALIZED labels across all test years, then
+    # re-scored those same rows: the fit is monotone but its tie-flattening
+    # is informed by future outcomes and altered the Spearman-based Gate-1
+    # metrics and the I2 decision frame. Measured impact: S1_05_Bcls_L1
+    # rank_ic 0.0326 calibrated vs 0.0246 raw — the leak pushed it over the
+    # 0.03 gate (ledger rows logged before this fix carry calibrated values).
+    # Gate-1 metrics and build_decision_frame are rank-based, so calibration
+    # is unnecessary; raw predict_proba scores are used. If calibrated
+    # probabilities are ever genuinely consumed downstream, fit the
+    # calibrator per-fold on that fold's TRAINING rows only.
+    if arch == "B_cls" and legacy_calibrated_metrics:
         ev_rows = oof["_is_eval_grid"] & oof["r_fwd21"].notna()
         ycol_bin = {"L1": "L3", "L2": "L3v"}[label]
         ybin = get_dataset(pool).loc[oof.index[ev_rows], ycol_bin].to_numpy()

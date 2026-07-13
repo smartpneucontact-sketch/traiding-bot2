@@ -16,7 +16,8 @@ Additions over ml_track.experiments:
   - L4 label = per-date cross-sectional OLS residual of L1 (= pctrank of
     r_fwd21) on mom_12_1_r (= pctrank of 12-1 momentum within the candidate
     set), re-pct-ranked within date so the ranker's quintile bucketing
-    (label*5) stays valid. Rows with NaN L1 stay NaN.
+    (label*5) stays valid. Rows with NaN L1 stay NaN. L4b = median split
+    of L4 (the L3-analog binary target, so B_cls x L4 is runnable).
   - run_walkforward_x: same purged anchored WF as Stage 1 (memoized), but
     parameterized by feature set and seed (for Stage-3 seed jitter).
 """
@@ -178,8 +179,9 @@ def get_dataset_x(pool: int, fset: str) -> pd.DataFrame:
 
 def add_l4(ds: pd.DataFrame) -> pd.DataFrame:
     """L4 = pctrank-within-date of the residual from per-date OLS of L1 on
-    mom_12_1_r (both already in [0,1])."""
-    if "L4" in ds.columns:
+    mom_12_1_r (both already in [0,1]). Also adds L4b = median-split binary
+    analog of L4 (mirrors L3/L3v) so B_cls x L4 has a target."""
+    if "L4" in ds.columns and "L4b" in ds.columns:
         return ds
     x = ds["mom_12_1_r"].astype(float)
     y = ds["L1"].astype(float)
@@ -197,6 +199,8 @@ def add_l4(ds: pd.DataFrame) -> pd.DataFrame:
     resid = yc - b * xc
     ds = ds.copy()
     ds["L4"] = resid.groupby(level=0).rank(pct=True)
+    ds["L4b"] = (ds["L4"] > 0.5).astype(float)
+    ds.loc[ds["L4"].isna(), "L4b"] = np.nan
     return ds
 
 
@@ -225,7 +229,15 @@ def run_walkforward_x(arch: str, label: str, pool: int, grid: int,
     if arch in ("A_rank", "A_reg"):
         ycol = label
     else:
-        ycol = {"L1": "L3", "L2": "L3v"}[label]
+        # B_cls needs a binary target: L3 (for L1), L3v (for L2), L4b (for
+        # L4; built by add_l4). A bare {L1,L2}-only lookup here used to
+        # crash B_cls x L4 runs with KeyError.
+        bmap = {"L1": "L3", "L2": "L3v", "L4": "L4b"}
+        if label not in bmap:
+            raise ValueError(
+                f"B_cls has no registered binary analog for label {label!r} "
+                f"(known: {sorted(bmap)})")
+        ycol = bmap[label]
 
     dser = pd.Series(dates_lvl, index=ds.index)
     cv = PurgedAnchoredWF(panel["close"].index)

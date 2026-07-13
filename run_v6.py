@@ -1,5 +1,7 @@
 """run_v6 — back-test the two-channel freeze on combo_v2.
 
+SUPERSEDED by the V7 program (engine_v2 / exp_lib) — kept for the published record only.
+
 Compares:
   combo_v2_2x_baseline       — current production (no freeze)
   combo_v2_2x_freeze_both    — VIX spike + SPY DD freeze

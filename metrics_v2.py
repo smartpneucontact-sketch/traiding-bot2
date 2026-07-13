@@ -76,6 +76,11 @@ def deflated_sharpe(
     scale at which the PSR formula operates. If the cross-trial SR variance
     is unknown, a conservative default equal to the squared observed daily
     SR is used.
+
+    PSR denominator is sqrt(1 - skew*SR + (kurt-1)/4 * SR^2) with kurt the
+    FULL kurtosis (normal = 3). We take EXCESS kurtosis as input, so the
+    coefficient is (excess_kurtosis + 2)/4; a pre-2026-07-12 version used
+    (excess_kurtosis - 1)/4, which understated the variance of SR-hat.
     """
     if n_obs_daily < 30 or n_trials < 1:
         return float("nan")
@@ -88,7 +93,7 @@ def deflated_sharpe(
              + emc * stats.norm.ppf(1 - 1.0 / (n_trials * np.e)))
     sr0 = np.sqrt(v) * max_z  # expected max SR under H0 across trials
     denom = np.sqrt(max(1e-12,
-                        1 - skew * sr + (excess_kurtosis - 1) / 4.0 * sr ** 2))
+                        1 - skew * sr + (excess_kurtosis + 2) / 4.0 * sr ** 2))
     z = (sr - sr0) * np.sqrt(n_obs_daily - 1) / denom
     return float(stats.norm.cdf(z))
 

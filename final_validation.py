@@ -20,7 +20,13 @@ This is the ONLY evaluation of 2023-01-01..2026-03-27. Protocol (binding):
      pre-existing ledger's annual-Sharpe column converted to daily scale).
   6. GATES G3 (validation) / G4 (full), reported PASS/FAIL with no re-tuning.
   7. OUTPUTS: results/v7/final_validation.json,
-     results/v7/FINAL_VALIDATION_REPORT.md; ledger rows: champion through
+     results/v7/FINAL_VALIDATION_REPORT.md (rendered from the json by
+     write_report() — regenerable standalone via `--report-only`, which
+     exits before the module-level data load and never recomputes; the
+     report carries the selection-contamination disclosure: the champion
+     benchmark anchoring the G3 gates was itself selected on the full
+     window incl. 2023-2026, so val-window results are quasi-out-of-sample
+     at the sleeve level); ledger rows: champion through
      exp_lib.run_trial (family=FINAL_VALIDATION, final=True for val/full);
      tier candidates through the manual ledger
      results/v7/trials/FINAL_VALIDATION_tier.csv mirroring run_trial's schema
@@ -72,6 +78,222 @@ ANCHOR_TOL = 1e-3
 SLEEVE_FILES = ["sleeve_residual_mom_market_sector_raw_n30",
                 "sleeve_dual_momentum_voltarget_n30",
                 "sleeve_adaptive_voltarget_n30"]
+
+
+# ── Report renderer (json -> md, NO recomputation) ────────────────────────
+def _pc(x: float) -> str:
+    """Percent with 2dp; '—' for missing."""
+    return "—" if x is None else f"{float(x) * 100:.2f}%"
+
+
+def _f3(x: float) -> str:
+    return "—" if x is None else f"{float(x):.3f}"
+
+
+def _ev(ev: dict | None) -> str:
+    if not ev:
+        return "—"
+    return "/".join(str(int(ev[f"tier{k}"])) for k in (1, 2, 3))
+
+
+def write_report(results: dict | None = None) -> Path:
+    """Render results/v7/FINAL_VALIDATION_REPORT.md from the persisted
+    results/v7/final_validation.json. Pure formatting — every number comes
+    from the artifact; nothing is recomputed (the one-shot protocol forbids
+    re-evaluating the locked window)."""
+    if results is None:
+        results = json.loads(OUT_JSON.read_text())
+    meta = results["meta"]
+    L: list[str] = []
+    L.append("# FINAL VALIDATION REPORT — V7 program")
+    L.append("")
+    L.append(f"Rendered from `{OUT_JSON.relative_to(ROOT)}` "
+             f"(run generated {meta['generated']}); no recomputation.")
+    L.append("")
+    L.append(f"- Protocol: {meta['protocol']}")
+    L.append(f"- Full index: {meta['full_index'][0]} .. {meta['full_index'][1]} "
+             f"({meta['n_days_full']} days); tc=5bp unless stated; "
+             f"leverage cap 2.0")
+    L.append(f"- Deflated-Sharpe trial count: {meta['dsr_n_trials']} "
+             f"(ledger rows pre-run: {meta['sr_variance_n_ledger_rows_pre_run']})")
+    L.append("- Metric provenance: numbers in the artifact predate the "
+             "2026-07-12 metric fixes (deflated-Sharpe kurtosis term, LPM2 "
+             "sortino, deduped trial counts) and are rendered as recorded; "
+             "deltas are immaterial at skew=0/excess_kurt=0 inputs but the "
+             "values are not regenerable byte-identically from current code.")
+    if "HARD_STOP" in meta:
+        L.append("")
+        L.append(f"**HARD STOP: {meta['HARD_STOP']}**")
+
+    L.append("")
+    L.append("## Selection contamination (disclosure)")
+    L.append("")
+    L.append("The champion benchmark (`combo_v2_base_1x` × 2.0) that anchors "
+             "the G3 relative gates (val Calmar ≥ champion, 2026Q1 DD ≤ "
+             "champion) was itself selected on the FULL window — including "
+             "2023-2026, the very window used here as 'validation'. The "
+             "candidate sleeves' parameters were tuned on dev only, but the "
+             "bar they are measured against has seen the answer key. "
+             "Val-window results are therefore quasi-out-of-sample at the "
+             "sleeve level, not a clean out-of-sample test of the "
+             "candidate-vs-champion comparison.")
+
+    # Step 1 — fidelity anchors
+    s1 = results["step1_fidelity_anchors"]
+    L.append("")
+    L.append(f"## Step 1 — Fidelity anchors "
+             f"({'PASS' if s1['pass'] else 'FAIL'}, tol {meta['anchor_tolerance']})")
+    L.append("")
+    L.append("| name | max abs diff | tier events dev (ref) | pass |")
+    L.append("|---|---|---|---|")
+    for nm, a in s1.items():
+        if nm == "pass":
+            continue
+        md = max(float(v) for v in a["abs_diffs"].values())
+        ev = (f"{tuple(a['tier_events_dev'])} ({tuple(a['tier_events_ref'])})"
+              if "tier_events_dev" in a else "—")
+        L.append(f"| {nm} | {md:.2e} | {ev} | "
+                 f"{'PASS' if a['pass'] else 'FAIL'} |")
+
+    # Step 2 — validation window
+    # Steps 2-6 are absent from a HARD_STOP artifact — render what exists.
+    s2 = results.get("step2_validation_window", {})
+    if s2:
+        L.append("")
+        L.append(f"## Step 2 — Validation window {VAL_START}..{VAL_END} "
+                 f"(tc=5bp)")
+        L.append("")
+        L.append("| name | mean/mo | sharpe | maxDD | calmar | worst mo | "
+                 "hit | turn | gross | 26Q1 ret | 26Q1 dd | tier ev |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for nm, w in s2.items():
+            L.append(f"| {nm} | {_pc(w['mean_monthly'])} | {_f3(w['sharpe'])} | "
+                     f"{_pc(w['max_drawdown'])} | {_f3(w['calmar'])} | "
+                     f"{_pc(w['worst_month'])} | {_pc(w['hit_rate'])} | "
+                     f"{w['turnover_ann']:.1f} | {w['avg_gross']:.2f} | "
+                     f"{_pc(w['ep_2026Q1_ret'])} | {_pc(w['ep_2026Q1_dd'])} | "
+                     f"{_ev(w.get('tier_events'))} |")
+
+    # Step 3 — full window at tc 5/10/20
+    s3 = results.get("step3_full_window", {})
+    if s3:
+        L.append("")
+        L.append("## Step 3 — Full window at tc 5/10/20bp")
+        L.append("")
+        L.append("| name | tc | mean/mo | sharpe | maxDD | calmar | "
+                 "2018Q4 dd | covid dd | 2022 dd | 26Q1 dd |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|")
+        for nm, d in s3.items():
+            for tck, w in d.items():
+                eps = w.get("episodes", {})
+                epc = [_pc(eps.get(k, {}).get("max_dd"))
+                       for k in ("2018Q4", "covid", "2022", "2026Q1")]
+                L.append(f"| {nm} | {tck[2:]} | {_pc(w['mean_monthly'])} | "
+                         f"{_f3(w['sharpe'])} | {_pc(w['max_drawdown'])} | "
+                         f"{_f3(w['calmar'])} | {' | '.join(epc)} |")
+
+    # Step 4 — phi stress
+    s4 = results.get("step4_phi_stress", {})
+    if s4:
+        L.append("")
+        L.append("## Step 4 — Tier phi-stress (full window, tc=5bp)")
+        L.append("")
+        L.append(f"Champion full-window Calmar (tc=5): "
+                 f"{_f3(s4['champion_full_calmar_tc5'])}. "
+                 f"Promotion risk (TF1 phi=1.0 Calmar < champion): "
+                 f"{'YES' if s4['PROMOTION_RISK_TF1_phi1_below_champion'] else 'no'}.")
+        L.append("")
+        L.append("| name | phi | mean/mo | sharpe | maxDD | calmar | "
+                 "calmar drop vs phi0 | dd widening (pp) | tier ev |")
+        L.append("|---|---|---|---|---|---|---|---|---|")
+        for nm, d in s4["tables"].items():
+            for pk, w in d.items():
+                drop = w.get("calmar_drop_vs_phi0")
+                wide = w.get("dd_widening_pp")
+                L.append(f"| {nm} | {pk[3:]} | {_pc(w['mean_monthly'])} | "
+                         f"{_f3(w['sharpe'])} | {_pc(w['max_drawdown'])} | "
+                         f"{_f3(w['calmar'])} | "
+                         f"{_pc(drop) if drop is not None else '—'} | "
+                         f"{f'{wide:+.2f}' if wide is not None else '—'} | "
+                         f"{_ev(w.get('tier_events'))} |")
+
+    # Step 5 — statistics
+    s5 = results.get("step5_statistics", {})
+    if s5:
+        L.append("")
+        L.append("## Step 5 — Statistics")
+        L.append("")
+        L.append("Paired monthly diffs vs champion (full window), "
+                 "Newey-West lag 3:")
+        L.append("")
+        L.append("| name | mean diff /mo | NW t | n months |")
+        L.append("|---|---|---|---|")
+        for nm, w in s5["newey_west"].items():
+            L.append(f"| {nm} | {float(w['mean_monthly_diff'])*100:+.3f}% | "
+                     f"{float(w['nw_tstat_lag3']):+.3f} | {w['n_months']} |")
+        L.append("")
+        L.append(f"Deflated Sharpe (n_trials={meta['dsr_n_trials']}, "
+                 f"cross-trial SR var daily="
+                 f"{meta['sr_variance_daily_scale']:.3e}):")
+        L.append("")
+        L.append("| name | SR (ann) | skew | ex.kurt | P(true SR>0) | primary |")
+        L.append("|---|---|---|---|---|---|")
+        for nm, w in s5["deflated_sharpe"].items():
+            L.append(f"| {nm} | {_f3(w['observed_sharpe_annual'])} | "
+                     f"{float(w['skew']):+.2f} | "
+                     f"{float(w['excess_kurtosis']):.1f} | "
+                     f"{float(w['dsr_probability']):.4f} | "
+                     f"{'yes' if w['primary'] else ''} |")
+
+    # Step 6 — gates
+    s6 = results.get("step6_gates", {})
+    if s6:
+        L.append("")
+        L.append("## Step 6 — Gates (no re-tuning)")
+        L.append("")
+        L.append("G3 anchors (val Calmar, 2026Q1 DD) inherit the selection "
+                 "contamination disclosed above.")
+        for nm, g in s6.items():
+            L.append("")
+            L.append(f"### {nm} — G3 {'PASS' if g['G3_pass'] else 'FAIL'} / "
+                     f"G4 {'PASS' if g['G4_pass'] else 'FAIL'}")
+            L.append("")
+            L.append("| gate | criterion | result |")
+            L.append("|---|---|---|")
+            for k, v in g["G3_validation"].items():
+                L.append(f"| G3 | {k} | {'PASS' if v else 'FAIL'} |")
+            for k, v in g["G4_full"].items():
+                L.append(f"| G4 | {k} | {'PASS' if v else 'FAIL'} |")
+
+    # Per-year returns
+    pyr = results.get("per_year_returns", {})
+    if pyr:
+        names = list(pyr)
+        years = sorted(set().union(*[set(v) for v in pyr.values()]))
+        L.append("")
+        L.append("## Per-year returns (full window, tc=5bp)")
+        L.append("")
+        L.append("| year | " + " | ".join(names) + " |")
+        L.append("|---|" + "---|" * len(names))
+        for y in years:
+            L.append(f"| {y} | " +
+                     " | ".join(_pc(pyr[n].get(y)) for n in names) + " |")
+
+    L.append("")
+    L.append(f"Ledger trial count after run: "
+             f"{meta.get('ledger_trial_count_post_run', '—')}. "
+             f"Tier ledger: `{TIER_LEDGER.relative_to(ROOT)}`.")
+    L.append("")
+    OUT_MD.write_text("\n".join(L))
+    print(f"report -> {OUT_MD}")
+    return OUT_MD
+
+
+# --report-only: render the MD from the persisted json and exit BEFORE the
+# module-level data load below (no cache load, no recomputation).
+if __name__ == "__main__" and "--report-only" in sys.argv:
+    write_report()
+    sys.exit(0)
 
 # ── Cross-trial SR variance: computed BEFORE any new rows are logged ──────
 _sharpes = []
@@ -675,6 +897,9 @@ def main():
     OUT_JSON.write_text(json.dumps(results, indent=2, default=str))
     print(f"\nresults -> {OUT_JSON}")
     print(f"ledger total after run: {results['meta']['ledger_trial_count_post_run']}")
+    # render the MD from the just-persisted json (round-trip: report always
+    # reflects the artifact on disk, never in-memory state)
+    write_report(json.loads(OUT_JSON.read_text()))
     return results
 
 

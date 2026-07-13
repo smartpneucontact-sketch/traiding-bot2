@@ -10,6 +10,15 @@ L2 = pctrank of (r_fwd21 / (sigma60 * sqrt(21))) within the candidate set,
 L3 = 1{r_fwd21 > candidate-set median r_fwd21}.
 L3v = 1{vol-scaled r_fwd21 > candidate-set median} (the L2-analog for B_cls).
 Each row carries label_end_date = the calendar date at position t+22.
+
+DISCLOSURE (2026-07 audit, dev/val boundary bleed): dev decision dates run
+through DEV_END (2022-12-31) while each label consumes closes through t+22,
+so late-2022 rows read prices as far as 2023-02-02 — inside the LOCKED
+validation window. Model/candidate selection on dev metrics therefore saw
+~1 month of validation-period prices via these labels. Purging labels at
+DEV_END would change the pre-registered dev set, so the bleed is disclosed
+rather than fixed; treat 2023 validation results as marginally contaminated
+through 2023-02-02.
 """
 from __future__ import annotations
 

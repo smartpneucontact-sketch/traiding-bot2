@@ -1,5 +1,17 @@
 """Vectorised daily backtester.
 
+DEPRECATED — DO NOT USE FOR NEW RESEARCH.
+
+Known execution flaw: `weights.shift(1)` in run_backtest shifts the SPARSE weights
+frame (rows = rebalance dates only) BEFORE reindexing to the daily calendar,
+so each decision row takes effect one full rebalance period late (a month for
+monthly strategies), not one trading day as the docstrings below claim. This
+module is retained BIT-FROZEN solely so the validation scripts
+(validation/reproduce_baseline.py, validation/test_engine_v2.py) can reproduce
+the published record in results/results_v6.json to machine precision. All new
+research must use engine_v2.run_backtest_v2 (whose default exec_model fixes
+the lag; its `legacy_period` mode reproduces this module exactly).
+
 Each strategy returns a `weights` DataFrame: rows = decision dates (signal
 formed at close), columns = ticker, values = target weights (post-leverage,
 sum ≤ leverage_cap; negatives allowed for shorts).

@@ -22,10 +22,25 @@ Execution models
                    Costs on |Δw| at the open. NaN/absent opens fall back to the
                    prior close (the switch then happens at prior close — same
                    convention as validation/stop_grid.py).
-- ``next_close`` : signal at close t → trade at close of t+1 (true 1-day lag
-                   on the DAILY frame). Close-to-close returns.
+- ``next_close`` : signal at close t; the book earns the full close t →
+                   close t+1 move. Because ``effective = daily.shift(1)``, the
+                   fill is AT the decision close itself (the standard
+                   vectorized close-to-close convention) — NOT a true 1-day
+                   execution lag, and mildly optimistic since a real order off
+                   the close print cannot fill at that print. ``next_open`` is
+                   the realistic benchmark.
 - ``legacy_period``: byte-reproduces backtest.py (shift on the sparse frame;
                    one full period of lag). For regression/comparison only.
+
+Financing
+---------
+Shorts pay ``borrow_bps_annual`` on short notional. Longs pay
+``margin_bps_annual`` on gross long exposure ABOVE 1.0x NAV, charged daily at
+rate/252 (ACT/252). WHY: the published record implicitly assumed free
+leverage — at ~6%/yr broker margin a 2x long book pays ~0.3–0.6%/mo, material
+next to combo_v2_2x's 4.96%/mo headline. Both default to legacy values
+(margin 0.0) so every existing result reproduces bit-for-bit; charging margin
+is opt-in, mirroring the engine_v2-supersedes-backtest.py pattern.
 
 Conventions match backtest.py: weights rows are decision dates with
 POST-leverage values (e.g. blend × 2.0); shorts clipped unless allowed;
@@ -50,6 +65,7 @@ class BTConfigV2:
     leverage_cap: float = 2.0
     allow_shorts: bool = False
     exec_model: str = "next_open"  # "next_open" | "next_close" | "legacy_period"
+    margin_bps_annual: float = 0.0  # on long gross > 1.0x NAV; 0.0 = published record
 
 
 def expand_daily(weights_sparse: pd.DataFrame, daily_index: pd.Index) -> pd.DataFrame:
@@ -103,8 +119,9 @@ def run_backtest_v2(
         common = [c for c in daily.columns if c in rets.columns]
         daily, r = daily[common], rets[common]
         daily = _clip_and_cap(daily, cfg)
-        # Effective book during day t: decided at close t-1, in force from
-        # day t's execution point (open or close per model).
+        # Effective book during day t: decided at close t-1. next_close earns
+        # the full close t-1 → close t move (fill AT the decision close, not
+        # a lagged fill); next_open splits it at the open via the delta leg.
         effective = daily.shift(1).fillna(0.0)
         delta = effective.diff().fillna(effective.iloc[0])
         turnover = delta.abs().sum(axis=1)
@@ -135,8 +152,12 @@ def run_backtest_v2(
     tc = turnover * (cfg.tc_bps / 10_000.0)
     short_notional = effective.clip(upper=0.0).abs().sum(axis=1)
     borrow = short_notional * (cfg.borrow_bps_annual / 10_000.0) / 252.0
+    # Margin financing on long gross above 1.0x NAV (ACT/252); applies to
+    # every exec_model including legacy_period. Default 0.0 → no-op.
+    long_notional = effective.clip(lower=0.0).sum(axis=1)
+    margin = (long_notional - 1.0).clip(lower=0.0) * (cfg.margin_bps_annual / 10_000.0) / 252.0
 
-    daily_net = daily_port_ret - tc - borrow
+    daily_net = daily_port_ret - tc - borrow - margin
     equity = (1 + daily_net).cumprod() * cfg.init_equity
 
     s = compute_summary(equity, name=name)
@@ -144,6 +165,7 @@ def run_backtest_v2(
     s["avg_gross_exposure"] = float(effective.abs().sum(axis=1).mean())
     s["avg_n_positions"] = float((effective.abs() > 1e-6).sum(axis=1).mean())
     s["exec_model"] = cfg.exec_model
+    s["margin_bps_annual"] = cfg.margin_bps_annual
     if cfg.exec_model == "next_open":
         s["n_close_fallback_names"] = n_fallback
     return {
