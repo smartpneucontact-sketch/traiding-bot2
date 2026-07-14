@@ -138,7 +138,30 @@ The new strategy plugs into the existing Trading bot 6 system in `/Users/arsenkh
 
 ---
 
-## All 27 variants, ranked by mean monthly return
+## Corrected catalog (2026-07-14) — engine_v2 `next_open`, 6 %/yr margin, geometric monthly
+
+The definitive re-scored ranking of the full 48-entry catalog under the corrected reporting configuration (full table with dev-window rows and crash-episode stats in [`results/v7/catalog_v2.csv`](results/v7/catalog_v2.csv); produced by [`exp_catalog_v2.py`](exp_catalog_v2.py); champion row cross-checked against the Validity Notice at machine tolerance). DSR = deflated-Sharpe probability that the true Sharpe is positive after 501 logged trials of search (Bailey–López de Prado, cross-trial variance measured from the ledgers). **All rows still ride the survivors-only universe — upper bounds.**
+
+| Rank | Strategy | **Geo mo** | Arith mo | Sharpe | MaxDD | DSR |
+|---|---|---|---|---|---|---|
+| 1 | combo_v2_2x | **3.68 %** | 4.80 % | 1.06 | −60.3 % | 0.91 |
+| 2 | combo_v2_2x_freeze_dd_v1 (retracted) | 3.56 % | 4.66 % | 1.06 | −60.4 % | 0.91 |
+| 3 | combo_v2_2x_freeze_dd_v2 | 3.32 % | 4.27 % | 1.03 | −49.5 % | 0.90 |
+| 4 | combo_4way_2.5x | 3.07 % | 4.05 % | 1.00 | −53.1 % | 0.88 |
+| 5 | combo_4way_2x | 2.70 % | 3.32 % | 1.02 | −43.3 % | 0.89 |
+| 6 | xs_momentum_top30 | 2.64 % | 3.02 % | 1.10 | −42.6 % | 0.93 |
+| 7 | dual_momentum_vol | 2.43 % | 2.75 % | **1.14** | −38.3 % | **0.95** |
+| 8 | adaptive_voltarget_momentum | 2.35 % | 2.66 % | 1.05 | −34.6 % | 0.91 |
+| 9 | FINAL_3pct_lev_1.5x | 2.27 % | 2.59 % | 1.06 | −33.8 % | 0.91 |
+| 10 | xs_momentum_12_1 | 2.25 % | 2.55 % | 1.03 | −43.2 % | 0.90 |
+
+Notable: the retracted `freeze_dd_v1` ranks BELOW the un-frozen baseline on geo (3.56 < 3.68) — consistent with the retraction; `freeze_dd_v2` remains the only overlay that buys real drawdown protection (−49.5 % vs −60.3 %) at a defensible cost. The strongest *single* signal by statistical confidence is `dual_momentum_vol` (DSR 0.95).
+
+---
+
+## ~~All 27 variants, ranked by mean monthly return~~ (DEPRECATED)
+
+> **DEPRECATED 2026-07-14** — this table was produced by the stale-execution legacy engine with free leverage and arithmetic means (Validity Notice §2–4). Superseded by the Corrected catalog above. Preserved as originally written.
 
 (Full table in [`results/summary.csv`](results/summary.csv).)
 

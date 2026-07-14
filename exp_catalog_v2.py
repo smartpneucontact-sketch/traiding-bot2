@@ -40,6 +40,28 @@ import pandas as pd
 from exp_lib import TRIALS_DIR, cached_weights, run_trial, trial_count
 from metrics_v2 import deflated_sharpe
 
+
+def ledger_sr_variance_daily() -> float:
+    """Cross-trial Sharpe variance (daily scale) from the actual ledgers.
+
+    deflated_sharpe's fallback (v = observed daily SR²) makes the expected
+    max-SR benchmark ~3x the observed SR at ~500 trials — DSR degenerates to
+    0.000 for every strategy regardless of merit. The Bailey-LdP estimator
+    wants the variance of SR estimates ACROSS the trials actually run, which
+    the ledgers record; deduplicate the same way trial_count does so re-runs
+    don't shrink the variance.
+    """
+    srs = []
+    for f in TRIALS_DIR.glob("*.csv"):
+        df = pd.read_csv(f)
+        keys = [c for c in ("family", "name", "window", "exec_model",
+                            "tc_bps", "leverage_cap", "params_json")
+                if c in df.columns]
+        df = df.drop_duplicates(subset=keys, keep="last")
+        srs.append(df["sharpe"].dropna())
+    all_sr = pd.concat(srs) / np.sqrt(252.0)  # annual -> daily scale
+    return float(all_sr.var())
+
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "results" / "v7"
 OUT.mkdir(parents=True, exist_ok=True)
@@ -108,10 +130,12 @@ def assemble(errors: list) -> None:
     led["geo_monthly"] = (1.0 + led["cagr"]) ** (1.0 / 12.0) - 1.0
 
     # Render-time DSR: deflates as the program-wide deduped trial count grows.
+    # Cross-trial SR variance measured from the ledgers (see helper above).
     n_trials = trial_count(dedupe=True)
+    sr_var = ledger_sr_variance_daily()
     full = led[led["window"] == "full"].copy()
     full["dsr"] = [
-        deflated_sharpe(s, int(n), n_trials)
+        deflated_sharpe(s, int(n), n_trials, sr_variance_across_trials=sr_var)
         if np.isfinite(s) and np.isfinite(n) else float("nan")
         for s, n in zip(full["sharpe"], full.get("n_days", pd.Series(2512, index=full.index)).fillna(2512))
     ]
