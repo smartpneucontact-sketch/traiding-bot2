@@ -20,6 +20,11 @@ if TYPE_CHECKING:
     from core.run_report import RunReport
 
 
+# Market-data API host — separate from the trading host in `mc.alpaca_base_url`
+# (paper/live both read data from the same endpoint; IEX feed is free).
+ALPACA_DATA_URL = "https://data.alpaca.markets"
+
+
 def _to_alpaca_symbol(sym: str) -> str:
     """Convert yfinance-style class-share ticker (BRK-B) to Alpaca form (BRK.B).
 
@@ -79,6 +84,87 @@ def alpaca_request(method: str, endpoint: str, mc: "ModelConfig",
     if resp.status_code == 204:
         return {}
     return resp.json()
+
+
+def fetch_snapshots(symbols: list[str], mc: "ModelConfig",
+                    logger=None) -> dict[str, dict]:
+    """Batched IEX snapshots for decision-price capture at rebalance time.
+
+    Slippage is unmeasurable after the fact — the arrival price and the
+    day's open must be captured when the order is decided, so this is
+    called once per rebalance and the values ride into the trade journal.
+
+    Returns `{symbol: {"arrival": latestTrade.p, "day_open": dailyBar.o,
+    "prev_close": prevDailyBar.c}}` keyed by the *input* (yfinance-style)
+    symbols; missing pieces are None. Chunks fail independently: symbols in
+    a failed chunk are simply absent from the result (partial capture beats
+    none for slippage stats). Every failure only logs a warning — the order
+    path must never depend on this data.
+    """
+    import requests
+
+    if not symbols:
+        return {}
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    result: dict[str, dict] = {}
+    try:
+        headers = _make_alpaca_headers(mc)
+        # Response keys come back in Alpaca's dot form (BRK.B) — map them
+        # back to our dash form so callers can key by their own symbols.
+        alpaca_to_ours = {_to_alpaca_symbol(s): s for s in symbols}
+        alpaca_syms = list(alpaca_to_ours)
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"    Snapshot fetch failed [{mc.name}]: {e} — "
+                f"decision prices skipped this rebalance"
+            )
+        return {}
+    # Chunk to 100 symbols per request to stay well under URL-length and
+    # API batch limits. Chunks fail independently: per-symbol prices are
+    # independent data, so a mid-batch error keeps everything already
+    # captured — partial capture beats none for slippage measurement.
+    for i in range(0, len(alpaca_syms), 100):
+        chunk = alpaca_syms[i:i + 100]
+        try:
+            url = (
+                f"{ALPACA_DATA_URL}/v2/stocks/snapshots"
+                f"?symbols={','.join(chunk)}&feed=iex"
+            )
+            if logger:
+                logger.info(
+                    f"    API [{mc.name}]: GET v2/stocks/snapshots "
+                    f"({len(chunk)} symbols)"
+                )
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                raise Exception(
+                    f"snapshots HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+            payload = resp.json() or {}
+            for alp_sym, snap in payload.items():
+                snap = snap or {}
+                latest_trade = snap.get("latestTrade") or {}
+                daily_bar = snap.get("dailyBar") or {}
+                prev_bar = snap.get("prevDailyBar") or {}
+                result[alpaca_to_ours.get(alp_sym, alp_sym)] = {
+                    "arrival": _f(latest_trade.get("p")),
+                    "day_open": _f(daily_bar.get("o")),
+                    "prev_close": _f(prev_bar.get("c")),
+                }
+        except Exception as e:
+            if logger:
+                logger.warning(
+                    f"    Snapshot chunk {i // 100 + 1} failed [{mc.name}]: "
+                    f"{e} — keeping {len(result)} prices captured so far"
+                )
+    return result
 
 
 def get_account(mc: "ModelConfig", logger, report: "RunReport"):

@@ -69,6 +69,15 @@ class TradeRecord:
     total_positions: Optional[int] = None
     rebalance_turnover_pct: Optional[float] = None
 
+    # Decision-price capture (slippage measurement). All None on rows
+    # written before this existed and whenever the snapshot fetch fails —
+    # readers must treat None as "not captured", never as zero slippage.
+    decision_price: Optional[float] = None          # arrival (latest trade at decision time)
+    reference_open: Optional[float] = None          # today's open — the backtest's assumed fill
+    prev_close: Optional[float] = None              # prior close (signal price)
+    slippage_bps: Optional[float] = None            # fill vs reference_open; positive = cost
+    slippage_vs_arrival_bps: Optional[float] = None # fill vs decision_price; positive = cost
+
 
 class TradeJournal:
     """Persistent per-model trade log.
@@ -101,6 +110,7 @@ class TradeJournal:
             with open(self.jsonl_path, "a") as f:
                 f.write(json.dumps(data, default=str) + "\n")
 
+            self._roll_csv_if_schema_changed(list(data.keys()))
             write_header = (
                 not self.csv_path.exists()
                 or self.csv_path.stat().st_size == 0
@@ -110,6 +120,38 @@ class TradeJournal:
                 if write_header:
                     writer.writeheader()
                 writer.writerow(data)
+
+    def _roll_csv_if_schema_changed(self, fieldnames: list[str]) -> None:
+        """Rename an existing CSV whose header predates the current
+        TradeRecord schema.
+
+        `log_trade` only writes a header into an empty file, so adding
+        dataclass fields would otherwise append wide rows under the old
+        narrow header forever. The stale CSV is preserved as
+        `<name>.csv.pre-slippage` (numeric suffix if that already exists);
+        JSONL — the source of truth — is untouched. Called under the
+        per-model lock.
+        """
+        try:
+            if (not self.csv_path.exists()
+                    or self.csv_path.stat().st_size == 0):
+                return
+            with open(self.csv_path, "r", newline="") as f:
+                header = f.readline().rstrip("\r\n")
+            if header == ",".join(fieldnames):
+                return
+            rolled = self.csv_path.with_name(
+                self.csv_path.name + ".pre-slippage")
+            n = 1
+            while rolled.exists():
+                rolled = self.csv_path.with_name(
+                    f"{self.csv_path.name}.pre-slippage.{n}")
+                n += 1
+            self.csv_path.rename(rolled)
+        except Exception:
+            # The CSV is a convenience copy — a failed rollover must never
+            # block the journal append.
+            pass
 
     def get_trades(self, symbol: Optional[str] = None,
                    since: Optional[str] = None) -> list[dict]:

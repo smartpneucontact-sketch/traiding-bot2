@@ -1,0 +1,167 @@
+{
+  "protocol_version": "1.0",
+  "committed_date": "2026-07-14",
+  "amended": false,
+  "strategy": "combo_v2 2.0x long-only momentum blend (bundle v2.3_nofreeze), Alpaca paper account",
+  "narrative": "PROTOCOL.md",
+  "reference": {
+    "geo_monthly_pct": 3.68,
+    "sharpe_annualized": 1.06,
+    "max_drawdown_pct": -60.3,
+    "sigma_monthly_pct": 15.7,
+    "success_floor_geo_monthly_pct": 1.8,
+    "source": "Corrected 10-yr backtest (engine_v2 next_open execution, 5bp/side TC, 600bp/yr margin), survivors-only universe — every reference number is an upper bound."
+  },
+  "power_disclosure": {
+    "sigma_monthly_pct": 15.7,
+    "se_mean_monthly_pp": {"3mo": 9.1, "6mo": 6.4, "12mo": 4.5},
+    "note": "At sigma_m ~= 15.7%, the SE of the mean monthly return is ~9.1pp at 3 months, ~6.4pp at 6 months, ~4.5pp at 12 months. This test CANNOT confirm 3.68%/mo. It can reject gross failure, calibrate real trading costs, and verify the machine matches backtest assumptions."
+  },
+  "criteria": [
+    {
+      "id": "K1",
+      "description": "Continuous kill: live drawdown from the forward-test equity peak reaches -45% or worse.",
+      "metric": "live_drawdown_pct",
+      "op": "<=",
+      "threshold": -45,
+      "checkpoint": "continuous",
+      "action": "KILL"
+    },
+    {
+      "id": "K2",
+      "description": "Continuous kill-or-recost: realized slippage exceeds 25bp/side over >=3 consecutive rebalances.",
+      "metric": "slippage_bps_per_side_3_consecutive_rebalances",
+      "op": ">",
+      "threshold": 25,
+      "checkpoint": "continuous",
+      "action": "KILL_OR_RECOST"
+    },
+    {
+      "id": "K3a",
+      "description": "Continuous operational pause: fill rate by notional below 90% on two consecutive rebalances.",
+      "metric": "fill_rate_pct_2_consecutive_rebalances",
+      "op": "<",
+      "threshold": 90,
+      "checkpoint": "continuous",
+      "action": "OPERATIONAL_PAUSE"
+    },
+    {
+      "id": "K3b",
+      "description": "Continuous operational pause: achieved-vs-target gross deviation above 15% on two consecutive rebalances.",
+      "metric": "gross_deviation_pct_2_consecutive_rebalances",
+      "op": ">",
+      "threshold": 15,
+      "checkpoint": "continuous",
+      "action": "OPERATIONAL_PAUSE"
+    },
+    {
+      "id": "M3-VOL",
+      "description": "3-month operational check: realized monthly volatility within [7%, 25%]/mo (machine matches backtest risk profile).",
+      "metric": "realized_vol_monthly_pct",
+      "op": "between",
+      "threshold": [7, 25],
+      "checkpoint": "3mo",
+      "action": "OPERATIONAL_REVIEW_IF_FAIL"
+    },
+    {
+      "id": "M3-GEO",
+      "description": "3-month operational check: geometric monthly return above -10%/mo (no gross failure).",
+      "metric": "geo_monthly_pct",
+      "op": ">",
+      "threshold": -10,
+      "checkpoint": "3mo",
+      "action": "OPERATIONAL_REVIEW_IF_FAIL"
+    },
+    {
+      "id": "M3-SLIP",
+      "description": "3-month operational check: median slippage <= 15bp/side, measured on >= 3 rebalances.",
+      "metric": "slippage_bps_per_side_median",
+      "op": "<=",
+      "threshold": 15,
+      "checkpoint": "3mo",
+      "action": "OPERATIONAL_REVIEW_IF_FAIL"
+    },
+    {
+      "id": "M3-RECON",
+      "description": "3-month operational check: post-rebalance reconciliation green on at least 2 of the last 3 rebalances.",
+      "metric": "reconciliation_green_count_of_last_3",
+      "op": ">=",
+      "threshold": 2,
+      "checkpoint": "3mo",
+      "action": "OPERATIONAL_REVIEW_IF_FAIL"
+    },
+    {
+      "id": "M6-BAND",
+      "description": "6-month band: cumulative log return must exceed expected - 1.28*sigma_m*sqrt(6) = 6*ln(1.0368) - 1.28*0.157*sqrt(6) ~= 0.2168 - 0.4922 = -0.2754 (about -24.1% simple). AND-ed with the regime adjustment in and_conditions: KILL fires only if the band is breached AND live - 2x SPY < -15pp AND live < 0 over the same window.",
+      "metric": "cum_log_return_6mo",
+      "op": ">",
+      "threshold": -0.2754,
+      "checkpoint": "6mo",
+      "action": "KILL_IF_AND_CONDITIONS_ALSO_FAIL",
+      "and_conditions": [
+        {"metric": "live_minus_2x_spy_cum_return_pp", "op": "<", "threshold": -15},
+        {"metric": "cum_return_6mo_pct", "op": "<", "threshold": 0}
+      ]
+    },
+    {
+      "id": "M12-GEO",
+      "description": "12-month SUCCESS requirement: geometric monthly return >= 1.8%/mo (pre-declared survivorship-haircut floor).",
+      "metric": "geo_monthly_pct",
+      "op": ">=",
+      "threshold": 1.8,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "M12-DD",
+      "description": "12-month SUCCESS requirement: max drawdown no worse than -45%.",
+      "metric": "max_drawdown_pct",
+      "op": ">=",
+      "threshold": -45,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "M12-SLIP",
+      "description": "12-month SUCCESS requirement: slippage <= 15bp/side.",
+      "metric": "slippage_bps_per_side",
+      "op": "<=",
+      "threshold": 15,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "M12-VOL",
+      "description": "12-month SUCCESS requirement: realized volatility <= 25%/mo.",
+      "metric": "realized_vol_monthly_pct",
+      "op": "<=",
+      "threshold": 25,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "M12-INCONCLUSIVE",
+      "description": "12-month INCONCLUSIVE (extend 6 months): geometric monthly return in [0, 1.8)%/mo with a documented regime headwind. Upper bound 1.8 is exclusive (>= 1.8 belongs to M12-GEO).",
+      "metric": "geo_monthly_pct",
+      "op": "between",
+      "threshold": [0, 1.8],
+      "checkpoint": "12mo",
+      "action": "INCONCLUSIVE_EXTEND_6MO"
+    },
+    {
+      "id": "M12-FAIL",
+      "description": "12-month FAIL: geometric monthly return < 0 at 12 months. Any continuous kill (K1/K2) firing at any time is also FAIL.",
+      "metric": "geo_monthly_pct",
+      "op": "<",
+      "threshold": 0,
+      "checkpoint": "12mo",
+      "action": "FAIL"
+    }
+  ],
+  "decision_rule": {
+    "SUCCESS": "All four REQUIRED_FOR_SUCCESS criteria pass at 12 months -> real-money discussion.",
+    "INCONCLUSIVE": "M12-INCONCLUSIVE holds (geo in [0, 1.8)%/mo with documented regime headwind) -> extend the test 6 months.",
+    "FAIL": "geo < 0 at 12 months, or any kill criterion fired."
+  },
+  "amendment_rule": "Amendments only via dated amendment sections appended to PROTOCOL.md plus a re-issued protocol.json with amended=true (permanent — never reset to false) and its new sha256 recorded alongside the original. Prior sections are never rewritten. Any hash mismatch against the sha256 bound at forward_test_start permanently flags the test MODIFIED_AFTER_START."
+}

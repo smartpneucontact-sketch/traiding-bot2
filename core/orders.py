@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 from core.alpaca import (
     _make_alpaca_headers, _to_alpaca_symbol, alpaca_request,
-    get_account, get_positions,
+    fetch_snapshots, get_account, get_positions,
 )
 from core.journal import TradeRecord
 
@@ -452,6 +452,19 @@ def rebalance_portfolio(
         report.end_step("rebalance")
         return rb_data
 
+    # Decision-price capture: one batched snapshot call per rebalance so
+    # each journal row records arrival / today's open / prev close at the
+    # moment the order was decided (unrecoverable after the fact). Failure
+    # is non-fatal — orders proceed with the price fields left None.
+    snapshots: dict[str, dict] = {}
+    try:
+        order_syms = sorted({o["symbol"] for o in orders})
+        if order_syms:
+            snapshots = fetch_snapshots(order_syms, mc, logger) or {}
+    except Exception as e:
+        logger.warning(f"  Decision-price snapshot capture failed: {e}")
+        snapshots = {}
+
     # -- Execute orders + log each trade ----------------------------------
     logger.info(f"\n  Executing {len(orders)} orders...")
     executed = 0
@@ -489,6 +502,9 @@ def rebalance_portfolio(
             cash_before=round(cash_available, 2),
             total_positions=len(target_symbols),
             rebalance_turnover_pct=round(turnover * 100, 1),
+            decision_price=(snapshots.get(sym) or {}).get("arrival"),
+            reference_open=(snapshots.get(sym) or {}).get("day_open"),
+            prev_close=(snapshots.get(sym) or {}).get("prev_close"),
         )
 
         try:
@@ -589,6 +605,24 @@ def rebalance_portfolio(
                     trade.fill_price = float(filled_price)
             except Exception:
                 pass
+
+        # Slippage vs the backtest's assumed fill (same-day open) and vs
+        # the arrival price. Sign convention: +1 buy / -1 sell, so positive
+        # bps = execution cost either direction (a sell filling ABOVE the
+        # reference is favorable → negative).
+        try:
+            if trade.fill_price:
+                sign = 1.0 if trade.side == "buy" else -1.0
+                if trade.reference_open:
+                    trade.slippage_bps = round(
+                        sign * (trade.fill_price / trade.reference_open - 1.0)
+                        * 1e4, 2)
+                if trade.decision_price:
+                    trade.slippage_vs_arrival_bps = round(
+                        sign * (trade.fill_price / trade.decision_price - 1.0)
+                        * 1e4, 2)
+        except Exception:
+            pass
 
         journal.log_trade(trade)
         trade_count += 1

@@ -661,6 +661,23 @@ def run_single_model(
     )
     if rebalanced:
         state["last_rebalance"] = datetime.now().isoformat()
+        # Forward-test clock: the first FUNDED rebalance starts the
+        # pre-registered paper test, binding it to the exact protocol.json
+        # bytes committed beforehand (any later edit → hash mismatch →
+        # MODIFIED_AFTER_START). Set-once; never overwritten. Import is
+        # local and the whole block best-effort so a missing/broken
+        # protocol file can never abort a live run that already traded.
+        if not state.get("forward_test_start"):
+            try:
+                from core.protocol import PROTOCOL_JSON_PATH, file_sha256
+                state["forward_test_start"] = today_iso
+                state["protocol_sha256"] = file_sha256(PROTOCOL_JSON_PATH)
+                logger.info(
+                    f"  Forward test clock started: {today_iso} "
+                    f"(protocol sha256 {state['protocol_sha256'][:12]}...)"
+                )
+            except Exception as e:
+                logger.warning(f"  forward_test_start binding failed: {e}")
     state["last_run"] = datetime.now().isoformat()
     state["run_count"] = state.get("run_count", 0) + 1
     history_entry: dict = {

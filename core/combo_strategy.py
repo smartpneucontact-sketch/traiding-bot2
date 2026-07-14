@@ -113,9 +113,15 @@ def _adaptive_voltarget_momentum_weights(
     calm_pctile: float = 0.33, stress_pctile: float = 0.67,
     calm_leverage: float = 1.5, neutral_leverage: float = 1.0,
     stress_leverage: float = 0.5,
+    diag: dict | None = None,
 ) -> dict[str, float]:
     """Top-N by 12-1 momentum, inverse-vol weighted, leverage based on
     where today's VIX sits in its rolling-252-day percentile distribution.
+
+    `diag` (optional out-param) receives {"vix_leverage": lev} so callers
+    can report which regime the sleeve traded in without re-deriving the
+    VIX percentile. An out-param (not a tuple return) keeps the return
+    type stable for any code that calls this helper directly.
     """
     if stock_px.empty or len(stock_px) < lookback_long + lookback_skip + 5:
         return {}
@@ -150,6 +156,8 @@ def _adaptive_voltarget_momentum_weights(
                 lev = stress_leverage
             else:
                 lev = neutral_leverage
+    if diag is not None:
+        diag["vix_leverage"] = float(lev)
     return {sym: float(w * lev) for sym, w in base_w.items()}
 
 
@@ -387,22 +395,35 @@ class ComboStrategy:
             stock_px, n_long=c.dual_mom_top_n,
             target_vol=c.dual_mom_vol_target,
         )
+        adaptive_diag: dict = {}
         w_adapt = _adaptive_voltarget_momentum_weights(
             stock_px, macro_px,
             n_long=c.adaptive_top_n,
             calm_leverage=c.adaptive_calm_leverage,
             neutral_leverage=c.adaptive_neutral_leverage,
             stress_leverage=c.adaptive_stress_leverage,
+            diag=adaptive_diag,
         )
 
         combined: dict[str, float] = {}
-        for sleeve, sleeve_weight in (
-            (w_xs, c.xs_mom_weight),
-            (w_dual, c.dual_mom_weight),
-            (w_adapt, c.adaptive_weight),
+        # Per-sleeve post-blend contributions (sleeve_weight × sleeve's own
+        # weight, i.e. w/3 at the default equal blend) for the diagnostics
+        # below. Recorded pre-gate: the exposure multiplier and gross cap
+        # scale all sleeves identically, so the pre-gate split is the one
+        # that matches what the backtest's per-sleeve references measure.
+        sleeve_contrib: dict[str, dict[str, float]] = {}
+        for name, sleeve, sleeve_weight in (
+            ("xs_momentum", w_xs, c.xs_mom_weight),
+            ("dual_momentum", w_dual, c.dual_mom_weight),
+            ("adaptive", w_adapt, c.adaptive_weight),
         ):
+            contrib: dict[str, float] = {}
             for sym, w in sleeve.items():
-                combined[sym] = combined.get(sym, 0.0) + sleeve_weight * w
+                blended = sleeve_weight * w
+                combined[sym] = combined.get(sym, 0.0) + blended
+                if blended != 0.0:
+                    contrib[sym] = round(blended, 6)
+            sleeve_contrib[name] = contrib
 
         if not combined:
             self.last_diagnostics = {}
@@ -462,6 +483,16 @@ class ComboStrategy:
             "gross_pre_gate": round(gross_pre_gate, 4),
             "gross_final": round(sum(abs(w) for w in combined.values()), 4),
             "n_positions": len(combined),
+            # Per-sleeve attribution (pre-gate; see the blend loop above):
+            # daily weight-based sleeve split for the forward-test evidence
+            # engine. adaptive_vix_leverage is None when the adaptive
+            # sleeve produced no book (insufficient history / empty vol).
+            "sleeves": sleeve_contrib,
+            "sleeve_gross": {
+                name: round(sum(abs(w) for w in contrib.values()), 6)
+                for name, contrib in sleeve_contrib.items()
+            },
+            "adaptive_vix_leverage": adaptive_diag.get("vix_leverage"),
         }
         return combined
 
