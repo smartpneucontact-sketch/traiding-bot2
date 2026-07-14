@@ -1,0 +1,10 @@
+{
+  "artifact": "sp500_events.parquet",
+  "sha256": "46be615427836ed4e66f161962a503362a43e3197504e50f374f95cabae718c6",
+  "source": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+  "scraped_at": "2026-07-14T13:35:20.798213+00:00",
+  "raw_html": "sp500_page_20260714.html",
+  "raw_html_sha256": "cca0df1c44f649571dda2c95654284c8c1d78eb71907e6a5e29ec46b1019eac0",
+  "n_change_rows": 402,
+  "n_events": 762
+}

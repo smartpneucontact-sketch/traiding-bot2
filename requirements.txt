@@ -7,6 +7,8 @@ pandas==2.2.3
 numpy==2.1.3
 scipy==1.15.3
 pyarrow==24.0.0
+# data_free.py only (imported lazily; cached reads work without it):
+yfinance==1.3.0
 # ml_track only:
 lightgbm==4.6.0
 scikit-learn==1.6.1

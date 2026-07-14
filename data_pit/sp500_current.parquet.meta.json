@@ -1,0 +1,8 @@
+{
+  "artifact": "sp500_current.parquet",
+  "sha256": "c29378614cf48c7fb12dc17a1047c7f5895745a22e85a1c66b3d59e666c18c7a",
+  "source": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+  "scraped_at": "2026-07-14T13:35:20.798213+00:00",
+  "raw_html": "sp500_page_20260714.html",
+  "n_constituents": 503
+}

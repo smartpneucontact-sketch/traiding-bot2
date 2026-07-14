@@ -31,6 +31,45 @@ def buy_hold_spy(prices: pd.DataFrame, macro: pd.DataFrame) -> pd.DataFrame:
     return w
 
 
+# ─── Helper: point-in-time universe eligibility ──────────────────────────
+def _eligibility_asof(eligible: pd.DataFrame, dates: pd.Index) -> pd.DataFrame:
+    """As-of view of a daily membership frame on the strategy's calendar.
+
+    `eligible` is a daily-indexed bool DataFrame (date × ticker), True = the
+    name is in the index at that date. Each strategy date gets the most recent
+    eligibility row at or before it (reindex+ffill ≡ per-date asof, computed
+    once instead of inside the decision loop). Dates before eligible.index[0]
+    come back all-NaN and are treated as UNRESTRICTED by _restrict_to_eligible:
+    pre-history decision dates fall back to the legacy unfiltered universe
+    (disclosed; the all-False alternative would silently blank the warm-up of
+    every backtest that starts before the membership history does).
+    """
+    return eligible.reindex(dates, method="ffill")
+
+
+def _restrict_to_eligible(
+    row: pd.Series, elig_asof: pd.DataFrame, dt: pd.Timestamp
+) -> pd.Series:
+    """Selection-time PIT filter: keep only candidates eligible as-of `dt`.
+
+    Applied to the candidate Series INSIDE the decision loop, before any
+    rank/top-N — NOT as a mask on the price panel: signals read shifted and
+    rolling rows, so panel-level masking corrupts the lookback math and blinds
+    new index entrants for the full 252d momentum window. Selection-time
+    filtering keeps every signal computed on full price history and only
+    restricts WHICH names may be picked at each decision date (engine prices
+    stay unmasked too, so names held past an index exit still mark correctly).
+
+    Names absent from eligible.columns (and NaN cells) count as NOT eligible.
+    An all-NaN as-of row (dt precedes the membership history) leaves the
+    candidate set unrestricted — see _eligibility_asof.
+    """
+    erow = elig_asof.loc[dt]
+    if erow.isna().all():
+        return row
+    return row[erow.reindex(row.index).eq(True)]
+
+
 # ─── Strategy 2: Cross-sectional momentum (12-1) ────────────────────────
 def xs_momentum(
     prices: pd.DataFrame,
@@ -39,14 +78,24 @@ def xs_momentum(
     lookback_skip: int = 21,    # skip last month
     n_long: int = 50,
     rebal_freq: int = 21,       # monthly
+    eligible: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Buy top-N stocks by (252-day return excluding most recent 21 days).
-    Equal-weight, monthly rebalance."""
+    Equal-weight, monthly rebalance.
+
+    `eligible` (optional): daily bool DataFrame of point-in-time index
+    membership, applied at selection time inside the decision loop (see
+    _restrict_to_eligible for why panel masking is wrong). None (default) is
+    bit-identical to the legacy path — the published-record fidelity chain
+    (validation/reproduce_baseline.py, validation/test_engine_v2.py) depends
+    on it.
+    """
     px = prices
     # 12-1 momentum: return from t-252 to t-21
     mom = px.shift(lookback_skip) / px.shift(lookback_long) - 1.0
     # Filter: require ≥ 252 trading days of history (drop newly listed)
     valid = mom.notna()
+    elig_asof = _eligibility_asof(eligible, px.index) if eligible is not None else None
 
     w_list = []
     dates = px.index
@@ -54,6 +103,8 @@ def xs_momentum(
         if i % rebal_freq != 0 or i < lookback_long + lookback_skip:
             continue
         row_mom = mom.loc[dt][valid.loc[dt]]
+        if elig_asof is not None:
+            row_mom = _restrict_to_eligible(row_mom, elig_asof, dt)
         if len(row_mom) < n_long:
             continue
         top = row_mom.nlargest(n_long).index
@@ -326,10 +377,17 @@ def dual_momentum_voltarget(
     rebal_freq: int = 21,
     vol_est: str = "diag_legacy",
     cash_when_no_signal: bool = False,
+    eligible: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Dual momentum: pick top-N by 6-month return *and* require absolute return > 0.
     Size each holding inversely to its 60-day volatility, then scale the
     portfolio to target_vol.
+
+    `eligible` (optional): daily bool DataFrame of point-in-time index
+    membership, applied at selection time inside the decision loop (see
+    _restrict_to_eligible for why panel masking is wrong). None (default) is
+    bit-identical to the legacy path — the published-record fidelity chain
+    depends on it.
 
     Caveats of the legacy defaults (kept for published-record reproduction):
     - vol_est="diag_legacy" ignores cross-correlation, so the estimated
@@ -345,6 +403,7 @@ def dual_momentum_voltarget(
     ret = px.pct_change(lookback, fill_method=None)
     daily = px.pct_change(fill_method=None)
     vol = daily.rolling(vol_lookback).std() * np.sqrt(252)
+    elig_asof = _eligibility_asof(eligible, px.index) if eligible is not None else None
 
     w_list = []
     dates = px.index
@@ -352,6 +411,8 @@ def dual_momentum_voltarget(
         if i % rebal_freq != 0 or i < max(lookback, vol_lookback) + 5:
             continue
         row = ret.loc[dt].dropna()
+        if elig_asof is not None:
+            row = _restrict_to_eligible(row, elig_asof, dt)
         # Absolute filter: must be positive
         row = row[row > 0]
         if len(row) == 0:
@@ -995,11 +1056,18 @@ def adaptive_voltarget_momentum(
     n_long: int = 30,
     vol_lookback: int = 60,
     rebal_freq: int = 21,
+    eligible: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """xs_momentum_top30 but with a leverage that adapts to VIX percentile.
     When VIX is in its bottom-tercile (calm), target 1.5x leverage; when
     in top-tercile (stressed), target 0.5x; middle = 1.0x. Self-adjusting
     risk-on / risk-off without hard cash flips.
+
+    `eligible` (optional): daily bool DataFrame of point-in-time index
+    membership, applied at selection time inside the decision loop (see
+    _restrict_to_eligible for why panel masking is wrong). None (default) is
+    bit-identical to the legacy path — the published-record fidelity chain
+    depends on it.
     """
     SECTOR_ETFS_LOCAL = []  # not used here but keeps namespace clean
     px = prices
@@ -1011,12 +1079,15 @@ def adaptive_voltarget_momentum(
         # Without VIX, fall back to constant 1.0x
         vix = pd.Series(15.0, index=px.index)
     vix_252 = vix.rolling(252).rank(pct=True)
+    elig_asof = _eligibility_asof(eligible, px.index) if eligible is not None else None
     dates = px.index
     w_list = []
     for i, dt in enumerate(dates):
         if i % rebal_freq != 0 or i < 260:
             continue
         row = mom.loc[dt].dropna()
+        if elig_asof is not None:
+            row = _restrict_to_eligible(row, elig_asof, dt)
         if len(row) < n_long:
             continue
         top = row.nlargest(n_long).index

@@ -83,6 +83,7 @@ def run_trial(
     exec_model: str = "next_open",
     tc_bps: float = 5.0,
     leverage_cap: float = 2.0,
+    margin_bps_annual: float = 0.0,
     weights_are_daily: bool = False,
     final: bool = False,
     notes: str = "",
@@ -92,6 +93,17 @@ def run_trial(
     `weights` are PRE-leverage decision weights ONLY if the caller already
     multiplied leverage in — this function does NOT apply leverage; pass
     post-leverage frames exactly as backtest.py callers do.
+
+    `margin_bps_annual` is forwarded to BTConfigV2 (financing drag on long
+    gross > 1.0x NAV). When non-zero it is also embedded in params_json and
+    logged as a `margin_bps` ledger column, so margin-on and margin-off runs
+    of the same config dedupe as DISTINCT trials. The default 0.0 keeps
+    existing calls byte-identical (no new key/column), because (a) ledgers
+    are append-mode CSVs and cannot change schema mid-file, and (b) injecting
+    the key at 0.0 would mutate params_json of already-logged configs and
+    inflate the deduped trial count. Consequence: callers turning margin ON
+    must use a NEW family name — the margin_bps column only exists in family
+    CSVs created after margin was first requested (enforced below).
     """
     if window in ("val", "full") and not final:
         raise PermissionError(
@@ -115,7 +127,10 @@ def run_trial(
         pu_w, opn_w, w = pu, opn, weights
 
     cfg = BTConfigV2(tc_bps=tc_bps, leverage_cap=leverage_cap,
-                     exec_model=exec_model)
+                     exec_model=exec_model,
+                     margin_bps_annual=margin_bps_annual)
+    if margin_bps_annual != 0.0:
+        params = {**params, "margin_bps_annual": margin_bps_annual}
     t0 = time.time()
     bt = run_backtest_v2(w, pu_w, cfg, name=name,
                          open_prices=opn_w if exec_model == "next_open" else None,
@@ -157,13 +172,34 @@ def run_trial(
         "runtime_s": round(time.time() - t0, 2),
         "notes": notes,
     }
+    if margin_bps_annual != 0.0:
+        row["margin_bps"] = margin_bps_annual
     for ep, st in crash_table(eq).items():
         row[f"ep_{ep}_ret"] = st["ret"]
         row[f"ep_{ep}_dd"] = st["max_dd"]
 
     ledger = TRIALS_DIR / f"{family}.csv"
-    pd.DataFrame([row]).to_csv(ledger, mode="a", header=not ledger.exists(),
-                               index=False)
+    row_df = pd.DataFrame([row])
+    if ledger.exists():
+        # Append-mode CSV: to_csv(mode="a", header=False) writes POSITIONALLY,
+        # so the row must be aligned to the on-file header in both content and
+        # order. Two failure modes guarded here: (a) a margin row into a
+        # pre-margin family (new column the header lacks -> hard error, use a
+        # new family); (b) a margin=0 row into a margin family (header has
+        # margin_bps, row lacks it -> fill 0.0 so columns stay aligned).
+        with open(ledger) as f:
+            header = f.readline().strip().split(",")
+        extra = [c for c in row_df.columns if c not in header]
+        if extra:
+            raise ValueError(
+                f"family {family!r} ledger header lacks column(s) {extra} — "
+                f"new columns require a NEW family name (append-mode CSVs "
+                f"cannot change schema mid-file)."
+            )
+        if "margin_bps" in header and "margin_bps" not in row_df.columns:
+            row_df["margin_bps"] = 0.0
+        row_df = row_df.reindex(columns=header)
+    row_df.to_csv(ledger, mode="a", header=not ledger.exists(), index=False)
     return {"summary": s, "equity": eq, "returns": bt["returns"],
             "weights": bt["weights"], "row": row}
 
