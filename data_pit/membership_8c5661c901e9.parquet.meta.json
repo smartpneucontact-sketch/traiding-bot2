@@ -1,0 +1,11 @@
+{
+  "artifact": "membership_8c5661c901e9.parquet",
+  "sha256": "5c3d280caba319cc56ddf5df43033b5df81457131e66464eacad46c3b7cfdca9",
+  "source": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+  "built_at": "2026-07-16T06:29:55.100904+00:00",
+  "events_sha256": "46be615427836ed4e66f161962a503362a43e3197504e50f374f95cabae718c6",
+  "index_start": "2016-04-01 00:00:00",
+  "index_end": "2026-03-27 00:00:00",
+  "n_days": 2512,
+  "n_ever_members": 701
+}

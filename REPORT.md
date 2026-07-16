@@ -159,6 +159,25 @@ Notable: the retracted `freeze_dd_v1` ranks BELOW the un-frozen baseline on geo 
 
 ---
 
+## Measured universe + survivorship bound (2026-07-16, WS1c)
+
+The combo_v2 blend was re-run with **point-in-time S&P 500 membership** (Wikipedia change-log reconstruction, `data_pit.py`) applied at selection time — at each decision date the sleeves may only pick names actually in the index that day. Engine, costs, and data identical across arms (next_open, 5bp, 6%/yr margin). Full method and tables: [`results/v7/pit/PIT_REPORT.md`](results/v7/pit/PIT_REPORT.md).
+
+| Leverage | Published (survivors, broad universe) | PIT S&P-500-only | Delta (geo) |
+|---|---|---|---|
+| 1× | 2.51 %/mo geo, Sharpe 1.15 | 0.92 %/mo, Sharpe 0.64 | −1.59 pp/mo |
+| 1.5× | 3.31 %/mo, Sharpe 1.10 | 1.07 %/mo, Sharpe 0.57 | −2.24 pp/mo |
+| 2× | 3.68 %/mo, Sharpe 1.06 | 1.08 %/mo, Sharpe 0.53 | −2.60 pp/mo |
+
+**What this delta is — and is not.** Measurement revealed that a mean **79% of the published strategy's gross weight sits on names that were NOT S&P 500 members at the decision date** (60% on names never in the index during the window): the cache universe (~1,040 names) is far broader than the index, and the published edge concentrates in exactly those mid-cap names. The delta is therefore the **joint** effect of universe narrowing + survivorship, not a pure survivorship measurement — the two are not separable with free data (no point-in-time history exists for the broader universe). Two honest conclusions survive:
+
+1. **The published edge lives predominantly in the mid-cap, non-index cohort — precisely where the cache's survivorship is worst and least auditable.** The upper-bound caveat on the headline numbers is therefore *more* material than generic survivorship concerns suggest, not less.
+2. **An honest S&P-500-only variant earns ~1.1 %/mo geo at 2× (Sharpe ~0.53)** — clearing zero but well under the 1.8 %/mo forward-test success floor. Even this floor remains somewhat inflated: 24.8 % of true 2016 members (decaying to 0.6 % by 2026) have no bars in the cache, so the PIT arm still can't hold the dead cohort. The `pit_plus_stooq` arm (pending the manual Stooq bulk download) will tighten that residual.
+
+Bottom line: the forward paper test is now clearly the *only* clean evidence for the deployed configuration, and the 12-month floor of 1.8 %/mo was well chosen — the PIT floor (1.08) and the published ceiling (3.68) bracket it.
+
+---
+
 ## ~~All 27 variants, ranked by mean monthly return~~ (DEPRECATED)
 
 > **DEPRECATED 2026-07-14** — this table was produced by the stale-execution legacy engine with free leverage and arithmetic means (Validity Notice §2–4). Superseded by the Corrected catalog above. Preserved as originally written.
