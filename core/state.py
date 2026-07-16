@@ -30,11 +30,21 @@ state_lock = threading.Lock()
 # Keys owned by the cutloss scanner. The pipeline holds its loaded state
 # dict across a multi-minute rebalance; before saving it must re-read the
 # disk copy and adopt these keys, or a stop that fired mid-rebalance gets
-# erased (trip flag, cool-down, sold-today ledger, peaks, daily anchor).
+# erased (trip flag, cool-down, sold-today ledger, peaks, daily anchors).
+#
+# daily_book_start / daily_book_start_date have TWO writers — the
+# scanner's ~09:30 first-tick anchor and the runner's post-rebalance
+# refresh (core.risk.refresh_daily_book_anchor_after_rebalance) — but
+# both write straight to disk under state_lock, so the disk copy is
+# always the authoritative one to adopt here. Before these keys were
+# listed, a pipeline run whose Step-2 snapshot predated the scanner's
+# anchor would silently drop it at the merged save.
 SCANNER_OWNED_KEYS = (
     "peak_prices",
     "daily_portfolio_start",
     "daily_portfolio_start_date",
+    "daily_book_start",
+    "daily_book_start_date",
     "portfolio_stop_tripped_date",
     "reentry_cooldown_until",
     "cutloss_sold_today",

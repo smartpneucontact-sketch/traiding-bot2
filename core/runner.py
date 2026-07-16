@@ -661,6 +661,26 @@ def run_single_model(
     )
     if rebalanced:
         state["last_rebalance"] = datetime.now().isoformat()
+        # Re-anchor the cutloss tier scaler's day-start book to what this
+        # rebalance actually achieved. The 60s scanner anchored it at
+        # ~09:30 on the PRE-rebalance overnight book, but the validated
+        # stop_grid.py backtest rebalances BEFORE its tier checks — its
+        # TIER_F targets are fractions of the POST-rebalance book. Reads
+        # the achieved gross from the rebalance reconciliation
+        # (result["reconciliation"]["book"]["achieved_gross_usd"]) with a
+        # fallback to the summed target notionals; writes through the
+        # scanner's own locked state path. Best-effort: any failure keeps
+        # the morning anchor and never touches the completed rebalance.
+        try:
+            from core.risk import refresh_daily_book_anchor_after_rebalance
+            refresh_daily_book_anchor_after_rebalance(
+                mc, result if isinstance(result, dict) else None,
+                logger=logger,
+            )
+        except Exception as e:
+            logger.warning(
+                f"  day-start book anchor refresh failed (non-fatal): {e}"
+            )
         # Forward-test clock: the first FUNDED rebalance starts the
         # pre-registered paper test, binding it to the exact protocol.json
         # bytes committed beforehand (any later edit → hash mismatch →

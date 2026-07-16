@@ -86,35 +86,56 @@ def fetch_inactive_assets(symbols: list[str], mc: "ModelConfig",
 
 
 def poll_order_status(order_id: str, mc: "ModelConfig", logger,
-                      max_wait: float = 8.0, interval: float = 0.5) -> dict:
+                      max_wait: float = 8.0, interval: float = 0.5,
+                      final_fetch: bool = True) -> dict:
     """Poll Alpaca for final order status (filled/rejected/etc).
 
     Most market orders fill in <1s but secondary-venue routing during
-    volatile minutes can take several seconds. We wait up to 8s before
-    giving up so the trade journal records real fill prices/quantities.
-    Polling backs off after the first 4 attempts to limit API calls.
+    volatile minutes can take several seconds. We wait up to `max_wait`
+    WALL-CLOCK seconds before giving up so the trade journal records real
+    fill prices/quantities. The deadline is measured with a monotonic
+    clock and includes HTTP time — the old accounting summed only the
+    sleeps, so a slow API stretched an "8s" poll far past its budget
+    (core.risk holds its state lock across these polls). Polling backs
+    off after the first 4 attempts to limit API calls.
+
+    `final_fetch=True` (default, the legacy behavior) makes one last
+    status request after the deadline so callers get the freshest
+    non-terminal state. Budget-bounded callers
+    (`core.risk._instrument_and_journal_sells`) pass False so a
+    timed-out poll can never add another network round-trip; they get
+    the last successfully polled state instead.
     """
     terminal_states = {"filled", "canceled", "expired", "rejected",
                        "suspended", "replaced"}
-    elapsed = 0.0
+    start = time.monotonic()
     attempts = 0
-    while elapsed < max_wait:
+    last_order: dict | None = None
+    while time.monotonic() - start < max_wait:
         try:
             order = alpaca_request("GET", f"v2/orders/{order_id}", mc)
+            last_order = order
             status = order.get("status", "")
             if status in terminal_states:
                 return order
         except Exception:
             break
         attempts += 1
-        # 0.5s × 4 = 2s of fast polling, then 1s intervals up to 8s total
+        # 0.5s × 4 = 2s of fast polling, then 1s intervals — but never
+        # sleep past the deadline.
         sleep_for = interval if attempts < 4 else max(interval, 1.0)
-        time.sleep(sleep_for)
-        elapsed += sleep_for
-    try:
-        return alpaca_request("GET", f"v2/orders/{order_id}", mc)
-    except Exception:
-        return {"status": "unknown", "id": order_id}
+        remaining = max_wait - (time.monotonic() - start)
+        if remaining <= 0:
+            break
+        time.sleep(min(sleep_for, remaining))
+    if final_fetch:
+        try:
+            return alpaca_request("GET", f"v2/orders/{order_id}", mc)
+        except Exception:
+            pass
+    if last_order is not None:
+        return last_order
+    return {"status": "unknown", "id": order_id}
 
 
 def liquidate_all_positions(
@@ -340,6 +361,12 @@ def rebalance_portfolio(
     rb_data["realized_leverage"] = (
         round(total_target_notional / portfolio_value, 4) if portfolio_value else 0.0
     )
+    # Total gross this rebalance targets (post auto-scale). Besides being
+    # useful reporting, it is the fallback the runner uses to refresh the
+    # cutloss day-start book anchor when the post-rebalance reconciliation
+    # can't measure the achieved book (see
+    # core.risk.refresh_daily_book_anchor_after_rebalance).
+    rb_data["target_gross_usd"] = round(float(total_target_notional), 2)
 
     total_positions = max(len(target_set) + len(current_set), 1)
     turnover = (len(to_sell) + len(to_buy)) / total_positions
@@ -473,6 +500,10 @@ def rebalance_portfolio(
     total_notional = 0.0
     buy_notional = 0.0
     sell_notional = 0.0
+    # Final per-order outcomes for the post-rebalance reconciliation block
+    # below — appended right where each record is journaled so the two can
+    # never disagree.
+    submitted_trades: list[TradeRecord] = []
 
     for order in orders:
         sym = order["symbol"]
@@ -625,6 +656,7 @@ def rebalance_portfolio(
             pass
 
         journal.log_trade(trade)
+        submitted_trades.append(trade)
         trade_count += 1
         time.sleep(0.1)
 
@@ -643,6 +675,130 @@ def rebalance_portfolio(
         f"  Notional: ${total_notional:,.2f} total "
         f"(${buy_notional:,.2f} buys, ${sell_notional:,.2f} sells)"
     )
+
+    # -- Post-rebalance reconciliation (Phase A1, additive) ----------------
+    # Flow-level: final polled outcome of each order we submitted.
+    # Book-level: ONE extra get_positions call comparing the achieved book
+    # against the per-symbol targets. Caveat: positions are marked at
+    # CURRENT prices, which have drifted since the fills — small per-symbol
+    # deviations are market noise, not execution failure; large ones (or
+    # missing names) point at rejects/unconfirmed orders. Everything above
+    # already executed and journaled, so a failure here is never allowed to
+    # touch the live path — the whole block is best-effort.
+    try:
+        rejected_states = ("rejected", "canceled", "expired", "failed")
+        n_filled = n_rejected = n_unconfirmed = 0
+        filled_notional = 0.0
+        orders_notional = 0.0
+        rejected_syms: list[str] = []
+        unconfirmed_syms: list[str] = []
+        for t in submitted_trades:
+            t_notional = float(t.notional_usd or 0.0)
+            orders_notional += t_notional
+            if t.order_status == "filled":
+                n_filled += 1
+                filled_notional += t_notional
+            elif t.order_status in rejected_states:
+                n_rejected += 1
+                rejected_syms.append(t.symbol)
+            else:
+                # accepted/submitted/new/pending/unknown — the order went
+                # out but never confirmed filled within the poll window.
+                n_unconfirmed += 1
+                unconfirmed_syms.append(t.symbol)
+        reconciliation: dict = {
+            "flow": {
+                "n_orders": len(submitted_trades),
+                "n_filled": n_filled,
+                "n_rejected": n_rejected,
+                "n_unconfirmed": n_unconfirmed,
+                "fill_rate_notional": (
+                    round(filled_notional / orders_notional, 4)
+                    if orders_notional > 0 else None
+                ),
+                "rejected_symbols": rejected_syms,
+                "unconfirmed_symbols": unconfirmed_syms,
+            },
+            "book": None,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            positions_after = get_positions(mc, logger)
+            achieved_gross = sum(
+                abs(float(p.get("market_value", 0) or 0))
+                for p in positions_after.values()
+            )
+            target_gross = float(total_target_notional)
+            # Symbol-form normalization before diffing: targets use the
+            # universe's dash form (BRK-B) while Alpaca reports positions
+            # in dot form (BRK.B) — comparing raw keys flagged the same
+            # position as both "missing" and "unexpected". Normalize both
+            # sides through _to_alpaca_symbol (dash→dot; dot passes
+            # through unchanged) and key achieved positions back by the
+            # target's own spelling wherever a target exists.
+            target_by_alpaca = {_to_alpaca_symbol(s): s
+                                for s in sym_allocations}
+            positions_after_norm = {
+                target_by_alpaca.get(_to_alpaca_symbol(s), s): p
+                for s, p in positions_after.items()
+            }
+            deviations = []
+            for sym in set(sym_allocations) | set(positions_after_norm):
+                tgt = float(sym_allocations.get(sym, 0.0))
+                ach = float(
+                    (positions_after_norm.get(sym) or {}).get("market_value", 0) or 0)
+                deviations.append({
+                    "symbol": sym,
+                    "target_usd": round(tgt, 2),
+                    "achieved_usd": round(ach, 2),
+                    "deviation_usd": round(ach - tgt, 2),
+                })
+            deviations.sort(key=lambda d: -abs(d["deviation_usd"]))
+            reconciliation["book"] = {
+                "positions_after": len(positions_after),
+                "target_gross_usd": round(target_gross, 2),
+                "achieved_gross_usd": round(achieved_gross, 2),
+                "gross_achieved_pct_of_target": (
+                    round(achieved_gross / target_gross * 100.0, 2)
+                    if target_gross > 0 else None
+                ),
+                # rb_data["realized_leverage"] is the gross this rebalance
+                # actually targeted (post auto-scale / sub-1.0 weights), so
+                # it's the honest comparison point for the achieved book.
+                "target_leverage": rb_data.get("realized_leverage"),
+                "achieved_leverage": (
+                    round(achieved_gross / portfolio_value, 4)
+                    if portfolio_value else None
+                ),
+                "top_deviations": deviations[:5],
+                "missing_positions": sorted(
+                    set(sym_allocations) - set(positions_after_norm)),
+                "unexpected_positions": sorted(
+                    set(positions_after_norm) - set(sym_allocations)),
+            }
+        except Exception as e:
+            logger.warning(f"  Reconciliation book check failed: {e}")
+        rb_data["reconciliation"] = reconciliation
+        flow = reconciliation["flow"]
+        fill_rate = flow["fill_rate_notional"]
+        logger.info(
+            f"  Reconciliation: {n_filled}/{flow['n_orders']} filled, "
+            f"{n_rejected} rejected, {n_unconfirmed} unconfirmed"
+            + (f", fill rate {fill_rate:.1%} of notional"
+               if fill_rate is not None else "")
+        )
+        book = reconciliation.get("book")
+        if book:
+            logger.info(
+                f"  Reconciliation book: gross "
+                f"${book['achieved_gross_usd']:,.2f} achieved vs "
+                f"${book['target_gross_usd']:,.2f} target, leverage "
+                f"{book['achieved_leverage']} vs {book['target_leverage']} "
+                f"targeted, {len(book['missing_positions'])} missing, "
+                f"{len(book['unexpected_positions'])} unexpected"
+            )
+    except Exception as e:
+        logger.warning(f"  Post-rebalance reconciliation failed (non-fatal): {e}")
 
     report.end_step("rebalance")
     return rb_data

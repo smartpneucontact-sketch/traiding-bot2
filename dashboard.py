@@ -1469,6 +1469,250 @@ def api_performance(model_name):
         return jsonify({"error": f"Internal error: {str(e)}", "model": model_name}), 500
 
 
+# ── PHASE A1 MEASUREMENT ENDPOINTS (read-only) ───────────────────────────
+
+def _compute_gate_state(mc, state: dict, fetch_equity=None) -> dict:
+    """Freeze pill + cutloss tier for one model — the exact logic that
+    used to live inline in /api/v1/models/<name>, extracted so the /v2
+    payload and /api/gates can never disagree.
+
+    `state` is the on-disk pipeline state dict; `mc` may be None (model
+    not active). `fetch_equity` is an injectable zero-arg callable
+    returning current equity (tests pass a stub; default reads Alpaca).
+
+    Returns {"freeze_state", "cutloss_state"} always, plus "freeze_since"
+    when frozen and "cutloss_daily_dd_pct" when a live tier read worked.
+    """
+    out: dict = {}
+    # V6 freeze indicator — surface for the /v2 dashboard pill rendering.
+    fs = state.get("freeze_state") or {}
+    if fs.get("active"):
+        out["freeze_state"] = "frozen"
+        out["freeze_since"] = fs.get("since_iso")
+    else:
+        out["freeze_state"] = "normal"
+    # Cutloss state — match the tiers from core/risk.py exactly:
+    #   Tier 3 (= "tripped" when persisted): daily DD ≤ pstop × 7/3
+    #   Tier 2: daily DD ≤ pstop × 5/3 (no trip flag)
+    #   Tier 1: daily DD ≤ pstop (no trip flag)
+    #   else:  "normal"
+    # Tier 2/3 only fire intraday (the 60s scanner) so without a live
+    # equity number we fall back to "tripped" iff today's persisted flag
+    # is set. With a live equity we can compute the current tier.
+    today = datetime.now().strftime("%Y-%m-%d")
+    if state.get("portfolio_stop_tripped_date") == today:
+        out["cutloss_state"] = "tripped"
+    else:
+        out["cutloss_state"] = "normal"  # may be upgraded below
+    # Upgrade with a live tier read if we have an active slot + start equity
+    if mc and mc.enable_cutloss and state.get("daily_portfolio_start_date") == today:
+        try:
+            if fetch_equity is not None:
+                cur_eq = float(fetch_equity())
+            else:
+                acct_live = pipeline.alpaca_request(
+                    "GET", "v2/account", mc,
+                    logger=logging.getLogger("dashboard"))
+                cur_eq = float(acct_live.get("equity", 0))
+            start_eq = float(state.get("daily_portfolio_start", 0) or 0)
+            # Same effective (leverage-scaled) threshold the scanner uses —
+            # raw mc.cutloss_portfolio_stop here would show "tier3" at half
+            # the drawdown the scanner actually liquidates at on a 2x book.
+            pstop = pipeline._effective_portfolio_stop(mc)
+            if start_eq > 0 and cur_eq > 0 and pstop is not None:
+                dd_pct = (cur_eq / start_eq - 1.0) * 100.0
+                if dd_pct <= pstop * (7.0 / 3.0):
+                    out["cutloss_state"] = "tier3"
+                elif dd_pct <= pstop * (5.0 / 3.0):
+                    out["cutloss_state"] = "tier2"
+                elif dd_pct <= pstop:
+                    out["cutloss_state"] = "tier1"
+                out["cutloss_daily_dd_pct"] = round(dd_pct, 4)
+        except Exception:
+            pass
+    return out
+
+
+@functools.lru_cache(maxsize=32)
+def _load_bundle_freeze_cfg_cached(path_str: str, mtime: float) -> dict:
+    """Freeze knobs from the bundle's combo_config, keyed by (path, mtime)
+    like _load_bundle_meta_cached so redeploys invalidate automatically."""
+    from core.runner import load_model_bundle
+    bundle = load_model_bundle(path_str)
+    cfg = bundle.get("combo_config")
+    if cfg is None:
+        return {"enabled": None, "params": None}
+    return {
+        "enabled": bool(getattr(cfg, "enable_drawdown_freeze", False)),
+        "params": {
+            "dd_freeze_pct": getattr(cfg, "dd_freeze_pct", None),
+            "dd_peak_lookback": getattr(cfg, "dd_peak_lookback", None),
+            "dd_unfreeze_within_pct": getattr(cfg, "dd_unfreeze_within_pct", None),
+            "dd_min_freeze_days": getattr(cfg, "dd_min_freeze_days", None),
+        },
+    }
+
+
+def _get_bundle_freeze_config(model_name: str) -> dict:
+    """Freeze config from the model bundle; {"enabled": None} on any miss
+    (no bundle, no combo_config — e.g. the legacy ML rankers)."""
+    try:
+        model_path = pipeline._resolve_model_path(model_name)
+        if not model_path.exists():
+            return {"enabled": None, "params": None}
+        return _load_bundle_freeze_cfg_cached(
+            str(model_path), model_path.stat().st_mtime)
+    except Exception:
+        return {"enabled": None, "params": None}
+
+
+@app.route("/api/slippage/<model_name>")
+def api_slippage(model_name):
+    """Execution-cost statistics from the trade journal (Phase A1).
+
+    Headline: `calibrated_cost_bps_per_side` (notional-weighted, vs the
+    same-day open the backtest assumes as fill) — directly comparable to
+    the research repo's 5 bp/side TC assumption.
+    """
+    try:
+        if model_name not in pipeline.MODEL_REGISTRY:
+            return jsonify({"error": f"Model {model_name} not found"}), 404
+
+        def fetch():
+            from core.execution_stats import compute_slippage_stats
+            from core.journal import TradeJournal
+            trades = TradeJournal(model_name).get_trades()
+            stats = compute_slippage_stats(trades)
+            stats["model"] = model_name
+            return stats
+
+        data = _cached_api_call(f"slippage_{model_name}", fetch, ttl=300)
+        if data is None:
+            return jsonify({"error": "slippage stats unavailable",
+                            "model": model_name}), 500
+        return jsonify(data)
+    except Exception as e:
+        logging.getLogger("dashboard").error(
+            f"Slippage API error for {model_name}: {e}")
+        return jsonify({"error": f"Internal error: {str(e)}",
+                        "model": model_name}), 500
+
+
+@app.route("/api/reconciliation/<model_name>")
+def api_reconciliation(model_name):
+    """Post-rebalance target-vs-achieved reconciliation, latest + last N
+    (from state.history — populated by core/orders.py at each live
+    rebalance). `?n=` caps the recent list (default 10, max 50)."""
+    try:
+        if model_name not in pipeline.MODEL_REGISTRY:
+            return jsonify({"error": f"Model {model_name} not found"}), 404
+        try:
+            n = max(1, min(int(flask_request.args.get("n", 10)), 50))
+        except (TypeError, ValueError):
+            n = 10
+
+        state = _load_model_state(model_name)
+        recs = []
+        for entry in state.get("history", []):
+            recon = (entry.get("result") or {}).get("reconciliation")
+            if recon:
+                recs.append({
+                    "date": entry.get("date"),
+                    "run_id": entry.get("run_id"),
+                    "reconciliation": recon,
+                })
+        return jsonify({
+            "model": model_name,
+            "count": len(recs),
+            "latest": recs[-1] if recs else None,
+            "recent": list(reversed(recs[-n:])),  # newest first
+        })
+    except Exception as e:
+        logging.getLogger("dashboard").error(
+            f"Reconciliation API error for {model_name}: {e}")
+        return jsonify({"error": f"Internal error: {str(e)}",
+                        "model": model_name}), 500
+
+
+@app.route("/api/gates/<model_name>")
+def api_gates(model_name):
+    """Current risk-gate state for one model: strategy gates (book/SPY,
+    exposure multiplier, final gross) from the last strategy_diagnostics,
+    freeze status (incl. the bundle-config enabled flag — disabled/
+    retracted for v2.3_nofreeze), and cutloss tier levels + live state."""
+    try:
+        if model_name not in pipeline.MODEL_REGISTRY:
+            return jsonify({"error": f"Model {model_name} not found"}), 404
+
+        def fetch():
+            mc = _get_model_config(model_name)
+            state = _load_model_state(model_name)
+            gate = _compute_gate_state(mc, state)
+
+            # Newest history entry carrying strategy_diagnostics
+            # (direct_weights runs publish them; ML rankers never do).
+            diag: dict = {}
+            diag_date = None
+            for entry in reversed(state.get("history", [])):
+                d = entry.get("strategy_diagnostics")
+                if d:
+                    diag = d
+                    diag_date = entry.get("date")
+                    break
+
+            freeze_cfg = _get_bundle_freeze_config(model_name)
+            fs = state.get("freeze_state") or {}
+
+            cutloss: dict = {
+                "enabled": bool(mc.enable_cutloss) if mc else False,
+                "state": gate["cutloss_state"],
+                "daily_dd_pct": gate.get("cutloss_daily_dd_pct"),
+                "tripped_date": state.get("portfolio_stop_tripped_date"),
+                "reentry_cooldown_until": state.get("reentry_cooldown_until"),
+                "tier_levels_dd_pct": None,
+            }
+            if mc and mc.enable_cutloss:
+                pstop = pipeline._effective_portfolio_stop(mc)
+                if pstop is not None:
+                    cutloss["tier_levels_dd_pct"] = {
+                        "tier1_scale_to_60pct": round(pstop, 4),
+                        "tier2_scale_to_30pct": round(pstop * 5.0 / 3.0, 4),
+                        "tier3_liquidate": round(pstop * 7.0 / 3.0, 4),
+                    }
+
+            return {
+                "model": model_name,
+                "as_of": datetime.now().isoformat(),
+                "gates": {
+                    "spy_gate": diag.get("spy_gate"),
+                    "book_gate": diag.get("book_gate"),
+                    "book_drawdown": diag.get("book_drawdown"),
+                    "exposure_multiplier": diag.get("exposure_multiplier"),
+                    "gross_pre_gate": diag.get("gross_pre_gate"),
+                    "gross_final": diag.get("gross_final"),
+                    "diagnostics_date": diag_date,
+                },
+                "freeze": {
+                    "enabled_in_config": freeze_cfg.get("enabled"),
+                    "state": gate["freeze_state"],
+                    "since": fs.get("since_iso"),
+                    "params": freeze_cfg.get("params"),
+                },
+                "cutloss": cutloss,
+            }
+
+        data = _cached_api_call(f"gates_{model_name}", fetch, ttl=30)
+        if data is None:
+            return jsonify({"error": "gate state unavailable",
+                            "model": model_name}), 500
+        return jsonify(data)
+    except Exception as e:
+        logging.getLogger("dashboard").error(
+            f"Gates API error for {model_name}: {e}")
+        return jsonify({"error": f"Internal error: {str(e)}",
+                        "model": model_name}), 500
+
+
 @app.route("/api/description/<model_name>")
 def api_description(model_name):
     """Model description and architecture details."""
@@ -1837,48 +2081,11 @@ def apiv1_model_detail(model_name):
         "portfolio_stop_tripped_date": state.get("portfolio_stop_tripped_date"),
         "freeze_state": state.get("freeze_state"),
     }
-    # V6 freeze indicator — surface for the /v2 dashboard pill rendering.
-    fs = state.get("freeze_state") or {}
-    if fs.get("active"):
-        result["freeze_state"] = "frozen"
-        result["freeze_since"] = fs.get("since_iso")
-    else:
-        result["freeze_state"] = "normal"
-    # Cutloss state — match the tiers from core/risk.py exactly:
-    #   Tier 3 (= "tripped" when persisted): daily DD ≤ pstop × 7/3
-    #   Tier 2: daily DD ≤ pstop × 5/3 (no trip flag)
-    #   Tier 1: daily DD ≤ pstop (no trip flag)
-    #   else:  "normal"
-    # Tier 2/3 only fire intraday (the 60s scanner) so without a live
-    # equity number we fall back to "tripped" iff today's persisted flag
-    # is set. With a live equity we can compute the current tier.
-    today = datetime.now().strftime("%Y-%m-%d")
-    if state.get("portfolio_stop_tripped_date") == today:
-        result["cutloss_state"] = "tripped"
-    else:
-        result["cutloss_state"] = "normal"  # may be upgraded below
-    # Upgrade with a live tier read if we have an active slot + start equity
-    if mc and mc.enable_cutloss and state.get("daily_portfolio_start_date") == today:
-        try:
-            acct_live = pipeline.alpaca_request("GET", "v2/account", mc,
-                                                logger=logger)
-            cur_eq = float(acct_live.get("equity", 0))
-            start_eq = float(state.get("daily_portfolio_start", 0) or 0)
-            # Same effective (leverage-scaled) threshold the scanner uses —
-            # raw mc.cutloss_portfolio_stop here would show "tier3" at half
-            # the drawdown the scanner actually liquidates at on a 2x book.
-            pstop = pipeline._effective_portfolio_stop(mc)
-            if start_eq > 0 and cur_eq > 0 and pstop is not None:
-                dd_pct = (cur_eq / start_eq - 1.0) * 100.0
-                if dd_pct <= pstop * (7.0 / 3.0):
-                    result["cutloss_state"] = "tier3"
-                elif dd_pct <= pstop * (5.0 / 3.0):
-                    result["cutloss_state"] = "tier2"
-                elif dd_pct <= pstop:
-                    result["cutloss_state"] = "tier1"
-                result["cutloss_daily_dd_pct"] = round(dd_pct, 4)
-        except Exception:
-            pass
+    # Freeze pill + cutloss tier via the shared helper (also powers
+    # /api/gates — extracted from here so the two can never disagree).
+    # Same key semantics as before: freeze_since only when frozen,
+    # cutloss_daily_dd_pct only when the live tier read worked.
+    result.update(_compute_gate_state(mc, state))
 
     # Full run history
     history = state.get("history", [])

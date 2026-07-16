@@ -121,6 +121,50 @@ class RunReport:
                 lines.append(f"    Bought: {', '.join(rb['buys_detail'])}")
             lines.append("")
 
+        # Post-rebalance reconciliation (Phase A1) — present only when the
+        # rebalance actually submitted orders and the block succeeded.
+        recon = (self.data.get("rebalance") or {}).get("reconciliation")
+        if recon:
+            flow = recon.get("flow") or {}
+            lines.append("  RECONCILIATION:")
+            lines.append(
+                f"    Orders:                {flow.get('n_orders', 0)} "
+                f"({flow.get('n_filled', 0)} filled, "
+                f"{flow.get('n_rejected', 0)} rejected, "
+                f"{flow.get('n_unconfirmed', 0)} unconfirmed)"
+            )
+            fr = flow.get("fill_rate_notional")
+            fr_str = f"{fr:.1%}" if fr is not None else "n/a"
+            lines.append(f"    Fill rate (notional):  {fr_str}")
+            if flow.get("rejected_symbols"):
+                lines.append(f"    Rejected:              {', '.join(flow['rejected_symbols'])}")
+            if flow.get("unconfirmed_symbols"):
+                lines.append(f"    Unconfirmed:           {', '.join(flow['unconfirmed_symbols'])}")
+            book = recon.get("book")
+            if book:
+                pct = book.get("gross_achieved_pct_of_target")
+                lines.append(f"    Target gross:          ${book.get('target_gross_usd', 0):,.2f}")
+                lines.append(
+                    f"    Achieved gross:        ${book.get('achieved_gross_usd', 0):,.2f}"
+                    + (f" ({pct:.1f}% of target)" if pct is not None else "")
+                )
+                lines.append(
+                    f"    Leverage:              targeted {book.get('target_leverage', '?')}, "
+                    f"achieved {book.get('achieved_leverage', '?')}"
+                )
+                for d in (book.get("top_deviations") or [])[:5]:
+                    lines.append(
+                        f"      dev {d.get('symbol', '?'):6s} "
+                        f"${d.get('target_usd', 0):>11,.2f} -> "
+                        f"${d.get('achieved_usd', 0):>11,.2f} "
+                        f"({d.get('deviation_usd', 0):+,.2f})"
+                    )
+                if book.get("missing_positions"):
+                    lines.append(f"    Missing:               {', '.join(book['missing_positions'])}")
+                if book.get("unexpected_positions"):
+                    lines.append(f"    Unexpected:            {', '.join(book['unexpected_positions'])}")
+            lines.append("")
+
         # Trade journal summary
         if "trade_log_summary" in self.data:
             tls = self.data["trade_log_summary"]

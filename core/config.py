@@ -473,6 +473,16 @@ def _resolve_model_path(model_name: str) -> Path:
     return path
 
 
+# Fingerprint of the last [MODEL DETECT] block we printed. Dashboards call
+# get_active_models() on every API request, so printing the 5-6 line block
+# unconditionally floods Railway's log retention (a Tier-1 stop event
+# scrolled out within a day). We buffer the block each scan and only print
+# it when its content changes — same output as before on any real change,
+# total silence when the scan result is identical. Only logging is gated;
+# the config read/scan itself is never cached.
+_last_model_detect_block: str | None = None
+
+
 def get_active_models() -> list[ModelConfig]:
     """Build active models from config file, falling back to env vars.
 
@@ -482,9 +492,11 @@ def get_active_models() -> list[ModelConfig]:
     bot bootstraps on a fresh container before the dashboard saves
     anything.
     """
+    global _last_model_detect_block
     config = _migrate_cutloss_calibration(load_model_config())
     models: list[ModelConfig] = []
     activated_via_config = False
+    detect_lines: list[str] = []  # buffered [MODEL DETECT] block, see above
 
     # -- Try config file first --
     for slot in config.get("slots", []):
@@ -499,9 +511,10 @@ def get_active_models() -> list[ModelConfig]:
         model_path = _resolve_model_path(model_name)
         reg = MODEL_REGISTRY[model_name]
 
-        print(f"[MODEL DETECT] slot {slot.get('slot_id')}: model={model_name}, "
-              f"key={'YES' if key else 'NO'}, secret={'YES' if secret else 'NO'}, "
-              f"model_file={model_path} exists={model_path.exists()}", flush=True)
+        detect_lines.append(
+            f"[MODEL DETECT] slot {slot.get('slot_id')}: model={model_name}, "
+            f"key={'YES' if key else 'NO'}, secret={'YES' if secret else 'NO'}, "
+            f"model_file={model_path} exists={model_path.exists()}")
 
         if key and secret and model_path.exists():
             activated_via_config = True
@@ -529,7 +542,8 @@ def get_active_models() -> list[ModelConfig]:
     # Keys-but-no-pickle is treated as "config didn't work" so env vars
     # still get a chance.
     if not activated_via_config:
-        print("[MODEL DETECT] No models activated from config; trying env vars", flush=True)
+        detect_lines.append(
+            "[MODEL DETECT] No models activated from config; trying env vars")
         for name in MODEL_REGISTRY:
             key_env = f"MODEL_{name.upper()}_ALPACA_KEY"
             secret_env = f"MODEL_{name.upper()}_ALPACA_SECRET"
@@ -548,9 +562,10 @@ def get_active_models() -> list[ModelConfig]:
             model_path = _resolve_model_path(name)
             reg = MODEL_REGISTRY[name]
 
-            print(f"[MODEL DETECT] env {name}: key={'YES' if key else 'NO'}, "
-                  f"secret={'YES' if secret else 'NO'}, "
-                  f"model={model_path} exists={model_path.exists()}", flush=True)
+            detect_lines.append(
+                f"[MODEL DETECT] env {name}: key={'YES' if key else 'NO'}, "
+                f"secret={'YES' if secret else 'NO'}, "
+                f"model={model_path} exists={model_path.exists()}")
 
             if key and secret and model_path.exists():
                 models.append(ModelConfig(
@@ -569,11 +584,25 @@ def get_active_models() -> list[ModelConfig]:
                 ["find", str(model_dir), "-name", "*.pkl"],
                 capture_output=True, text=True, timeout=5,
             )
-            print(f"[MODEL DETECT] .pkl files found: {result.stdout.strip()}", flush=True)
+            detect_lines.append(
+                f"[MODEL DETECT] .pkl files found: {result.stdout.strip()}")
         except Exception:
             pass
 
-    print(f"[MODEL DETECT] Active: {[m.name for m in models]}", flush=True)
+    detect_lines.append(f"[MODEL DETECT] Active: {[m.name for m in models]}")
+
+    # Only print the block when the scan result changed since the last
+    # print (log spam gating — see _last_model_detect_block above). On any
+    # gating error, fail open and print: losing a log line is worse than
+    # a duplicate.
+    try:
+        block = "\n".join(detect_lines)
+        if block != _last_model_detect_block:
+            print(block, flush=True)
+            _last_model_detect_block = block
+    except Exception:
+        print("\n".join(detect_lines), flush=True)
+
     return models
 
 

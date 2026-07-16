@@ -181,8 +181,12 @@ def test_disabled_position_stops_never_fire(tmp_path, monkeypatch):
         monkeypatch.setattr(risk_mod, "alpaca_request", fake_alpaca)
         monkeypatch.setattr(risk_mod, "load_state", lambda mc_: {})
         monkeypatch.setattr(risk_mod, "save_state", lambda st, mc_: None)
-        monkeypatch.setattr(risk_mod, "_execute_cutloss_sell",
-                            lambda *a, **kw: sells.append(a) or 100.0)
+        # The scan places stop sells via _place_position_close (the legacy
+        # _execute_cutloss_sell is no longer on the scan path).
+        monkeypatch.setattr(risk_mod, "_place_position_close",
+                            lambda *a, **kw: sells.append(a))
+        monkeypatch.setattr(risk_mod, "_instrument_and_journal_sells",
+                            lambda *a, **kw: None)
 
         risk_mod._cutloss_scan_model(mc, logger)
         assert sells == [], f"stop fired with disabled value {disabled_value!r}"
@@ -349,9 +353,12 @@ def test_scan_wires_proceeds_and_ledger_into_redistribute(tmp_path, monkeypatch)
 
     monkeypatch.setattr(risk_mod, "alpaca_request", fake_alpaca)
     monkeypatch.setattr(risk_mod, "poll_order_status",
-                        lambda oid, mc_, lg: {"status": "filled",
-                                              "filled_qty": "10",
-                                              "filled_avg_price": "94.5"})
+                        lambda oid, mc_, lg, **kw: {"status": "filled",
+                                                    "filled_qty": "10",
+                                                    "filled_avg_price": "94.5"})
+    # Post-placement snapshot (instrumentation only) — keep the test offline.
+    monkeypatch.setattr(risk_mod, "fetch_snapshots",
+                        lambda syms, mc_, lg=None: {})
     monkeypatch.setattr(risk_mod, "TradeJournal", StubJournal)
     monkeypatch.setattr(
         risk_mod, "_redistribute_after_cutloss",
