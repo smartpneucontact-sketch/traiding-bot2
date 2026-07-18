@@ -161,6 +161,161 @@ def _adaptive_voltarget_momentum_weights(
     return {sym: float(w * lev) for sym, w in base_w.items()}
 
 
+# ───── Sleeve 4: residual momentum (V7 E3 port, 2026-07-18) ──────────────
+# Port of research strategies_v2.py (Traiding 11) — Blitz/Huij/Martens
+# (2011) residual (idiosyncratic) momentum. Used by the Stream-1 candidate-X
+# B-base blend (residual REPLACES xs: res+dual+adapt at static 1/3 each,
+# see assemble_candidates.py). DISABLED in the frozen primary
+# (ComboConfig.residual_weight defaults to 0.0).
+#
+# Numerics are a verbatim port of strategies_v2._residual_momentum_scores /
+# _residual_momentum_weights_live (parity 1e-9, tests/test_residual_parity.py).
+# The ONLY divergence: research raises on missing/NaN SPY; the live path
+# fail-softs to an empty sleeve (failure-tolerant live rule).
+
+# Yahoo-style sector names (research data_cache sector_map) → SPDR sector
+# ETF present in the bot's macro panel (core/data.py MACRO_TICKERS).
+SECTOR_TO_ETF = {
+    "Technology": "XLK",
+    "Healthcare": "XLV",
+    "Financial Services": "XLF",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Industrials": "XLI",
+    "Energy": "XLE",
+    "Basic Materials": "XLB",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+    "Communication Services": "XLC",
+}
+
+_RESIDUAL_MIN_OBS_FRAC = 0.95  # share of finite returns required in-window
+
+
+def _residual_momentum_scores(
+    px_hist: pd.DataFrame,
+    macro_hist: pd.DataFrame,
+    sector_map: dict,
+    beta_mode: str = "market_sector",
+    scale_mode: str = "raw",
+    lookback_long: int = 252,
+    lookback_skip: int = 21,
+) -> pd.Series:
+    """Residual-momentum scores as of the LAST row of `px_hist`.
+
+    Spec (binding, E3): trailing 252+21 daily-return window ending at the
+    decision date; per-stock OLS beta vs SPY (beta_mode="market") or
+    two-factor OLS on [SPY, own-sector XL* ETF] (beta_mode="market_sector",
+    demeaned normal equations, 2x2 solve per sector group; unmapped
+    sectors / ETFs with in-window gaps / singular windows fall back to
+    market-only). Signal = SUM of residuals over the first 252 rows
+    (12-1 convention). scale_mode="sharpe" divides by the ddof=0 std of
+    the same formation rows; "raw" does not.
+
+    Eligibility: finite close at window start and end AND >=95% finite
+    daily returns in-window. Missing returns are zero-filled for the
+    regression. Returns an empty Series when history or SPY data is
+    insufficient (live fail-soft; research twin raises instead).
+    """
+    T = lookback_long + lookback_skip  # 273 return days
+    if len(px_hist) < T + 1:
+        return pd.Series(dtype=float)
+    pxw = px_hist.iloc[-(T + 1):]
+    rets = pxw.pct_change(fill_method=None).iloc[1:]  # T × N
+
+    if "SPY" not in macro_hist.columns:
+        return pd.Series(dtype=float)  # research twin raises here
+    spy_px = macro_hist["SPY"].reindex(pxw.index)
+    spy = spy_px.pct_change(fill_method=None).iloc[1:].to_numpy(dtype=float)
+    if not np.isfinite(spy).all():
+        return pd.Series(dtype=float)  # research twin raises here
+
+    # Eligibility: finite close at window start & end, ≥95% finite returns.
+    first_ok = pxw.iloc[0].notna().to_numpy()
+    last_ok = pxw.iloc[-1].notna().to_numpy()
+    finite_cnt = np.isfinite(rets.to_numpy(dtype=float)).sum(axis=0)
+    eligible = first_ok & last_ok & (
+        finite_cnt >= int(np.ceil(_RESIDUAL_MIN_OBS_FRAC * T)))
+
+    R = rets.to_numpy(dtype=float)
+    R = np.where(np.isfinite(R), R, 0.0)  # zero-fill missing returns
+    cols = np.asarray(rets.columns)
+
+    # Market betas (always needed: market mode + sector fallback).
+    xc = spy - spy.mean()
+    denom = float(xc @ xc)
+    Rc = R - R.mean(axis=0)
+    beta_mkt = (xc @ Rc) / denom
+    resid = R - np.outer(spy, beta_mkt)  # alpha kept in the residual
+
+    if beta_mode == "market_sector":
+        sec_px = {}
+        for sec, etf in SECTOR_TO_ETF.items():
+            if etf in macro_hist.columns:
+                s = macro_hist[etf].reindex(pxw.index)
+                sr = s.pct_change(fill_method=None).iloc[1:].to_numpy(dtype=float)
+                if np.isfinite(sr).all():
+                    sec_px[sec] = sr
+        # group columns by sector
+        sec_of = np.asarray([sector_map.get(c) for c in cols], dtype=object)
+        for sec, sr in sec_px.items():
+            g = np.where(sec_of == sec)[0]
+            if g.size == 0:
+                continue
+            X = np.column_stack([spy, sr])               # 273 × 2, raw
+            Xc = X - X.mean(axis=0)
+            G = Xc.T @ Xc                                # 2 × 2
+            if abs(np.linalg.det(G)) < 1e-18:
+                continue  # collinear → keep market-only residual
+            B = np.linalg.solve(G, Xc.T @ Rc[:, g])      # 2 × n_g
+            resid[:, g] = R[:, g] - X @ B
+    elif beta_mode != "market":
+        raise ValueError(f"unknown beta_mode: {beta_mode}")
+
+    form = resid[:T - lookback_skip]  # first 252 rows = excl. last 21 days
+    sig = form.sum(axis=0)
+    if scale_mode == "sharpe":
+        sd = form.std(axis=0, ddof=0)
+        bad = sd < 1e-12
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sig = sig / sd
+        sig[bad] = np.nan
+    elif scale_mode != "raw":
+        raise ValueError(f"unknown scale_mode: {scale_mode}")
+
+    out = pd.Series(sig, index=cols)
+    return out[eligible & np.isfinite(sig)]
+
+
+def _residual_momentum_weights(
+    stock_px: pd.DataFrame,
+    macro_px: pd.DataFrame,
+    sector_map: dict,
+    n_long: int = 30,
+    beta_mode: str = "market_sector",
+    scale_mode: str = "raw",
+    lookback_long: int = 252,
+    lookback_skip: int = 21,
+) -> dict[str, float]:
+    """Stateless live twin of strategies_v2._residual_momentum_weights_live
+    (same pattern as _xs_momentum_weights above): long top-`n_long` by
+    residual 12-1 momentum, equal weight 1/n_long, or {} if not feasible.
+    B-base config (candidate X): beta_mode="market_sector", scale_mode="raw",
+    n_long=30.
+    """
+    if stock_px.empty or len(stock_px) < lookback_long + lookback_skip + 1:
+        return {}
+    scores = _residual_momentum_scores(
+        stock_px, macro_px, sector_map,
+        beta_mode=beta_mode, scale_mode=scale_mode,
+        lookback_long=lookback_long, lookback_skip=lookback_skip,
+    )
+    if len(scores) < n_long:
+        return {}
+    top = scores.nlargest(n_long).index
+    return {sym: 1.0 / n_long for sym in top}
+
+
 # ───── Risk overlays ─────────────────────────────────────────────────────
 def _linear_dd_ramp(dd: float, full_dd: float, cash_dd: float) -> float:
     """Map a drawdown (≤ 0) to an exposure multiplier in [0, 1]:
@@ -305,7 +460,13 @@ def evaluate_spy_drawdown_freeze(
 class ComboConfig:
     """All knobs for ComboStrategy. Pickle-safe."""
 
-    # Equal-weight blend of 3 sleeves (must sum to 1.0)
+    # Sleeve blend (all sleeve weights must sum to 1.0). A sleeve with
+    # weight 0.0 is not computed at all.
+    #
+    # xs_mom_top_n=30 is the primary's xs_momentum_top30; the catalog's
+    # `xs_momentum_12_1` variant is the SAME signal with n_long=50
+    # (verified: exp_rescore.py REGISTRY, {"n_long": 50}) — set
+    # xs_mom_top_n=50 to trade it (needed by the Stream-3 process slot).
     xs_mom_weight: float = 1.0 / 3.0
     xs_mom_top_n: int = 30
     dual_mom_weight: float = 1.0 / 3.0
@@ -316,6 +477,30 @@ class ComboConfig:
     adaptive_calm_leverage: float = 1.5
     adaptive_neutral_leverage: float = 1.0
     adaptive_stress_leverage: float = 0.5
+
+    # Sleeve 4: residual momentum (V7 E3 port, 2026-07-18). DISABLED in
+    # the frozen primary: residual_weight=0.0 reproduces pre-port behavior
+    # exactly, and every default below is a class-level immutable, so
+    # bundles pickled BEFORE these fields existed resolve them via the
+    # class attribute (dataclass defaults) on every access path.
+    #
+    # Candidate-X B base (assemble_candidates.py: residual REPLACES xs in
+    # a 3-sleeve static-1/3 blend):
+    #   xs_mom_weight=0.0, residual_weight=1/3,
+    #   dual_mom_weight=1/3, adaptive_weight=1/3,
+    #   residual_beta_mode="market_sector", residual_scale_mode="raw",
+    #   residual_top_n=30, residual_sector_map=<bundled ticker→sector dict>.
+    residual_weight: float = 0.0
+    residual_top_n: int = 30
+    residual_beta_mode: str = "market_sector"
+    residual_scale_mode: str = "raw"
+    residual_lookback_long: int = 252
+    residual_lookback_skip: int = 21
+    # ticker → Yahoo-style sector name (see SECTOR_TO_ETF). None (default,
+    # immutable — safe as a shared class fallback) means no sector map:
+    # market_sector mode then degrades to market-only betas per spec.
+    # Variant bundles must ship their sector map here (build_variant.py).
+    residual_sector_map: dict | None = None
 
     # SPY drawdown gate (soft, in-strategy). Disabled in the 2026-06
     # calibration: stacked on the book gate it costs 0.40pp/mo for only
@@ -358,12 +543,13 @@ class ComboConfig:
     min_position_weight: float = 0.003
 
     def __post_init__(self):
-        total = self.xs_mom_weight + self.dual_mom_weight + self.adaptive_weight
+        total = (self.xs_mom_weight + self.dual_mom_weight
+                 + self.adaptive_weight + self.residual_weight)
         if abs(total - 1.0) > 1e-6:
             raise ValueError(
                 f"ComboConfig sleeve weights sum to {total:.6f}, expected 1.0. "
                 f"Got xs={self.xs_mom_weight}, dual={self.dual_mom_weight}, "
-                f"adapt={self.adaptive_weight}."
+                f"adapt={self.adaptive_weight}, residual={self.residual_weight}."
             )
 
 
@@ -389,21 +575,39 @@ class ComboStrategy:
         stock_px = _to_close_panel(stock_data) if stock_data else pd.DataFrame()
         macro_px = _to_close_panel(macro_data) if macro_data else pd.DataFrame()
 
-        # Sleeves
-        w_xs = _xs_momentum_weights(stock_px, n_long=c.xs_mom_top_n)
-        w_dual = _dual_momentum_voltarget_weights(
+        # Sleeves. A sleeve with blend weight 0.0 is skipped entirely (no
+        # computation, no zero-weight symbol pollution in `combined`).
+        # `residual_weight` is getattr-guarded: bundles pickled before the
+        # 2026-07-18 residual port lack the field on the instance, and the
+        # class-level dataclass default (0.0) reproduces pre-port behavior.
+        res_weight = getattr(c, "residual_weight", 0.0)
+
+        w_xs = (_xs_momentum_weights(stock_px, n_long=c.xs_mom_top_n)
+                if c.xs_mom_weight != 0.0 else {})
+        w_dual = (_dual_momentum_voltarget_weights(
             stock_px, n_long=c.dual_mom_top_n,
             target_vol=c.dual_mom_vol_target,
-        )
+        ) if c.dual_mom_weight != 0.0 else {})
         adaptive_diag: dict = {}
-        w_adapt = _adaptive_voltarget_momentum_weights(
+        w_adapt = (_adaptive_voltarget_momentum_weights(
             stock_px, macro_px,
             n_long=c.adaptive_top_n,
             calm_leverage=c.adaptive_calm_leverage,
             neutral_leverage=c.adaptive_neutral_leverage,
             stress_leverage=c.adaptive_stress_leverage,
             diag=adaptive_diag,
-        )
+        ) if c.adaptive_weight != 0.0 else {})
+        w_res: dict[str, float] = {}
+        if res_weight != 0.0:
+            w_res = _residual_momentum_weights(
+                stock_px, macro_px,
+                sector_map=getattr(c, "residual_sector_map", None) or {},
+                n_long=getattr(c, "residual_top_n", 30),
+                beta_mode=getattr(c, "residual_beta_mode", "market_sector"),
+                scale_mode=getattr(c, "residual_scale_mode", "raw"),
+                lookback_long=getattr(c, "residual_lookback_long", 252),
+                lookback_skip=getattr(c, "residual_lookback_skip", 21),
+            )
 
         combined: dict[str, float] = {}
         # Per-sleeve post-blend contributions (sleeve_weight × sleeve's own
@@ -412,11 +616,18 @@ class ComboStrategy:
         # scale all sleeves identically, so the pre-gate split is the one
         # that matches what the backtest's per-sleeve references measure.
         sleeve_contrib: dict[str, dict[str, float]] = {}
-        for name, sleeve, sleeve_weight in (
+        # The three legacy sleeve names always appear in diagnostics (the
+        # attribution layer keys off them); "residual_momentum" appears
+        # only when the sleeve is enabled, so primary-slot diagnostics are
+        # unchanged by the port.
+        sleeve_specs = [
             ("xs_momentum", w_xs, c.xs_mom_weight),
             ("dual_momentum", w_dual, c.dual_mom_weight),
             ("adaptive", w_adapt, c.adaptive_weight),
-        ):
+        ]
+        if res_weight != 0.0:
+            sleeve_specs.append(("residual_momentum", w_res, res_weight))
+        for name, sleeve, sleeve_weight in sleeve_specs:
             contrib: dict[str, float] = {}
             for sym, w in sleeve.items():
                 blended = sleeve_weight * w

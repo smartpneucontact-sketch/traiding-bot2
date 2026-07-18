@@ -78,6 +78,90 @@ class TradeRecord:
     slippage_bps: Optional[float] = None            # fill vs reference_open; positive = cost
     slippage_vs_arrival_bps: Optional[float] = None # fill vs decision_price; positive = cost
 
+    # Freeze-state capture for the pre-registered FREEZE ABLATION REPLAY
+    # (protocol_exp.json `freeze_disputed`; DECISION_RULE.md ruling). The
+    # combo_v2_exp slot ships freeze dd_v1 as a DISPUTED component, so
+    # every rebalance/scan order row records the freeze posture in force
+    # when it was submitted — research replays the identical book monthly
+    # WITHOUT the freeze multiplier and adjudicates at 12 months. Filled
+    # best-effort by log_trade() from the slot's pipeline state (see
+    # freeze_context_from_state); all None for slots with no freeze
+    # machinery (the frozen primary) and on rows predating this field.
+    freeze_active: Optional[bool] = None            # was a freeze in force at submit time
+    freeze_multiplier: Optional[float] = None       # exposure multiplier the freeze applied (1.0 = no cut)
+    freeze_state: Optional[str] = None              # compact JSON of the persisted freeze-state dict
+
+
+def freeze_context_from_state(state: dict | None) -> dict:
+    """Extract the freeze posture from a slot's pipeline state. PURE.
+
+    Reads the two places the runner persists freeze information (the
+    publisher is core/runner.py's freeze block — it writes BOTH on every
+    run of a freeze-enabled slot):
+      - state["freeze_state"] — the runner-level freeze dict. Besides the
+        V6-style {"active": ..., "since_iso": ...} keys the runner embeds
+        "freeze_multiplier" (0.0 = hard cut in force, 1.0 = evaluated,
+        no cut). This is the FRESHEST source: it is updated even on
+        frozen runs, which liquidate and return before writing a history
+        entry — so it takes precedence over history below.
+      - the newest history entry's strategy_diagnostics — the runner
+        merges "freeze_multiplier" / "freeze_active" into the rebalance
+        diagnostics alongside the existing gate values. Fallback for
+        states written before the freeze_state dict carried the
+        multiplier.
+
+    Returns {"freeze_active", "freeze_multiplier", "freeze_state"} with
+    None for anything not present — a slot with no freeze machinery (the
+    frozen primary) yields all-None, so its journal rows are unchanged.
+    """
+    ctx = {"freeze_active": None, "freeze_multiplier": None,
+           "freeze_state": None}
+    if not isinstance(state, dict):
+        return ctx
+    fs = state.get("freeze_state")
+    if isinstance(fs, dict) and fs:
+        if fs.get("active") is not None:
+            ctx["freeze_active"] = bool(fs.get("active"))
+        if fs.get("freeze_multiplier") is not None:
+            try:
+                ctx["freeze_multiplier"] = float(fs["freeze_multiplier"])
+            except (TypeError, ValueError):
+                pass
+        ctx["freeze_state"] = json.dumps(fs, sort_keys=True, default=str)
+    for entry in reversed(state.get("history") or []):
+        diag = entry.get("strategy_diagnostics")
+        if not isinstance(diag, dict):
+            continue
+        if "freeze_multiplier" in diag or "freeze_active" in diag:
+            if (ctx["freeze_multiplier"] is None
+                    and diag.get("freeze_multiplier") is not None):
+                try:
+                    ctx["freeze_multiplier"] = float(diag["freeze_multiplier"])
+                except (TypeError, ValueError):
+                    pass
+            if ctx["freeze_active"] is None and diag.get("freeze_active") is not None:
+                ctx["freeze_active"] = bool(diag["freeze_active"])
+            break
+    return ctx
+
+
+def _load_freeze_context(model_name: str) -> dict:
+    """freeze_context_from_state() against the slot's on-disk pipeline
+    state. Best-effort: any read/parse failure yields the all-None
+    context — journaling a trade must never fail on freeze capture.
+
+    Reads module globals at call time (not import time) so tests can
+    repoint _DATA_DIR.
+    """
+    try:
+        state_path = _DATA_DIR / "state" / f"pipeline_state_{model_name}.json"
+        if not state_path.exists():
+            return freeze_context_from_state(None)
+        return freeze_context_from_state(
+            json.loads(state_path.read_text()))
+    except Exception:
+        return freeze_context_from_state(None)
+
 
 class TradeJournal:
     """Persistent per-model trade log.
@@ -104,7 +188,24 @@ class TradeJournal:
         self.csv_path = _TRADE_DIR / f"trades_{model_name}.csv"
 
     def log_trade(self, record: TradeRecord) -> None:
-        """Append a trade record to both JSONL and CSV (lock-protected)."""
+        """Append a trade record to both JSONL and CSV (lock-protected).
+
+        Freeze capture (ablation replay): when the caller didn't set the
+        freeze_* fields, they are auto-filled from the slot's pipeline
+        state so every rebalance/scan row carries the freeze posture in
+        force when the order went out. Best-effort — a failed capture
+        journals the row with freeze_* = None, never blocks the append.
+        """
+        if (record.freeze_active is None
+                and record.freeze_multiplier is None
+                and record.freeze_state is None):
+            try:
+                ctx = _load_freeze_context(self.model_name)
+                record.freeze_active = ctx["freeze_active"]
+                record.freeze_multiplier = ctx["freeze_multiplier"]
+                record.freeze_state = ctx["freeze_state"]
+            except Exception:
+                pass
         data = asdict(record)
         with self._lock_for(self.model_name):
             with open(self.jsonl_path, "a") as f:

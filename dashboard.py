@@ -1889,40 +1889,136 @@ def api_sleeves(model_name):
                         "model": model_name}), 500
 
 
+def _equity_points_payload(model_name: str) -> Optional[dict]:
+    """Raw padding-trimmed equity points for one slot, cached 300s.
+
+    {"points": [[ts_ms, equity], ...], "forward_test_start": iso|None}.
+    Used by the relative-metric computation, which re-runs
+    compute_tracking over the COMMON window (a different start date than
+    the slot's own tracking) and therefore needs the raw curve, not the
+    already-anchored _tracking_payload. None when the fetch failed;
+    empty points when the slot is inactive (no Alpaca key).
+    """
+    def fetch():
+        logger = logging.getLogger("dashboard")
+        mc = _get_model_config(model_name)
+        state = _load_model_state(model_name)
+        points: list = []
+        if mc is not None:
+            ts_ms, equity = _fetch_equity_history(mc, logger)
+            points = [[t, e] for t, e in zip(ts_ms, equity)]
+        return {"points": points,
+                "forward_test_start": state.get("forward_test_start")}
+
+    return _cached_api_call(f"equity_points_{model_name}", fetch, ttl=300)
+
+
+def _relative_metrics_for(model_name: str, proto: dict) -> Optional[dict]:
+    """rel_* metric values for a shadow slot's protocol, or None.
+
+    For every baseline named by the protocol's rel_ criteria
+    (`relative_to`, default the primary), computes BOTH slots' tracking
+    over the COMMON window — max of the two forward_test_start dates —
+    via core.tracking.compute_tracking, then diffs them with
+    core.protocol.compute_relative_metrics. Entirely best-effort: any
+    missing input leaves that baseline's metrics absent (the scorer
+    renders NA, never a guess). Returns None when the protocol has no
+    relative criteria (the frozen primary path — zero extra work).
+    """
+    from core.protocol import (PRIMARY_MODEL, common_window_start,
+                               compute_relative_metrics)
+    from core.tracking import compute_tracking, get_backtest_reference
+
+    baselines = {c.get("relative_to") or PRIMARY_MODEL
+                 for c in proto.get("criteria", [])
+                 if str(c.get("metric", "")).startswith("rel_")}
+    if not baselines:
+        return None
+
+    rel: dict = {"_common_window_start": {}}
+    try:
+        own_pts = _equity_points_payload(model_name) or {}
+        own_ref = get_backtest_reference(_get_model_config(model_name)) or {}
+    except Exception:
+        return rel
+    for baseline in sorted(baselines):
+        try:
+            base_pts = _equity_points_payload(baseline) or {}
+            common = common_window_start(
+                own_pts.get("forward_test_start"),
+                base_pts.get("forward_test_start"))
+            if not common:
+                continue
+            rel["_common_window_start"][baseline] = common
+            base_ref = get_backtest_reference(
+                _get_model_config(baseline)) or {}
+            own_cw = compute_tracking(
+                [tuple(p) for p in own_pts.get("points") or []],
+                own_ref, common)
+            base_cw = compute_tracking(
+                [tuple(p) for p in base_pts.get("points") or []],
+                base_ref, common)
+            rel[baseline] = compute_relative_metrics(own_cw, base_cw)
+        except Exception as e:
+            logging.getLogger("dashboard").warning(
+                f"[COMPARE] rel metrics {model_name} vs {baseline} "
+                f"failed (non-fatal): {e}")
+    return rel
+
+
+def _protocol_payload(model_name: str) -> Optional[dict]:
+    """Per-slot protocol scoreboard, cached 60s — THE one shared
+    computation behind /api/protocol and /api/compare.
+
+    Resolves the slot's OWN protocol file (core.protocol per-slot
+    resolution: combo_v2 → the frozen protocol.json, combo_v2_exp →
+    protocol_exp.json, combo_v2_process → protocol_process.json), feeds
+    the scorer the same tracking dict /api/tracking serves, and — for
+    shadow protocols with rel_ criteria — the common-window relative
+    metrics versus each referenced baseline slot."""
+    def fetch():
+        from core.execution_stats import compute_slippage_stats
+        from core.journal import TradeJournal
+        from core.protocol import load_protocol_for, score_protocol
+        proto = load_protocol_for(model_name)
+        state = _load_model_state(model_name)
+
+        try:
+            slip = compute_slippage_stats(
+                TradeJournal(model_name).get_trades())
+        except Exception:
+            slip = None
+        recons = [
+            (e.get("result") or {}).get("reconciliation")
+            for e in state.get("history", [])
+        ]
+        recons = [r for r in recons if r]
+        tracking = _tracking_payload(model_name)  # None-safe for scorer
+        try:
+            rel_metrics = _relative_metrics_for(model_name, proto)
+        except Exception:
+            rel_metrics = None
+
+        score = score_protocol(tracking, slip, recons, state, proto,
+                               rel_metrics=rel_metrics)
+        score["model"] = model_name
+        return score
+
+    return _cached_api_call(f"protocol_{model_name}", fetch, ttl=60)
+
+
 @app.route("/api/protocol/<model_name>")
 def api_protocol(model_name):
     """Protocol scoreboard (Phase A2): every pre-registered criterion
     scored PASS/WARN/KILL/NA against live metrics, plus the binding check
-    (protocol.json sha256 vs the hash bound at forward_test_start — any
-    mismatch is permanently MODIFIED_AFTER_START)."""
+    (the slot's own protocol file sha256 vs the hash bound at its
+    forward_test_start — any mismatch is permanently
+    MODIFIED_AFTER_START). Shadow slots additionally score their rel_
+    criteria on the common window versus the baseline slot."""
     try:
         if model_name not in pipeline.MODEL_REGISTRY:
             return jsonify({"error": f"Model {model_name} not found"}), 404
-
-        def fetch():
-            from core.execution_stats import compute_slippage_stats
-            from core.journal import TradeJournal
-            from core.protocol import load_protocol, score_protocol
-            proto = load_protocol()
-            state = _load_model_state(model_name)
-
-            try:
-                slip = compute_slippage_stats(
-                    TradeJournal(model_name).get_trades())
-            except Exception:
-                slip = None
-            recons = [
-                (e.get("result") or {}).get("reconciliation")
-                for e in state.get("history", [])
-            ]
-            recons = [r for r in recons if r]
-            tracking = _tracking_payload(model_name)  # None-safe for scorer
-
-            score = score_protocol(tracking, slip, recons, state, proto)
-            score["model"] = model_name
-            return score
-
-        data = _cached_api_call(f"protocol_{model_name}", fetch, ttl=60)
+        data = _protocol_payload(model_name)
         if data is None:
             return jsonify({"error": "protocol score unavailable",
                             "model": model_name}), 500
@@ -1932,6 +2028,90 @@ def api_protocol(model_name):
             f"Protocol API error for {model_name}: {e}")
         return jsonify({"error": f"Internal error: {str(e)}",
                         "model": model_name}), 500
+
+
+@app.route("/api/compare")
+def api_compare():
+    """Side-by-side slot comparison (Phase A3): every registered slot's
+    version, forward_test_start, live geo monthly, MaxDD, live Calmar and
+    per-slot protocol verdict in one payload — built from the SAME cached
+    computations that feed /api/tracking and /api/protocol, so this
+    endpoint can never disagree with the per-slot scoreboards. Display
+    only: the pre-registered protocols decide, this endpoint shows."""
+    try:
+        from core.protocol import live_calmar_from_tracking, protocol_path_for
+
+        def fetch():
+            slots = []
+            active = {mc.name for mc in pipeline.get_active_models()}
+            for name in pipeline.MODEL_REGISTRY:
+                meta = _get_bundle_metadata(name)
+                entry = {
+                    "model": name,
+                    "active": name in active,
+                    "version": meta.get("version") or meta.get("tag"),
+                    "tag": meta.get("tag"),
+                    "protocol_file": protocol_path_for(name).name,
+                    "forward_test_start": None,
+                    "months_elapsed": None,
+                    "geo_monthly_pct": None,
+                    "max_drawdown_pct": None,
+                    "live_calmar": None,
+                    "tracking_status": None,
+                    "protocol_overall": None,
+                    "protocol_binding": None,
+                    "checkpoint": None,
+                }
+                try:
+                    tr = _tracking_payload(name) or {}
+                    entry["tracking_status"] = tr.get("status")
+                    entry["forward_test_start"] = tr.get("forward_test_start")
+                    if tr.get("status") == "ok":
+                        entry["months_elapsed"] = tr.get("months_elapsed")
+                        entry["geo_monthly_pct"] = tr.get("live_geo_monthly_pct")
+                        entry["max_drawdown_pct"] = tr.get("max_drawdown_pct")
+                        calmar = live_calmar_from_tracking(tr)
+                        entry["live_calmar"] = (
+                            round(calmar, 4) if calmar is not None else None)
+                except Exception as e:
+                    entry["tracking_error"] = str(e)
+                try:
+                    score = _protocol_payload(name) or {}
+                    entry["protocol_overall"] = score.get("overall")
+                    entry["protocol_binding"] = score.get("binding")
+                    entry["checkpoint"] = score.get("checkpoint")
+                    entry["required_for_success"] = score.get(
+                        "required_for_success")
+                    # Surface the rel_ criteria inline so the Compare
+                    # panel can show the pairwise legs without a second
+                    # /api/protocol call per slot.
+                    rels = [c for c in score.get("criteria") or []
+                            if str(c.get("metric", "")).startswith("rel_")]
+                    if rels:
+                        entry["relative_criteria"] = [
+                            {k: c.get(k) for k in
+                             ("id", "metric", "relative_to", "op",
+                              "threshold", "value", "status",
+                              "common_window_start")}
+                            for c in rels]
+                except Exception as e:
+                    entry["protocol_error"] = str(e)
+                slots.append(entry)
+            return {
+                "slots": slots,
+                "note": ("Common-window relative legs live inside each "
+                         "shadow slot's protocol scoreboard; only "
+                         "pre-registered pairwise comparisons decide — "
+                         "this endpoint displays."),
+            }
+
+        data = _cached_api_call("compare_all_slots", fetch, ttl=60)
+        if data is None:
+            return jsonify({"error": "compare unavailable"}), 500
+        return jsonify(data)
+    except Exception as e:
+        logging.getLogger("dashboard").error(f"Compare API error: {e}")
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
 
 
 @app.route("/api/description/<model_name>")
@@ -2837,6 +3017,13 @@ V2_DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </section>
 
+<section class="panels" style="margin-top: 16px; grid-template-columns: 1fr;">
+  <div class="panel">
+    <h2>Compare <span class="count">all slots · forward-test window · per-slot protocol</span></h2>
+    <div id="compare-panel"><div class="loading">…</div></div>
+  </div>
+</section>
+
 <section class="panels" style="margin-top: 16px;">
   <div class="panel">
     <h2>Protocol <span class="count" id="protocol-sub"></span></h2>
@@ -3136,6 +3323,37 @@ function renderSleeves(s) {
     </tbody></table>`;
 }
 
+function renderCompare(data) {
+  const slots = data.slots || [];
+  if (!slots.length) {
+    document.getElementById('compare-panel').innerHTML =
+      '<div style="color:var(--muted);font-size:13px;">No registered slots.</div>';
+    return;
+  }
+  const fmtNum = (x, d) => x == null || isNaN(+x) ? '—' : (+x).toFixed(d);
+  const rows = slots.map(s => {
+    const rel = (s.relative_criteria || []).map(c =>
+      `${c.id}: ${c.value == null ? '—' : (+c.value).toFixed(2)} ${statusPill(c.status)}`
+    ).join('<br>');
+    return `<tr>
+      <td>${s.model}${s.active ? '' : ' <span class="pill" style="background:rgba(148,163,184,0.15);color:var(--neutral)">inactive</span>'}</td>
+      <td style="color:var(--muted)">${s.version || '—'}</td>
+      <td>${s.forward_test_start || '—'}${s.months_elapsed != null ? ` <span style="color:var(--muted)">(${(+s.months_elapsed).toFixed(1)} mo)</span>` : ''}</td>
+      <td style="text-align:right" class="${cls(+s.geo_monthly_pct)}">${fmtNum(s.geo_monthly_pct, 2)}%</td>
+      <td style="text-align:right" class="${cls(+s.max_drawdown_pct)}">${fmtNum(s.max_drawdown_pct, 2)}%</td>
+      <td style="text-align:right">${fmtNum(s.live_calmar, 2)}</td>
+      <td>${statusPill(s.protocol_overall)} <span style="color:var(--muted);font-size:11px">${s.protocol_file || ''}</span></td>
+      <td style="font-size:11px">${rel || '<span style="color:var(--muted)">—</span>'}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('compare-panel').innerHTML = `
+    <table><thead><tr><th>Slot</th><th>Version</th><th>Forward test</th>
+      <th style="text-align:right">Geo %/mo</th><th style="text-align:right">MaxDD</th>
+      <th style="text-align:right">Calmar</th><th>Protocol</th><th>Relative legs (common window)</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <div style="margin-top:8px;font-size:11px;color:var(--muted)">${data.note || ''}</div>`;
+}
+
 async function refreshEvidence() {
   let names = [];
   try {
@@ -3146,6 +3364,12 @@ async function refreshEvidence() {
   const name = names[0];  // primary slot
   const authNote = (ep) =>
     `Auth token required for ${ep} — open the <a href="/" style="color:var(--accent)">original dashboard</a>, enter the DASHBOARD_AUTH_TOKEN once when prompted (any Settings/run action asks), then reload this page; the stashed token is reused here.`;
+  try {
+    renderCompare(await apiGet(`/api/compare`));
+  } catch (e) {
+    document.getElementById('compare-panel').innerHTML =
+      `<div style="color:var(--muted);font-size:13px;">${/401/.test(e.message) ? authNote('/api/compare') : e.message}</div>`;
+  }
   try {
     renderProtocol(await apiGet(`/api/protocol/${name}`));
   } catch (e) {

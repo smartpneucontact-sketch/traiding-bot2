@@ -29,6 +29,22 @@ Scoring conventions (see score_protocol):
     the two coincide). The registered threshold is still reported; the
     value actually compared is `effective_threshold`.
 
+Shadow slots (Improvement Roadmap v2, Streams 1+3): each model slot binds
+its OWN protocol file — combo_v2 keeps the frozen protocol.json (its
+recorded sha semantics are untouched); combo_v2_exp binds
+protocol_exp.json (Candidate X relative shadow protocol); combo_v2_process
+/ combo_v2_proc bind protocol_process.json. Resolution is
+`protocol_path_for(model_name)` / `load_protocol_for(model_name)`.
+Shadow protocols add two schema extensions the primary never uses:
+  - Relative criteria: metric names starting with "rel_" are computed
+    versus a baseline slot (criterion field `relative_to`, default
+    "combo_v2") on the COMMON WINDOW — max of the two slots'
+    forward_test_start dates — from both slots' tracking. The values are
+    supplied to score_protocol via the `rel_metrics` keyword (the caller
+    computes them with core/tracking.py; see compute_relative_metrics).
+  - action "REPORT_ONLY": scored INFO, never PASS/WARN/KILL, never
+    enters the overall verdict, and its threshold may be null.
+
 Deliberately dependency-free (json + hashlib + math only): this module
 must be importable from the live order path, the dashboard, and offline
 tooling without dragging in pandas/yfinance.
@@ -45,6 +61,63 @@ from typing import Optional
 _BASE_DIR = Path(__file__).resolve().parent.parent
 PROTOCOL_JSON_PATH = _BASE_DIR / "protocol.json"
 PROTOCOL_MD_PATH = _BASE_DIR / "PROTOCOL.md"
+PROTOCOL_EXP_JSON_PATH = _BASE_DIR / "protocol_exp.json"
+PROTOCOL_PROCESS_JSON_PATH = _BASE_DIR / "protocol_process.json"
+
+# The slot every rel_* criterion defaults to comparing against.
+PRIMARY_MODEL = "combo_v2"
+
+# Per-slot protocol files. Exact model-name match first; versioned process
+# bundles (combo_v2_process.<year>.<sha8>) resolve by prefix below. Any
+# unknown name falls back to the primary protocol.json — the pre-shadow
+# behavior, so existing callers are unchanged.
+SLOT_PROTOCOL_FILES: dict[str, Path] = {
+    "combo_v2": PROTOCOL_JSON_PATH,            # FROZEN primary — never edit
+    "combo_v2_exp": PROTOCOL_EXP_JSON_PATH,
+    "combo_v2_process": PROTOCOL_PROCESS_JSON_PATH,
+    "combo_v2_proc": PROTOCOL_PROCESS_JSON_PATH,  # registry short alias
+}
+
+
+def protocol_path_for(model_name: str | None) -> Path:
+    """The protocol file governing a model slot.
+
+    Exact registry-name match first, then longest-prefix match so
+    versioned process bundle names (combo_v2_process.2026.ab12cd34) and
+    exp variants (combo_v2_exp_v2) resolve to their family's protocol.
+    Unknown names get the primary protocol.json (back-compat: that is
+    what every caller received before shadow slots existed).
+    """
+    name = model_name or ""
+    if name in SLOT_PROTOCOL_FILES:
+        return SLOT_PROTOCOL_FILES[name]
+    for prefix in sorted(SLOT_PROTOCOL_FILES, key=len, reverse=True):
+        if prefix != PRIMARY_MODEL and name.startswith(prefix):
+            return SLOT_PROTOCOL_FILES[prefix]
+    return PROTOCOL_JSON_PATH
+
+
+def load_protocol_for(model_name: str | None) -> dict:
+    """load_protocol() against the slot's own protocol file."""
+    return load_protocol(protocol_path_for(model_name))
+
+
+def bind_forward_test_start(state: dict, model_name: str,
+                            today_iso: str) -> bool:
+    """Set-once forward-test clock + PER-SLOT protocol sha binding.
+
+    Generalizes what core/runner.py does inline for the primary (bind
+    protocol.json's sha at the first funded rebalance): each slot binds
+    the sha256 of ITS OWN protocol file. For combo_v2 this hashes exactly
+    PROTOCOL_JSON_PATH — byte-identical to the primary's existing
+    recorded-sha semantics. Returns True when the binding was written,
+    False when the clock was already running (never overwrites).
+    """
+    if state.get("forward_test_start"):
+        return False
+    state["forward_test_start"] = today_iso
+    state["protocol_sha256"] = file_sha256(protocol_path_for(model_name))
+    return True
 
 # Every criterion must carry exactly these keys (extras like
 # `and_conditions` are allowed — the 6mo regime AND-condition needs one).
@@ -82,6 +155,11 @@ def _validate_criterion(crit: dict) -> None:
             f"{crit['checkpoint']!r} (allowed: {ALLOWED_CHECKPOINTS})"
         )
     thr = crit["threshold"]
+    if thr is None and crit["action"] == "REPORT_ONLY":
+        # Report-only entries display a value and never compare it, so a
+        # null threshold is legal (and protocol_process.json's
+        # P-vs-CANDIDATE-X deliberately has none).
+        return
     if crit["op"] == "between":
         if (not isinstance(thr, (list, tuple)) or len(thr) != 2
                 or not all(isinstance(x, (int, float)) for x in thr)
@@ -200,6 +278,84 @@ def _band_threshold_at(reference: dict, t_months: float):
             - 1.28 * (float(sigma) / 100.0) * math.sqrt(t_months))
 
 
+# ── Relative (two-slot) metrics — pure math, computed on the COMMON
+# window (max of the two slots' forward_test_start dates). The caller
+# produces both tracking dicts with core/tracking.py's compute_tracking
+# using that shared start date and hands the results here.
+
+def common_window_start(start_a: Optional[str],
+                        start_b: Optional[str]) -> Optional[str]:
+    """Common forward-test window start: the LATER of two ISO dates.
+
+    Relative criteria are only meaningful over days both slots traded, so
+    the shared window begins when the second slot's clock started. None
+    when either clock hasn't started (no common window exists yet).
+    """
+    if not start_a or not start_b:
+        return None
+    return max(start_a[:10], start_b[:10])
+
+
+def live_calmar_from_tracking(tracking: Optional[dict]) -> Optional[float]:
+    """Live Calmar = annualized geometric return / |MaxDD| from a
+    compute_tracking() dict: ((1 + geo_m)^12 - 1) / |max_drawdown|.
+
+    None when tracking isn't "ok", inputs are missing, or MaxDD is 0 (a
+    zero-drawdown window makes Calmar unbounded — report unmeasured, and
+    let the criterion stay NA rather than fabricate a huge number).
+    """
+    tr = tracking or {}
+    if tr.get("status") != "ok":
+        return None
+    geo_pct = tr.get("live_geo_monthly_pct")
+    dd_pct = tr.get("max_drawdown_pct")
+    if geo_pct is None or dd_pct is None or dd_pct == 0:
+        return None
+    ann_return = (1.0 + float(geo_pct) / 100.0) ** 12 - 1.0
+    return ann_return / (abs(float(dd_pct)) / 100.0)
+
+
+def compute_relative_metrics(own_tracking: Optional[dict],
+                             baseline_tracking: Optional[dict]) -> dict:
+    """rel_* metric values for one slot versus a baseline slot.
+
+    Both dicts must be compute_tracking() outputs over the SAME common
+    window (see common_window_start). Every metric is own − baseline, so
+    the registered ops read naturally (e.g. rel_max_drawdown_diff_pp >=
+    -3 ⇔ own drawdown at most 3pp deeper). Any missing input → that
+    metric is None (NA downstream), never a guess.
+
+      rel_max_drawdown_diff_pp: own MaxDD% − baseline MaxDD%
+      rel_geo_monthly_diff_pp:  own geo%/mo − baseline geo%/mo
+      rel_live_calmar_diff:     own live Calmar − baseline live Calmar
+    """
+    own = own_tracking if (own_tracking or {}).get("status") == "ok" else {}
+    base = (baseline_tracking
+            if (baseline_tracking or {}).get("status") == "ok" else {})
+
+    def diff(a, b, ndigits=4):
+        if a is None or b is None:
+            return None
+        return round(float(a) - float(b), ndigits)
+
+    own_calmar = live_calmar_from_tracking(own or None)
+    base_calmar = live_calmar_from_tracking(base or None)
+    return {
+        "rel_max_drawdown_diff_pp": diff(
+            own.get("max_drawdown_pct"), base.get("max_drawdown_pct")),
+        "rel_geo_monthly_diff_pp": diff(
+            own.get("live_geo_monthly_pct"), base.get("live_geo_monthly_pct")),
+        "rel_live_calmar_diff": diff(own_calmar, base_calmar),
+        # Components for display / audit — not criteria inputs.
+        "own_live_calmar": (round(own_calmar, 4)
+                            if own_calmar is not None else None),
+        "baseline_live_calmar": (round(base_calmar, 4)
+                                 if base_calmar is not None else None),
+        "own_months_elapsed": own.get("months_elapsed"),
+        "baseline_months_elapsed": base.get("months_elapsed"),
+    }
+
+
 def _median(vals: list[float]) -> float:
     s = sorted(vals)
     n = len(s)
@@ -290,7 +446,8 @@ def _metric_values(tracking: dict, slippage_stats: dict,
 
 def score_protocol(tracking: Optional[dict], slippage_stats: Optional[dict],
                    reconciliation_history: Optional[list[dict]],
-                   state: Optional[dict], proto: dict) -> dict:
+                   state: Optional[dict], proto: dict, *,
+                   rel_metrics: Optional[dict] = None) -> dict:
     """Score live metrics against the pre-registered protocol.
 
     Args:
@@ -300,11 +457,23 @@ def score_protocol(tracking: Optional[dict], slippage_stats: Optional[dict],
         `result.reconciliation` blocks from state.history).
       state: on-disk pipeline state (forward_test_start, protocol_sha256).
       proto: load_protocol() output (must carry `_sha256`).
+      rel_metrics: OPTIONAL relative-metric values for shadow protocols,
+        keyed by baseline model name:
+          {"combo_v2": {"rel_max_drawdown_diff_pp": ..., ...},
+           "_common_window_start": {"combo_v2": "YYYY-MM-DD", ...}}
+        (compute_relative_metrics output per baseline, both slots' tracking
+        computed over the common window). Criteria whose metric starts
+        with "rel_" read from here via their `relative_to` field (default
+        PRIMARY_MODEL); a missing entry scores NA, never a guess. The
+        primary protocol has no rel_ criteria, so passing None keeps its
+        scoring byte-identical to the pre-shadow behavior.
 
     Returns {overall, binding, forward_test_start, months_elapsed,
     checkpoint, criteria: [{id, metric, value, op, threshold, checkpoint,
     action, status, ...}]}. Before forward_test_start everything is NA and
     overall is NOT_STARTED — only the binding integrity is scored.
+    REPORT_ONLY criteria score INFO (value displayed) and never enter the
+    overall verdict.
     """
     state = state or {}
     fts = state.get("forward_test_start")
@@ -326,7 +495,13 @@ def score_protocol(tracking: Optional[dict], slippage_stats: Optional[dict],
 
     criteria_out: list[dict] = []
     for crit in proto["criteria"]:
-        value = vals.get(crit["metric"])
+        is_relative = str(crit["metric"]).startswith("rel_")
+        if is_relative:
+            baseline = crit.get("relative_to") or PRIMARY_MODEL
+            value = ((rel_metrics or {}).get(baseline) or {}).get(
+                crit["metric"])
+        else:
+            value = vals.get(crit["metric"])
         cp_needed = CHECKPOINT_MONTHS[crit["checkpoint"]]
         out = {
             "id": crit["id"],
@@ -339,6 +514,11 @@ def score_protocol(tracking: Optional[dict], slippage_stats: Optional[dict],
             "value": value,
             "status": "NA",
         }
+        if is_relative:
+            out["relative_to"] = baseline
+            cw = ((rel_metrics or {}).get("_common_window_start") or {})
+            if cw.get(baseline):
+                out["common_window_start"] = cw[baseline]
         if not started:
             out["na_reason"] = "forward test not started"
         elif months < cp_needed:
@@ -346,7 +526,14 @@ def score_protocol(tracking: Optional[dict], slippage_stats: Optional[dict],
                 f"checkpoint {crit['checkpoint']} not reached "
                 f"({months:.2f} months elapsed)")
         elif value is None:
-            out["na_reason"] = "metric not measurable yet"
+            out["na_reason"] = (
+                "relative metric not measurable yet (baseline slot "
+                "tracking missing or no common window)"
+                if is_relative else "metric not measurable yet")
+        elif crit["action"] == "REPORT_ONLY":
+            # Displayed, never judged: INFO regardless of any threshold,
+            # excluded from the overall verdict below.
+            out["status"] = "INFO"
         else:
             threshold = crit["threshold"]
             if crit["id"] == "M6-BAND":
@@ -388,13 +575,15 @@ def score_protocol(tracking: Optional[dict], slippage_stats: Optional[dict],
                 out["status"] = status
         criteria_out.append(out)
 
+    # REPORT_ONLY rows are context, never verdict inputs.
+    decisive = [c for c in criteria_out if c["action"] != "REPORT_ONLY"]
     if not started:
         overall = "NOT_STARTED"
-    elif any(c["status"] == "KILL" for c in criteria_out):
+    elif any(c["status"] == "KILL" for c in decisive):
         overall = "KILL"
-    elif any(c["status"] == "WARN" for c in criteria_out):
+    elif any(c["status"] == "WARN" for c in decisive):
         overall = "WARN"
-    elif all(c["status"] == "NA" for c in criteria_out):
+    elif all(c["status"] == "NA" for c in decisive):
         overall = "NO_DATA"
     else:
         overall = "PASS"
@@ -407,9 +596,24 @@ def score_protocol(tracking: Optional[dict], slippage_stats: Optional[dict],
             if months >= CHECKPOINT_MONTHS[label]:
                 checkpoint = label
 
+    # 12mo-leg bookkeeping for the shadow decision rules (protocol_exp:
+    # FAIL when >=2 REL legs fail; SUCCESS = all REQUIRED legs pass). The
+    # counts are reported — the written decision_rule stays the authority.
+    req = [c for c in decisive if c["action"] == "REQUIRED_FOR_SUCCESS"]
+    rel_req = [c for c in req if str(c["metric"]).startswith("rel_")]
+    required_summary = {
+        "total": len(req),
+        "passed": sum(1 for c in req if c["status"] == "PASS"),
+        "failed": sum(1 for c in req if c["status"] == "WARN"),
+        "na": sum(1 for c in req if c["status"] == "NA"),
+        "rel_legs_total": len(rel_req),
+        "rel_legs_failed": sum(1 for c in rel_req if c["status"] == "WARN"),
+    }
+
     return {
         "overall": overall,
         "binding": binding,
+        "required_for_success": required_summary,
         "forward_test_start": fts,
         "protocol_sha256_bound": bound_sha,
         "protocol_sha256_current": proto.get("_sha256"),

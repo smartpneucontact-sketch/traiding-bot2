@@ -210,6 +210,17 @@ def run_single_model(
     # improve Sharpe 1.06→1.19 and Max DD -65%→-56% on the 10-year window.
     # Only fires for `direct_weights` strategies that have a ComboConfig
     # with `enable_drawdown_freeze=True`. Other models are unaffected.
+    #
+    # `freeze_diag` is the FREEZE-ABLATION PUBLISHER (protocol_exp.json
+    # `freeze_disputed`; DECISION_RULE.md adjudication): whenever a slot's
+    # config carries the freeze machinery, the multiplier the freeze
+    # applied to this run (0.0 = hard cut to cash, 1.0 = evaluated but not
+    # in force) is published into the rebalance's strategy_diagnostics /
+    # state.history AND into the persisted freeze_state dict, where
+    # core/journal.py freeze_context_from_state picks it up for every
+    # journal row. Stays None for slots with no freeze machinery (the
+    # frozen primary) — their diagnostics/journal rows are unchanged.
+    freeze_diag: dict | None = None
     if strategy_type == "direct_weights":
         config_obj = model_bundle.get("combo_config")
         if config_obj is not None and getattr(config_obj, "enable_drawdown_freeze", False):
@@ -219,6 +230,12 @@ def run_single_model(
             is_frozen, new_freeze, reason = evaluate_spy_drawdown_freeze(
                 macro_data or {}, prior_freeze, config_obj, today_iso,
             )
+            freeze_diag = {
+                "freeze_active": bool(is_frozen),
+                "freeze_multiplier": 0.0 if is_frozen else 1.0,
+            }
+            new_freeze = dict(new_freeze)
+            new_freeze["freeze_multiplier"] = freeze_diag["freeze_multiplier"]
             state["freeze_state"] = new_freeze
             report.set("freeze_state", new_freeze)
             report.set("freeze_reason", reason)
@@ -236,6 +253,13 @@ def run_single_model(
                 # aborts on an empty target list — a frozen bot silently
                 # kept its full levered book.
                 if not dry_run and is_market_open():
+                    # Persist the freeze posture BEFORE liquidating: the
+                    # journal's best-effort freeze capture
+                    # (core/journal.py _load_freeze_context) reads the
+                    # slot's ON-DISK state, so without this write the
+                    # liquidation rows would carry the stale pre-freeze
+                    # posture instead of active=True / multiplier=0.0.
+                    _save_state_merged(state, mc)
                     try:
                         liquidation = liquidate_all_positions(
                             mc, journal, logger, report,
@@ -416,6 +440,14 @@ def run_single_model(
         # from the dashboard. ComboStrategy publishes its gate values via
         # `last_diagnostics` after compute_weights().
         diagnostics = getattr(model, "last_diagnostics", None) or {}
+        if freeze_diag is not None:
+            # Freeze-posture publish (ablation replay): merge the freeze
+            # multiplier/state the runner-level freeze applied to THIS
+            # run into the diagnostics the dashboard + journal read. The
+            # frozen path (multiplier 0.0) liquidates and returns above,
+            # so reaching here means the freeze was evaluated and applied
+            # no cut — recorded explicitly, never inferred.
+            diagnostics = {**diagnostics, **freeze_diag}
         if diagnostics:
             regime_exposure = float(diagnostics.get("exposure_multiplier", 1.0))
             report.set("strategy_diagnostics", diagnostics)
@@ -682,20 +714,27 @@ def run_single_model(
                 f"  day-start book anchor refresh failed (non-fatal): {e}"
             )
         # Forward-test clock: the first FUNDED rebalance starts the
-        # pre-registered paper test, binding it to the exact protocol.json
+        # pre-registered paper test, binding it to the exact protocol
         # bytes committed beforehand (any later edit → hash mismatch →
-        # MODIFIED_AFTER_START). Set-once; never overwritten. Import is
+        # MODIFIED_AFTER_START). PER-SLOT (core/protocol.py
+        # bind_forward_test_start): each slot binds the sha256 of ITS OWN
+        # protocol file — the primary still hashes exactly protocol.json
+        # (byte-identical to the old inline binding), while combo_v2_exp
+        # binds protocol_exp.json and combo_v2_process* binds
+        # protocol_process.json. Binding the primary's sha here for a
+        # shadow slot would permanently flag it MODIFIED_AFTER_START,
+        # because scoring compares against the slot's own file
+        # (load_protocol_for). Set-once; never overwritten. Import is
         # local and the whole block best-effort so a missing/broken
         # protocol file can never abort a live run that already traded.
         if not state.get("forward_test_start"):
             try:
-                from core.protocol import PROTOCOL_JSON_PATH, file_sha256
-                state["forward_test_start"] = today_iso
-                state["protocol_sha256"] = file_sha256(PROTOCOL_JSON_PATH)
-                logger.info(
-                    f"  Forward test clock started: {today_iso} "
-                    f"(protocol sha256 {state['protocol_sha256'][:12]}...)"
-                )
+                from core.protocol import bind_forward_test_start
+                if bind_forward_test_start(state, mc.name, today_iso):
+                    logger.info(
+                        f"  Forward test clock started: {today_iso} "
+                        f"(protocol sha256 {state['protocol_sha256'][:12]}...)"
+                    )
             except Exception as e:
                 logger.warning(f"  forward_test_start binding failed: {e}")
         # Live-vs-backtest tracking snapshot (Phase A2) for the run report's
@@ -731,6 +770,12 @@ def run_single_model(
         # replacements; truncating to 20 of a 40+ name book starved it.
         history_entry["weights"] = {s: round(p, 6) for s, p in rankings}
         diagnostics = getattr(model, "last_diagnostics", None) or {}
+        if freeze_diag is not None:
+            # Freeze-ablation publisher, part 2: the per-rebalance freeze
+            # posture lands in state.history's strategy_diagnostics — the
+            # exact place core/journal.py freeze_context_from_state reads
+            # the multiplier from for every journalled order row.
+            diagnostics = {**diagnostics, **freeze_diag}
         if diagnostics:
             history_entry["strategy_diagnostics"] = diagnostics
     else:

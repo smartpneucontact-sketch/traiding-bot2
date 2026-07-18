@@ -1,0 +1,135 @@
+{
+  "protocol_version": "exp-1.0",
+  "committed_date": "2026-07-18",
+  "amended": false,
+  "slot": "combo_v2_exp",
+  "baseline_slot": "combo_v2",
+  "strategy": "Candidate X shadow slot — ASM_Bst_BTF1 (B-base residual-momentum blend + book gate + tier + freeze dd_v1 [DISPUTED]) at 2.0x, Alpaca paper account #2. Selection frozen in results/v7/candidate_x/DECISION_RULE.md (research repo, 2026-07-18): dev 4.28%/mo, dev Calmar 1.234, dev MaxDD -41.7% (trials/ASSEMBLY_tier.csv row ASM_Bst_BTF1); margin-600 re-score (family ASM_rescore600) governs the bundle's backtest_reference.",
+  "narrative": "results/v7/candidate_x/DECISION_RULE.md (frozen 2026-07-18; G4 retired in writing there — this relative shadow protocol is its replacement)",
+  "relative_metrics": {
+    "common_window": "The common window starts at max(candidate forward_test_start, primary forward_test_start) and every rel_* metric is computed on both slots' tracking over that shared window via core/tracking.py (compute_tracking with the common start date). Metrics: rel_max_drawdown_diff_pp = candidate MaxDD% - primary MaxDD% (both negative; >= -3 means the candidate's drawdown is no more than 3pp deeper); rel_live_calmar_diff = candidate live Calmar - primary live Calmar, where live Calmar = ((1 + geo_monthly)^12 - 1) / |MaxDD| on the common window; rel_geo_monthly_diff_pp = candidate geo%/mo - primary geo%/mo.",
+    "arbiter": "Only the pre-registered pairwise candidate-vs-primary comparison below decides anything. /api/compare displays; this protocol decides."
+  },
+  "power_disclosure": {
+    "paired_diff_se_pp_per_month": 1.2,
+    "note": "The candidate and primary books are highly correlated (shared sleeves, same universe), so the paired monthly return difference has SE ~= 1.2pp/mo — far tighter than either slot's own ~4.5pp 12-month SE, but still too weak to confirm a small geo edge. The X12-REL-GEO leg is therefore a weak leg disclosed as such; the DD and Calmar legs (X12-REL-DD, X12-REL-CALMAR, X12-ABS-DD) carry the verdict — drawdown control is the candidate's pitch and is what this test is powered to detect."
+  },
+  "three_month_note": "The 3-month checkpoint is OPERATIONAL-ONLY. X3-* verify the machine (vol band, slippage, reconciliation) — NO performance decisions of any kind are taken at 3 months, in either direction. This is a pre-commitment against peeking at 3-month returns. The only performance-bearing events before 12 months are the continuous kill XK1 and the pre-registered CRASH1 v2 swap clause (results/v7/crash/CRASH1_PREREG.md), which resets the shadow clock if exercised.",
+  "criteria": [
+    {
+      "id": "XK1",
+      "description": "Continuous kill: live drawdown from the forward-test equity peak reaches -40% or worse. Tighter than the primary's -45% — drawdown control is the candidate's pitch; a candidate that draws down 40% has already failed its own thesis.",
+      "metric": "live_drawdown_pct",
+      "op": "<=",
+      "threshold": -40,
+      "checkpoint": "continuous",
+      "action": "KILL"
+    },
+    {
+      "id": "XK2",
+      "description": "Continuous kill-or-recost (mirrors primary K2): realized slippage exceeds 25bp/side over >=3 consecutive rebalances.",
+      "metric": "slippage_bps_per_side_3_consecutive_rebalances",
+      "op": ">",
+      "threshold": 25,
+      "checkpoint": "continuous",
+      "action": "KILL_OR_RECOST"
+    },
+    {
+      "id": "XK3a",
+      "description": "Continuous operational pause (mirrors primary K3a): fill rate by notional below 90% on two consecutive rebalances.",
+      "metric": "fill_rate_pct_2_consecutive_rebalances",
+      "op": "<",
+      "threshold": 90,
+      "checkpoint": "continuous",
+      "action": "OPERATIONAL_PAUSE"
+    },
+    {
+      "id": "XK3b",
+      "description": "Continuous operational pause (mirrors primary K3b): achieved-vs-target gross deviation above 15% on two consecutive rebalances.",
+      "metric": "gross_deviation_pct_2_consecutive_rebalances",
+      "op": ">",
+      "threshold": 15,
+      "checkpoint": "continuous",
+      "action": "OPERATIONAL_PAUSE"
+    },
+    {
+      "id": "X3-VOL",
+      "description": "3-month OPERATIONAL-ONLY check: realized monthly volatility within [6%, 22%]/mo (the tier+freeze stack should run cooler than the primary's [7, 25] band). Operational review only — see three_month_note; no performance decision.",
+      "metric": "realized_vol_monthly_pct",
+      "op": "between",
+      "threshold": [6, 22],
+      "checkpoint": "3mo",
+      "action": "OPERATIONAL_REVIEW_IF_FAIL"
+    },
+    {
+      "id": "X3-SLIP",
+      "description": "3-month OPERATIONAL-ONLY check: median slippage <= 15bp/side, measured on >= 3 rebalances. Operational review only — see three_month_note; no performance decision.",
+      "metric": "slippage_bps_per_side_median",
+      "op": "<=",
+      "threshold": 15,
+      "checkpoint": "3mo",
+      "action": "OPERATIONAL_REVIEW_IF_FAIL"
+    },
+    {
+      "id": "X3-RECON",
+      "description": "3-month OPERATIONAL-ONLY check: post-rebalance reconciliation green on at least 2 of the last 3 rebalances. Operational review only — see three_month_note; no performance decision.",
+      "metric": "reconciliation_green_count_of_last_3",
+      "op": ">=",
+      "threshold": 2,
+      "checkpoint": "3mo",
+      "action": "OPERATIONAL_REVIEW_IF_FAIL"
+    },
+    {
+      "id": "X12-REL-DD",
+      "description": "12-month SUCCESS requirement (common window, vs primary): candidate MaxDD - primary MaxDD >= -3pp — the candidate's drawdown may be at most 3pp deeper than the primary's over the shared window. Carries verdict weight (power disclosure).",
+      "metric": "rel_max_drawdown_diff_pp",
+      "relative_to": "combo_v2",
+      "op": ">=",
+      "threshold": -3,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "X12-REL-CALMAR",
+      "description": "12-month SUCCESS requirement (common window, vs primary): candidate live Calmar >= primary live Calmar (live Calmar = annualized geo return / |MaxDD| on the common window). Carries verdict weight (power disclosure).",
+      "metric": "rel_live_calmar_diff",
+      "relative_to": "combo_v2",
+      "op": ">=",
+      "threshold": 0,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "X12-REL-GEO",
+      "description": "12-month SUCCESS requirement (common window, vs primary): candidate geo monthly >= primary geo monthly - 1.0pp/mo (the ~95%-of-return expectation from the assembly ledger). WEAK LEG: paired SE ~1.2pp/mo means this cannot distinguish small differences — disclosed in power_disclosure; the DD/Calmar legs carry the verdict.",
+      "metric": "rel_geo_monthly_diff_pp",
+      "relative_to": "combo_v2",
+      "op": ">=",
+      "threshold": -1.0,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "X12-ABS-DD",
+      "description": "12-month SUCCESS requirement (absolute backstop, candidate's own full forward-test window): MaxDD >= -35%. A relative win while both books crater is not a success.",
+      "metric": "max_drawdown_pct",
+      "op": ">=",
+      "threshold": -35,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    }
+  ],
+  "decision_rule": {
+    "SUCCESS": "All four 12-month legs pass (X12-REL-DD, X12-REL-CALMAR, X12-REL-GEO, X12-ABS-DD) -> year-2 promotion discussion.",
+    "FAIL": "XK1 fired at any time, OR at least 2 of the three X12-REL legs fail at 12 months.",
+    "MIXED": "Anything else (exactly one REL leg failing, or only the absolute backstop failing) -> MIXED: extend the shadow test; no promotion, no kill. The extension decision and its rationale are documented in a dated amendment."
+  },
+  "freeze_disputed": {
+    "status": "DISPUTED",
+    "component": "freeze dd_v1",
+    "provenance": "Parameters originate from the retracted V6 in-sample full-window 135-cell grid; RESCORE_NOTES stability flag 83.3% (< 85% bar); the prescribed dev-window freeze-parameter grid was never run. Ruling in results/v7/candidate_x/DECISION_RULE.md: ship the ledgered construction exactly, freeze included, labeled DISPUTED.",
+    "ablation_replay": "Pre-registered monthly FREEZE ABLATION REPLAY: the bot journals daily weights and freeze multiplier/state per rebalance and scan (core/journal.py freeze_* fields); research replays the identical book each month with the freeze multiplier removed. At the 12-month review, if the freeze's live contribution is negative (costs return without cutting realized MaxDD), freeze is DISABLED in any promoted configuration.",
+    "adjudication_scope": "This is a BINDING CONFIG DECISION at 12 months about the freeze component only. It is NOT a slot pass/fail leg: no X12 leg reads the ablation replay, and the replay cannot save or kill the slot."
+  },
+  "amendment_rule": "Amendments only via dated amendment sections appended to this file's narrative documents plus a re-issued protocol_exp.json with amended=true (permanent — never reset to false) and its new sha256 recorded alongside the original. A CRASH1 v2 swap (pre-registered in results/v7/crash/CRASH1_PREREG.md) is a NEW protocol binding: new bundle version, new protocol_exp sha bound at the swapped slot's next funded rebalance, 12-month clock reset, old record archived. Any hash mismatch against the sha256 bound at the slot's forward_test_start permanently flags the test MODIFIED_AFTER_START."
+}

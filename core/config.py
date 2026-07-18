@@ -97,6 +97,16 @@ MODEL_REGISTRY: dict[str, dict] = {
     # `model.compute_weights(stock_data, macro_data)` instead of the
     # ranked-prediction path. See core/combo_strategy.py.
     "combo_v2": {"feature_version": "combo", "model_dir": "combo_v2", "fallback_model": None},
+    # ── Shadow slots (Roadmap v2, Stream 0 / A3) ──────────────────────────
+    # These run alongside the frozen primary on separate Alpaca paper
+    # accounts. Their bundles are built by scripts/build_variant.py — NEVER
+    # by scripts/build_combo_v2.py, which is byte-frozen for the primary.
+    # combo_v2_exp = Candidate X (ASM_Bst_BTF1), judged by protocol_exp.json.
+    "combo_v2_exp": {"feature_version": "combo", "model_dir": "combo_v2_exp", "fallback_model": None},
+    # combo_v2_process = walk-forward annual re-selection (process spec v2),
+    # judged by protocol_process.json; rebuilt each Dec-31 from a
+    # selection_<year>.json — the bot itself never self-modifies.
+    "combo_v2_process": {"feature_version": "combo", "model_dir": "combo_v2_process", "fallback_model": None},
 }
 
 
@@ -153,6 +163,83 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
                     "backtest universe is survivors-only, so these are upper "
                     "bounds; treat the 3 %/mo target as unproven pending the "
                     "forward paper test (REPORT.md Validity Notice).",
+    },
+    "combo_v2_exp": {
+        "title": "Combo V2-EXP — Candidate X (ASM_Bst_BTF1) shadow slot",
+        "summary": "SHADOW slot #2 — experimental drawdown-cut candidate, NOT the "
+                   "frozen primary. B-base 3-sleeve blend (residual_momentum + "
+                   "dual_momentum_voltarget + adaptive_voltarget, static 1/3 each) "
+                   "+ book-DD gate + portfolio tiers + freeze dd_v1 (DISPUTED). "
+                   "Selected by the frozen decision rule in the research repo "
+                   "(results/v7/candidate_x/DECISION_RULE.md, 2026-07-18) from DEV "
+                   "ledger rows only. Judged relative to the primary by "
+                   "protocol_exp.json; its 12-month shadow test — not any backtest "
+                   "number — is the arbiter.",
+        "architecture": "Direct-weights strategy. Three equal sleeves:\n"
+                        "  • 1/3 residual_momentum (market+sector residual 12-1, the "
+                        "B-base swap for xs_momentum_top30)\n"
+                        "  • 1/3 dual_momentum_voltarget — 6-mo abs-mom > 0, inverse-vol, "
+                        "vol-target 15 %\n"
+                        "  • 1/3 adaptive_voltarget_momentum — 12-1 mom, inverse-vol, VIX "
+                        "leverage 0.5x/1.0x/1.5x\n"
+                        "Overlays: book-DD gate (12 % → 30 %, 60d), SPY-freeze dd_v1 "
+                        "(DISPUTED — see risk), portfolio tiers via slot cutloss config.",
+        "features": "Same inline raw-OHLCV + VIX computation as combo_v2; residual "
+                    "sleeve adds market/sector regression residuals. No ML model.",
+        "portfolio": "~30-60 names, 21-trading-day rebalance, target_leverage 2.0x "
+                     "set on the slot (comparable to the primary).",
+        "risk": "DISPUTED COMPONENT — freeze dd_v1 ships ENABLED but its parameters "
+                "have tainted provenance (retracted V6 in-sample full-window grid; "
+                "stability 83.3 % < 85 % bar; dev freeze grid never run). It rides "
+                "only because swapping to an unledgered variant would be worse "
+                "methodology. Adjudication: pre-registered monthly freeze-ablation "
+                "replay; negative live contribution at 12 mo → freeze disabled in "
+                "any promoted config. Book gate 12→30 % and -4 % leverage-scaled "
+                "portfolio tiers as on the primary. Continuous kill XK1: DD ≤ -40 % "
+                "(tighter than primary — DD control is this candidate's pitch).",
+        "training": "No training — rule allocator. DEV backtest (pre-margin-rescore, "
+                    "trials/ASSEMBLY_tier.csv row ASM_Bst_BTF1): 4.28 %/mo, Calmar "
+                    "1.234, MaxDD -41.7 %, turnover 20.8x/yr. Deployed reference "
+                    "numbers come ONLY from the margin-600 re-score injected at "
+                    "bundle build. HONESTY: the 2026-06-12 one-shot validation was "
+                    "burned before the selection rule was written (val 6.15 %/mo / "
+                    "-28.1 % / Calmar 3.22) — that is a DISCLOSURE, never a "
+                    "criterion. Honest expectation is the tier phi-stress band "
+                    "(phi=0.5: 4.47 %/mo, phi=1.0: 3.77 %/mo), and the universe is "
+                    "survivors-only — all numbers are upper bounds.",
+    },
+    "combo_v2_process": {
+        "title": "Combo V2-PROCESS — Walk-Forward Annual Re-Selection shadow slot",
+        "summary": "SHADOW slot #3 — tests the PROCESS, not a fixed portfolio: every "
+                   "Dec-31 the research repo re-selects the top-3 Sharpe sleeves "
+                   "(walk-forward, spec v2, 21-name pool) and this slot trades their "
+                   "equal blend for the next year. The bot NEVER self-modifies: "
+                   "wf_select.py → selection_<year>.json → scripts/build_variant.py "
+                   "--variant process → new bundle version "
+                   "combo_v2_process.<year>.<sha8> → commit + deploy. Judged by "
+                   "protocol_process.json (annual swap pre-authorized).",
+        "architecture": "Direct-weights strategy. k=3 equal-weight blend of the "
+                        "year's selected sleeves (equal 1/3 each), from the frozen "
+                        "21-name pool. Bootstrap 2026 leg (already ledgered): "
+                        "dual_momentum_vol + xs_momentum_top30 + xs_momentum_12_1 "
+                        "(the latter needs a bot port before deploy — the build "
+                        "fails loudly on unported sleeves). No in-strategy gates: "
+                        "the measured walk-forward object is the plain blend.",
+        "features": "Inline raw-OHLCV computation per sleeve. No ML model.",
+        "portfolio": "Depends on the year's picks (~30-90 names), 21-trading-day "
+                     "rebalance, target_leverage 2.0x on the slot (comparability "
+                     "with the primary).",
+        "risk": "No in-strategy overlays (mirrors the measured process). Slot-level "
+                "portfolio tiers + kill PK1: DD ≤ -45 % (same as primary). ACCEPTED "
+                "RISK, disclosed: the historical process path hit -57.7 % MaxDD at "
+                "2.0x — deeper than the kill bar; a repeat kills the slot, and that "
+                "is the honest design.",
+        "training": "No training. Walk-forward process evaluation (spec v1 sha "
+                    "b75aa7e7…, superseded by v2 for the annual cadence): ~3.40 %/mo "
+                    "process mean vs hindsight champion 4.44 %/mo — the measured "
+                    "hindsight tax is about -1.0 pp/mo. 12-mo required legs: geo "
+                    "≥ 1.65 %/mo, process-primary geo ≥ -1.5 pp/mo, MaxDD ≥ -45 %. "
+                    "Survivors-only universe caveat applies — upper bounds.",
     },
     # ── The v4-v9 entries below are vestigial — they document the prior
     # bot's ML model family for reference, but no v4-v9 model.pkl ships
@@ -336,9 +423,47 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
 # has been applied to the stored slots. Bump when thresholds are re-tuned.
 CUTLOSS_CALIBRATION_VERSION = "2026-06-riskfix-v1"
 
+# Stamp written into model_config.json once the A3 shadow-slot templates
+# (slots 2/3, disabled) have been appended. Bump only if the template set
+# itself changes (a bump re-appends any template model still missing).
+SHADOW_SLOTS_VERSION = "2026-07-a3-shadow-v1"
+
+
+def _shadow_slot_templates() -> list[dict]:
+    """DISABLED template slots for the two shadow models (Roadmap v2 A3).
+
+    Both ship enabled=False with EMPTY keys. Keys must be entered via the
+    dashboard Settings panel (one extra Alpaca paper account per slot):
+    once slot 1 is config-active, get_active_models() never reaches the
+    env-var fallback path, so MODEL_*_ALPACA_KEY env vars are DEAD for
+    these slots — the dashboard-edited config file is the only way in.
+
+    Cutloss/tier settings mirror the primary's 2026-06 calibration: the
+    portfolio tier layer is part of the Candidate X construction ("T" in
+    ASM_Bst_BTF1) and the process slot keeps the same tiers for
+    comparability. target_leverage 2.0 matches both protocols' reference
+    leverage.
+    """
+    common = {
+        "enabled": False,
+        "alpaca_key": "",
+        "alpaca_secret": "",
+        "enable_cutloss": True,
+        "cutloss_hard_stop": None,
+        "cutloss_trailing_stop": None,
+        "cutloss_portfolio_stop": -4.0,
+        "cutloss_scale_by_leverage": True,
+        "cutloss_reentry_delay_days": 2,
+        "target_leverage": 2.0,
+    }
+    return [
+        {"slot_id": 2, "model": "combo_v2_exp", **common},
+        {"slot_id": 3, "model": "combo_v2_process", **common},
+    ]
+
 
 def _default_config() -> dict:
-    """Generate default config — single slot for combo_v2."""
+    """Generate default config — combo_v2 primary + disabled shadow slots."""
     return {
         "slots": [
             {
@@ -360,8 +485,10 @@ def _default_config() -> dict:
                 "cutloss_reentry_delay_days": 2,
                 "target_leverage": 2.0,
             },
+            *_shadow_slot_templates(),
         ],
         "cutloss_calibration": CUTLOSS_CALIBRATION_VERSION,
+        "shadow_slots": SHADOW_SLOTS_VERSION,
         "updated_at": None,
     }
 
@@ -406,6 +533,60 @@ def _migrate_cutloss_calibration(config: dict) -> dict:
     if changed:
         print(f"[CONFIG MIGRATE] model_config.json stamped "
               f"{CUTLOSS_CALIBRATION_VERSION}", flush=True)
+    return config
+
+
+def _ensure_shadow_slots(config: dict) -> dict:
+    """One-time migration appending the DISABLED shadow-slot templates
+    (slots 2/3: combo_v2_exp, combo_v2_process) to an existing
+    model_config.json.
+
+    Same pattern as _migrate_cutloss_calibration: model_config.json lives
+    on the Railway volume and survives deploys, so new code defaults never
+    reach a live bot on their own. A config already stamped with
+    SHADOW_SLOTS_VERSION is returned untouched. Otherwise each template
+    model that has no slot yet is APPENDED (never overwriting or reordering
+    the operator's existing slots — slot 1 / the frozen primary is not
+    touched); if a template's preferred slot_id is already taken by a
+    different model, the next free id is used.
+
+    The appended slots are enabled=False with empty keys: the operator must
+    paste the extra Alpaca paper-account keys via the dashboard Settings
+    panel. The env-var fallback in get_active_models() is DEAD for shadow
+    slots whenever slot 1 activates from the config file, so Settings is
+    the only supported path.
+
+    Failure-tolerant: this runs on the live get_active_models() path, so
+    any exception logs and returns the config unchanged — a failed
+    migration must never take down trading.
+    """
+    try:
+        if config.get("shadow_slots") == SHADOW_SLOTS_VERSION:
+            return config
+
+        slots = config.setdefault("slots", [])
+        existing_models = {s.get("model") for s in slots}
+        used_ids = {s.get("slot_id") for s in slots}
+        appended = []
+        for tpl in _shadow_slot_templates():
+            if tpl["model"] in existing_models:
+                continue  # operator already has this model configured
+            if tpl["slot_id"] in used_ids:
+                tpl["slot_id"] = max(
+                    (i for i in used_ids if isinstance(i, int)), default=0) + 1
+            used_ids.add(tpl["slot_id"])
+            slots.append(tpl)
+            appended.append(f"slot {tpl['slot_id']}={tpl['model']}")
+
+        config["shadow_slots"] = SHADOW_SLOTS_VERSION
+        save_model_config(config)
+        print(f"[CONFIG MIGRATE] shadow-slot templates "
+              f"{'appended: ' + ', '.join(appended) if appended else 'already present'} "
+              f"(disabled, empty keys — enter Alpaca paper keys via dashboard "
+              f"Settings); stamped {SHADOW_SLOTS_VERSION}", flush=True)
+    except Exception as e:  # never break the live model-detect path
+        print(f"[CONFIG MIGRATE] WARNING: shadow-slot migration failed ({e}); "
+              f"continuing with unmigrated config", flush=True)
     return config
 
 
@@ -493,7 +674,7 @@ def get_active_models() -> list[ModelConfig]:
     anything.
     """
     global _last_model_detect_block
-    config = _migrate_cutloss_calibration(load_model_config())
+    config = _ensure_shadow_slots(_migrate_cutloss_calibration(load_model_config()))
     models: list[ModelConfig] = []
     activated_via_config = False
     detect_lines: list[str] = []  # buffered [MODEL DETECT] block, see above

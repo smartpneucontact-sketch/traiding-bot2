@@ -1,0 +1,105 @@
+{
+  "protocol_version": "process-1.0",
+  "committed_date": "2026-07-18",
+  "amended": false,
+  "slot": "combo_v2_process",
+  "baseline_slot": "combo_v2",
+  "strategy": "Process shadow slot — walk-forward annual re-selection under process_spec_v2.json (k=3 equal blend by Sharpe from the frozen 21-name pool, 2.0x). Bootstrap leg = the already-ledgered 2026 selection (dual_momentum_vol + xs_momentum_top30 + xs_momentum_12_1); first live re-selection 2026-12-31. The measured object is the PROCESS, not any one selection. Historical process MaxDD -57.7% vs the -45% kill bar is disclosed as an accepted risk.",
+  "narrative": "process_spec_v2.json (research repo, versioned; supersedes wf_process spec v1) + the WS3 walk-forward process evaluation (measured hindsight tax -1.04pp/mo vs champion)",
+  "relative_metrics": {
+    "common_window": "The common window starts at max(process forward_test_start, baseline forward_test_start) and rel_* metrics are computed on both slots' tracking over that shared window via core/tracking.py (compute_tracking with the common start date). rel_geo_monthly_diff_pp = process geo%/mo - baseline geo%/mo.",
+    "multiplicity_note": "Only the pre-registered process-vs-primary comparison (P12-REL-PRIMARY) decides anything. The process-vs-candidate-X entry is REPORT-ONLY: three-slot cross-gates are a multiplicity machine, so no decision may ever cite it."
+  },
+  "power_disclosure": {
+    "paired_diff_se_pp_per_month": 1.2,
+    "note": "The process and primary books share most holdings, so the paired monthly return difference has SE ~= 1.2pp/mo. The P12-REL-PRIMARY threshold (-1.5pp/mo) sits ~0.5pp below the measured walk-forward hindsight tax (-1.04pp/mo) — the leg can reject gross process failure but cannot confirm a small edge; geo legs are disclosed as weak."
+  },
+  "criteria": [
+    {
+      "id": "PK1",
+      "description": "Continuous kill: live drawdown from the forward-test equity peak reaches -45% or worse (same bar as the primary — the process runs the same 2.0x leverage for comparability).",
+      "metric": "live_drawdown_pct",
+      "op": "<=",
+      "threshold": -45,
+      "checkpoint": "continuous",
+      "action": "KILL"
+    },
+    {
+      "id": "PK2",
+      "description": "Continuous kill-or-recost (mirrors primary K2): realized slippage exceeds 25bp/side over >=3 consecutive rebalances.",
+      "metric": "slippage_bps_per_side_3_consecutive_rebalances",
+      "op": ">",
+      "threshold": 25,
+      "checkpoint": "continuous",
+      "action": "KILL_OR_RECOST"
+    },
+    {
+      "id": "PK3a",
+      "description": "Continuous operational pause (mirrors primary K3a): fill rate by notional below 90% on two consecutive rebalances.",
+      "metric": "fill_rate_pct_2_consecutive_rebalances",
+      "op": "<",
+      "threshold": 90,
+      "checkpoint": "continuous",
+      "action": "OPERATIONAL_PAUSE"
+    },
+    {
+      "id": "PK3b",
+      "description": "Continuous operational pause (mirrors primary K3b): achieved-vs-target gross deviation above 15% on two consecutive rebalances.",
+      "metric": "gross_deviation_pct_2_consecutive_rebalances",
+      "op": ">",
+      "threshold": 15,
+      "checkpoint": "continuous",
+      "action": "OPERATIONAL_PAUSE"
+    },
+    {
+      "id": "P12-GEO",
+      "description": "12-month SUCCESS requirement: geometric monthly return >= 1.65%/mo. Derived pre-registration: primary success floor 1.8%/mo x process/champion walk-forward ratio — the process is allowed exactly the measured hindsight tax, no more.",
+      "metric": "geo_monthly_pct",
+      "op": ">=",
+      "threshold": 1.65,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "P12-REL-PRIMARY",
+      "description": "12-month SUCCESS requirement (common window, vs primary): process geo monthly - primary geo monthly >= -1.5pp/mo. The measured walk-forward hindsight tax was -1.04pp/mo; a live gap beyond -1.5pp/mo means the automated process is losing materially more than selection hindsight explains.",
+      "metric": "rel_geo_monthly_diff_pp",
+      "relative_to": "combo_v2",
+      "op": ">=",
+      "threshold": -1.5,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "P12-DD",
+      "description": "12-month SUCCESS requirement: max drawdown no worse than -45% over the slot's own forward-test window.",
+      "metric": "max_drawdown_pct",
+      "op": ">=",
+      "threshold": -45,
+      "checkpoint": "12mo",
+      "action": "REQUIRED_FOR_SUCCESS"
+    },
+    {
+      "id": "P-vs-CANDIDATE-X",
+      "description": "REPORT-ONLY (never a decision input): process geo monthly - candidate-X geo monthly, common window vs the combo_v2_exp slot. Displayed for context on /api/compare and in reports; pre-registered as non-binding because three-slot cross-gates are a multiplicity machine. No threshold exists and none may be added except by dated amendment.",
+      "metric": "rel_geo_monthly_diff_pp",
+      "relative_to": "combo_v2_exp",
+      "op": ">=",
+      "threshold": null,
+      "checkpoint": "12mo",
+      "action": "REPORT_ONLY"
+    }
+  ],
+  "decision_rule": {
+    "SUCCESS": "All three REQUIRED_FOR_SUCCESS legs pass at 12 months (P12-GEO, P12-REL-PRIMARY, P12-DD) -> the automated process is validated as a maintenance mode; year-2 discussion.",
+    "FAIL": "PK1 fired at any time, or any REQUIRED_FOR_SUCCESS leg fails at 12 months.",
+    "REPORT_ONLY": "P-vs-CANDIDATE-X never enters any verdict."
+  },
+  "P_SWAP": {
+    "clause": "PRE-AUTHORIZED ANNUAL RE-SELECTION. Each Dec-31, research runs wf_select.py against process_spec_v2.json, producing selection_<year>.json (picks, Sharpes, spec sha, data-revision shas, and the selection file's own sha). scripts/build_variant.py --variant process builds the new bundle versioned combo_v2_process.<year>.<sha8>; deploying it into this slot is PRE-AUTHORIZED by this clause and is NOT a protocol amendment — the annual swap IS the measured process. The selection sha256 and bundle version are logged in the slot's state/history at the swap.",
+    "bot_never_self_modifies": "The bot only ever runs a committed bundle. Selection happens research-side; the deploy is a human-reviewed commit.",
+    "miss_rule": "If the re-selection bundle is not deployed within 10 trading days after Dec-31, the miss is a LOGGED OPERATIONAL FAILURE of the process (recorded in the run report and reviewed at 12 months as an operational finding). It does not by itself kill or fail the slot.",
+    "unported_sleeve_rule": "If a selection picks a sleeve not ported to the bot, build_variant.py fails loudly; porting + live-twin parity is a deploy prerequisite."
+  },
+  "amendment_rule": "Amendments only via dated amendment sections plus a re-issued protocol_process.json with amended=true (permanent — never reset to false) and its new sha256 recorded alongside the original. The pre-authorized annual re-selection swap (P_SWAP) is explicitly NOT an amendment and does not re-bind the protocol sha. Any hash mismatch against the sha256 bound at the slot's forward_test_start permanently flags the test MODIFIED_AFTER_START."
+}
