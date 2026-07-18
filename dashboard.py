@@ -23,7 +23,7 @@ import os
 import threading
 import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -1257,6 +1257,28 @@ def _window_start_ms(window_days: Optional[int], inception_ts_ms: Optional[int])
     return int((datetime.now() - timedelta(days=window_days)).timestamp() * 1000)
 
 
+def _fetch_equity_history(mc, logger) -> tuple[list, list]:
+    """Padding-trimmed (ts_ms, equity) from Alpaca portfolio history.
+
+    Uses `period=all` (not 1A) so Alpaca returns only days the account has
+    actually existed — with period=1A it pads pre-funding days with a
+    synthetic $100k equity, which used to make `inception_ts_ms` point ~1
+    year back and wildly inflate inception alphas. Leading zero/None
+    padding is stripped by core.tracking.trim_equity_padding — the ONE
+    shared trim used by both _compute_performance and /api/tracking so the
+    two can never disagree about where the account's history starts.
+    Raises on network failure; callers wrap.
+    """
+    from core.tracking import trim_equity_padding
+    hist = pipeline.alpaca_request(
+        "GET",
+        "v2/account/portfolio/history?period=all&timeframe=1D&extended_hours=false",
+        mc, logger=logger,
+    )
+    return trim_equity_padding(
+        hist.get("timestamp") or [], hist.get("equity") or [])
+
+
 def _compute_performance(model_name: str) -> dict:
     """Compute model performance vs full tradeable universe across windows.
 
@@ -1277,26 +1299,12 @@ def _compute_performance(model_name: str) -> dict:
     if not mc:
         return {"error": f"Model {model_name} not found"}
 
-    # 1) Model equity history. We use period=all (not 1A) so Alpaca returns
-    # only the days the account has actually existed. With period=1A Alpaca
-    # pads pre-funding days with a synthetic $100k equity, which makes
-    # `inception_ts_ms = ts_ms[0]` point to ~1 year ago instead of the
-    # actual account-funded date — and then SPY / universe returns get
-    # measured over a full year while the model's return reflects only the
-    # real trading days, producing wildly inflated alphas at inception.
+    # 1) Model equity history — shared fetch+trim helper (also used by
+    # /api/tracking) so the two can never disagree about padding.
     try:
-        hist = pipeline.alpaca_request(
-            "GET",
-            "v2/account/portfolio/history?period=all&timeframe=1D&extended_hours=false",
-            mc, logger=logger,
-        )
+        ts_ms, equity = _fetch_equity_history(mc, logger)
     except Exception as e:
         return {"error": f"Failed to fetch portfolio history: {e}"}
-
-    timestamps = hist.get("timestamp") or []
-    equity = [float(e) for e in (hist.get("equity") or [])]
-    # Alpaca timestamps are seconds → milliseconds for consistency
-    ts_ms = [int(t) * 1000 for t in timestamps]
 
     if len(equity) < 2:
         return {"error": "Insufficient equity history (need ≥ 2 daily snapshots)", "model": model_name}
@@ -1709,6 +1717,219 @@ def api_gates(model_name):
     except Exception as e:
         logging.getLogger("dashboard").error(
             f"Gates API error for {model_name}: {e}")
+        return jsonify({"error": f"Internal error: {str(e)}",
+                        "model": model_name}), 500
+
+
+# ── PHASE A2 EVIDENCE ENDPOINTS (tracking / sleeves / protocol) ──────────
+
+def _tracking_payload(model_name: str) -> Optional[dict]:
+    """Live-vs-backtest tracking dict for one model, cached 300s.
+
+    Shared by /api/tracking and the protocol scorer so both read the same
+    numbers. Always returns a dict with a `status` field on the happy
+    path — "not_started" before the first funded rebalance, "ok" after —
+    or None when the fetch itself failed (Alpaca down, no cache).
+    """
+    def fetch():
+        from core.tracking import compute_tracking, get_backtest_reference
+        logger = logging.getLogger("dashboard")
+        mc = _get_model_config(model_name)
+        state = _load_model_state(model_name)
+        start_iso = state.get("forward_test_start")
+        ref = get_backtest_reference(mc) or {}
+
+        if not start_iso or not mc:
+            # Clean pre-start / inactive-slot state: pure not-started
+            # payload, no network.
+            result = compute_tracking([], ref, start_iso)
+            if not mc:
+                result["reason"] = (
+                    "slot inactive (no Alpaca key configured)"
+                    if not start_iso else
+                    "forward test started but slot is inactive — no "
+                    "equity source")
+        else:
+            ts_ms, equity = _fetch_equity_history(mc, logger)
+            # SPY same-window regime context — OPTIONAL. Any failure just
+            # leaves the spy fields null.
+            spy_points = None
+            try:
+                resp, _feed = _alpaca_bars_with_fallback(
+                    mc, "v2/stocks/SPY/bars",
+                    {"start": start_iso[:10], "timeframe": "1Day",
+                     "limit": 10000, "adjustment": "split"},
+                    logger=logger,
+                )
+                if resp is not None and resp.status_code == 200:
+                    spy_points = []
+                    for b in resp.json().get("bars") or []:
+                        ts = datetime.fromisoformat(
+                            b["t"].replace("Z", "+00:00")).timestamp()
+                        spy_points.append((int(ts * 1000), float(b["c"])))
+            except Exception as e:
+                logger.warning(f"[TRACKING] SPY context fetch failed: {e}")
+                spy_points = None
+            result = compute_tracking(
+                list(zip(ts_ms, equity)), ref, start_iso,
+                spy_points=spy_points)
+        result["model"] = model_name
+        result["reference"] = {
+            "geo_monthly_return": ref.get("geo_monthly_return"),
+            "mean_monthly_return": ref.get("mean_monthly_return"),
+            "sharpe": ref.get("sharpe"),
+            "max_drawdown": ref.get("max_drawdown"),
+            "window": ref.get("window"),
+        } if ref else None
+        return result
+
+    return _cached_api_call(f"tracking_{model_name}", fetch, ttl=300)
+
+
+@app.route("/api/tracking/<model_name>")
+def api_tracking(model_name):
+    """Live-vs-backtest tracking (Phase A2): live geo monthly vs the
+    bundle's reference, ±1σ band on cumulative log return, cumulative
+    tracking diff, SPY-same-window context. Anchored at
+    forward_test_start; clean "not_started" payload before that."""
+    try:
+        if model_name not in pipeline.MODEL_REGISTRY:
+            return jsonify({"error": f"Model {model_name} not found"}), 404
+        data = _tracking_payload(model_name)
+        if data is None:
+            return jsonify({"error": "tracking unavailable",
+                            "model": model_name}), 500
+        return jsonify(data)
+    except Exception as e:
+        logging.getLogger("dashboard").error(
+            f"Tracking API error for {model_name}: {e}")
+        return jsonify({"error": f"Internal error: {str(e)}",
+                        "model": model_name}), 500
+
+
+# Bundle sleeve-reference keys → live sleeve names in strategy_diagnostics.
+_SLEEVE_REF_KEYS = {
+    "xs_momentum": "sleeve_xs_momentum_top30",
+    "dual_momentum": "sleeve_dual_momentum_voltarget",
+    "adaptive": "sleeve_adaptive_voltarget",
+}
+
+
+@app.route("/api/sleeves/<model_name>")
+def api_sleeves(model_name):
+    """Daily weight-based sleeve attribution (Phase A2) with an explicit
+    unattributed_residual line. Data failures degrade to a partial result
+    with `data_gaps` — never a 500 for a missing bar."""
+    try:
+        if model_name not in pipeline.MODEL_REGISTRY:
+            return jsonify({"error": f"Model {model_name} not found"}), 404
+
+        def fetch():
+            from core.attribution import compute_attribution, sleeve_entries
+            from core.tracking import get_backtest_reference
+            logger = logging.getLogger("dashboard")
+            mc = _get_model_config(model_name)
+            state = _load_model_state(model_name)
+            history = state.get("history", [])
+            # Same filter compute_attribution applies (funded rebalances
+            # only) so the bar-fetch window can never start at a dry-run
+            # or skipped entry the attribution itself would ignore.
+            entries = sleeve_entries(history)
+
+            closes: dict = {}
+            equity_by_date: dict = {}
+            fetch_gaps: list[str] = []
+            if entries and mc:
+                start_iso = str(entries[0].get("date"))[:10]
+                syms = sorted({s for e in entries
+                               for s in (e.get("weights") or {})})
+                try:
+                    bars, _feed = _fetch_bars_paged(
+                        mc, syms, start_iso, logger=logger)
+                    for sym, blist in bars.items():
+                        closes[sym] = {
+                            b["t"][:10]: float(b["c"])
+                            for b in blist if b.get("c") is not None
+                        }
+                except Exception as e:
+                    fetch_gaps.append(f"daily bars fetch failed: {e}")
+                try:
+                    ts_ms, equity = _fetch_equity_history(mc, logger)
+                    for t, e in zip(ts_ms, equity):
+                        d = datetime.fromtimestamp(
+                            t / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+                        equity_by_date[d] = e
+                except Exception as e:
+                    fetch_gaps.append(f"equity history fetch failed: {e}")
+            elif entries and not mc:
+                fetch_gaps.append(
+                    "slot inactive (no Alpaca key) — no price/equity source")
+
+            result = compute_attribution(
+                history, closes, equity_by_date,
+                leverage=mc.target_leverage if mc else 1.0)
+            result["data_gaps"] = fetch_gaps + result.get("data_gaps", [])
+            ref = get_backtest_reference(mc) or {}
+            result["reference"] = {
+                live_name: ref.get(ref_key)
+                for live_name, ref_key in _SLEEVE_REF_KEYS.items()
+            } if ref else None
+            result["model"] = model_name
+            return result
+
+        data = _cached_api_call(f"sleeves_{model_name}", fetch, ttl=3600)
+        if data is None:
+            return jsonify({"error": "sleeve attribution unavailable",
+                            "model": model_name}), 500
+        return jsonify(data)
+    except Exception as e:
+        logging.getLogger("dashboard").error(
+            f"Sleeves API error for {model_name}: {e}")
+        return jsonify({"error": f"Internal error: {str(e)}",
+                        "model": model_name}), 500
+
+
+@app.route("/api/protocol/<model_name>")
+def api_protocol(model_name):
+    """Protocol scoreboard (Phase A2): every pre-registered criterion
+    scored PASS/WARN/KILL/NA against live metrics, plus the binding check
+    (protocol.json sha256 vs the hash bound at forward_test_start — any
+    mismatch is permanently MODIFIED_AFTER_START)."""
+    try:
+        if model_name not in pipeline.MODEL_REGISTRY:
+            return jsonify({"error": f"Model {model_name} not found"}), 404
+
+        def fetch():
+            from core.execution_stats import compute_slippage_stats
+            from core.journal import TradeJournal
+            from core.protocol import load_protocol, score_protocol
+            proto = load_protocol()
+            state = _load_model_state(model_name)
+
+            try:
+                slip = compute_slippage_stats(
+                    TradeJournal(model_name).get_trades())
+            except Exception:
+                slip = None
+            recons = [
+                (e.get("result") or {}).get("reconciliation")
+                for e in state.get("history", [])
+            ]
+            recons = [r for r in recons if r]
+            tracking = _tracking_payload(model_name)  # None-safe for scorer
+
+            score = score_protocol(tracking, slip, recons, state, proto)
+            score["model"] = model_name
+            return score
+
+        data = _cached_api_call(f"protocol_{model_name}", fetch, ttl=60)
+        if data is None:
+            return jsonify({"error": "protocol score unavailable",
+                            "model": model_name}), 500
+        return jsonify(data)
+    except Exception as e:
+        logging.getLogger("dashboard").error(
+            f"Protocol API error for {model_name}: {e}")
         return jsonify({"error": f"Internal error: {str(e)}",
                         "model": model_name}), 500
 
@@ -2616,6 +2837,17 @@ V2_DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </section>
 
+<section class="panels" style="margin-top: 16px;">
+  <div class="panel">
+    <h2>Protocol <span class="count" id="protocol-sub"></span></h2>
+    <div id="protocol-panel"><div class="loading">…</div></div>
+  </div>
+  <div class="panel">
+    <h2>Sleeves <span class="count" id="sleeves-sub"></span></h2>
+    <div id="sleeves-panel"><div class="loading">…</div></div>
+  </div>
+</section>
+
 </div>
 
 <script>
@@ -2627,6 +2859,23 @@ const cls = (x) => x == null || isNaN(x) || x === 0 ? 'neutral' : (x > 0 ? 'good
 
 async function jget(url) {
   const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} → HTTP ${r.status}`);
+  return r.json();
+}
+
+// Internal (non-/api/v1) endpoints are auth-gated when DASHBOARD_AUTH_TOKEN
+// is set on the server. Reuse the token the original dashboard's api()
+// helper stashes in localStorage under 'dashboard_auth_token' (entered once
+// via its prompt — same origin, so the stash is shared with this page) and
+// send it as a Bearer header. Deliberately no prompt here: with no token
+// stashed the request goes out bare (fine for local dev, where no gate is
+// configured) and a 401 renders as the graceful note in refreshEvidence().
+function authHeader() {
+  const t = localStorage.getItem('dashboard_auth_token');
+  return t ? { 'Authorization': 'Bearer ' + t } : {};
+}
+async function apiGet(url) {
+  const r = await fetch(url, { headers: authHeader() });
   if (!r.ok) throw new Error(`${url} → HTTP ${r.status}`);
   return r.json();
 }
@@ -2818,8 +3067,103 @@ async function refresh() {
   }
 }
 
+// ── Protocol + Sleeves panels (Phase A2 evidence endpoints) ──────────────
+// These hit the internal /api/ endpoints (auth-gated when a dashboard
+// token is configured) via apiGet(), which sends the Bearer token stashed
+// by the original dashboard; a 401 renders as a note instead of an error.
+const statusPill = (s) => {
+  const map = { PASS: 'pill-good', WARN: 'pill-warn', KILL: 'pill-bad' };
+  const c = map[s] || '';
+  const style = c ? '' : 'background:rgba(148,163,184,0.15);color:var(--neutral)';
+  return `<span class="pill ${c}" style="${style}">${s || 'NA'}</span>`;
+};
+
+function renderProtocol(p) {
+  const bindCls = p.binding === 'intact' ? 'pill-good'
+    : p.binding === 'MODIFIED_AFTER_START' ? 'pill-bad' : '';
+  const bindStyle = bindCls ? '' : 'background:rgba(148,163,184,0.15);color:var(--neutral)';
+  const started = p.forward_test_start
+    ? `started ${p.forward_test_start} · ${(+p.months_elapsed || 0).toFixed(1)} mo · checkpoint ${p.checkpoint}`
+    : 'forward test not started';
+  document.getElementById('protocol-sub').textContent = `${p.model || ''}`;
+  const rows = (p.criteria || []).map(c => {
+    const thr = Array.isArray(c.threshold) ? `[${c.threshold.join(', ')}]` : c.threshold;
+    // M6-BAND is scored against the band at the ACTUAL elapsed t; show it
+    // next to the registered 6mo number so the table matches the scorer.
+    const eff = (c.effective_threshold != null && c.effective_threshold !== c.threshold)
+      ? ` (t=${(+c.evaluated_at_months).toFixed(1)}mo: ${c.effective_threshold})` : '';
+    const val = c.value == null ? '—' : (+c.value).toFixed(2);
+    return `<tr title="${(c.description || '').replace(/"/g, '&quot;')}">
+      <td>${c.id}</td><td>${val}</td><td style="color:var(--muted)">${c.op} ${thr}${eff}</td>
+      <td>${c.checkpoint}</td><td>${statusPill(c.status)}</td></tr>`;
+  }).join('');
+  document.getElementById('protocol-panel').innerHTML = `
+    <div style="margin-bottom:10px;font-size:12px;color:var(--muted)">
+      ${started} · overall ${statusPill(p.overall)} ·
+      binding <span class="pill ${bindCls}" style="${bindStyle}">${p.binding}</span>
+    </div>
+    <table><thead><tr><th>ID</th><th>Value</th><th>Threshold</th><th>When</th><th>Status</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+function renderSleeves(s) {
+  document.getElementById('sleeves-sub').textContent = `${s.model || ''}`;
+  if (s.status !== 'ok') {
+    document.getElementById('sleeves-panel').innerHTML =
+      `<div style="color:var(--muted);font-size:13px;">${s.reason || s.status || 'no data yet'}</div>`;
+    return;
+  }
+  const ref = s.reference || {};
+  const rows = Object.entries(s.sleeves || {}).map(([name, v]) => {
+    const r = ref[name];
+    const refStr = r && r.mean_monthly != null ? fmtPctNoSign(r.mean_monthly) + '/mo bt' : '—';
+    return `<tr><td>${name}</td>
+      <td style="text-align:right" class="${cls(v.cum_contribution_pp)}">${v.cum_contribution_pp?.toFixed(2)} pp</td>
+      <td style="text-align:right;color:var(--muted)">${refStr}</td></tr>`;
+  }).join('');
+  const resid = s.unattributed_residual_pp;
+  const gaps = (s.data_gaps || []).length;
+  document.getElementById('sleeves-panel').innerHTML = `
+    <div style="margin-bottom:10px;font-size:12px;color:var(--muted)">
+      since ${s.window_start} · ${s.n_days} days · book ${(+s.book_cum_pp).toFixed(2)} pp cum
+      ${gaps ? ` · <span class="warn">${gaps} data gap${gaps === 1 ? '' : 's'}</span>` : ''}
+    </div>
+    <table><thead><tr><th>Sleeve</th><th style="text-align:right">Cum contrib</th><th style="text-align:right">Backtest ref</th></tr></thead>
+    <tbody>${rows}
+      <tr><td style="color:var(--muted)">unattributed residual</td>
+        <td style="text-align:right" class="${cls(resid)}">${resid == null ? '—' : resid.toFixed(2) + ' pp'}</td>
+        <td style="text-align:right;color:var(--muted)">costs/timing</td></tr>
+    </tbody></table>`;
+}
+
+async function refreshEvidence() {
+  let names = [];
+  try {
+    const models = await jget('/api/v1/models');
+    names = (models.models || models).filter(m => m.active !== false).map(m => m.name);
+  } catch (e) {}
+  if (!names.length) names = ['combo_v2'];
+  const name = names[0];  // primary slot
+  const authNote = (ep) =>
+    `Auth token required for ${ep} — open the <a href="/" style="color:var(--accent)">original dashboard</a>, enter the DASHBOARD_AUTH_TOKEN once when prompted (any Settings/run action asks), then reload this page; the stashed token is reused here.`;
+  try {
+    renderProtocol(await apiGet(`/api/protocol/${name}`));
+  } catch (e) {
+    document.getElementById('protocol-panel').innerHTML =
+      `<div style="color:var(--muted);font-size:13px;">${/401/.test(e.message) ? authNote('/api/protocol') : e.message}</div>`;
+  }
+  try {
+    renderSleeves(await apiGet(`/api/sleeves/${name}`));
+  } catch (e) {
+    document.getElementById('sleeves-panel').innerHTML =
+      `<div style="color:var(--muted);font-size:13px;">${/401/.test(e.message) ? authNote('/api/sleeves') : e.message}</div>`;
+  }
+}
+
 refresh();
 setInterval(refresh, 30000);  // refresh every 30s
+refreshEvidence();
+setInterval(refreshEvidence, 120000);  // protocol/sleeves are slow-moving
 </script>
 </body>
 </html>"""

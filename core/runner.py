@@ -698,6 +698,18 @@ def run_single_model(
                 )
             except Exception as e:
                 logger.warning(f"  forward_test_start binding failed: {e}")
+        # Live-vs-backtest tracking snapshot (Phase A2) for the run report's
+        # LIVE VS BACKTEST block. Read-only (one portfolio/history GET) and
+        # entirely best-effort: tracking_snapshot returns None on any
+        # failure, so a data hiccup can never touch a completed rebalance.
+        if state.get("forward_test_start"):
+            try:
+                from core.tracking import tracking_snapshot
+                snap = tracking_snapshot(mc, state, logger=logger)
+                if snap:
+                    report.set("tracking", snap)
+            except Exception as e:
+                logger.warning(f"  tracking snapshot failed (non-fatal): {e}")
     state["last_run"] = datetime.now().isoformat()
     state["run_count"] = state.get("run_count", 0) + 1
     history_entry: dict = {

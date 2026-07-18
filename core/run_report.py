@@ -165,6 +165,36 @@ class RunReport:
                     lines.append(f"    Unexpected:            {', '.join(book['unexpected_positions'])}")
             lines.append("")
 
+        # Live vs backtest tracking (Phase A2) — present only after the
+        # forward-test clock started and the best-effort snapshot succeeded.
+        tr = self.data.get("tracking")
+        if tr and tr.get("status") == "ok":
+            lines.append("  LIVE VS BACKTEST:")
+            lines.append(
+                f"    Forward test:          since {tr.get('forward_test_start')} "
+                f"({tr.get('months_elapsed', 0):.2f} months, "
+                f"{tr.get('n_days', 0)} trading days)"
+            )
+            lines.append(
+                f"    Geo monthly:           live {tr.get('live_geo_monthly_pct', 0):+.2f}%"
+                f" vs expected {tr.get('expected_geo_monthly_pct', 0):+.2f}%"
+            )
+            diff = tr.get("cum_tracking_diff_pp")
+            if diff is not None:
+                lines.append(f"    Cum tracking diff:     {diff:+.2f} pp")
+            within = tr.get("within_1sigma")
+            if within is not None:
+                lines.append(
+                    f"    Within +/-1 sigma band: {'yes' if within else 'NO'}"
+                )
+            rv = tr.get("realized_vol_monthly_pct")
+            if rv is not None:
+                lines.append(f"    Realized vol:          {rv:.2f}%/mo")
+            dd = tr.get("max_drawdown_pct")
+            if dd is not None:
+                lines.append(f"    Max drawdown:          {dd:.2f}%")
+            lines.append("")
+
         # Trade journal summary
         if "trade_log_summary" in self.data:
             tls = self.data["trade_log_summary"]
