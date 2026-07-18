@@ -194,6 +194,16 @@ Taken together, the honest bracket for live expectations at 2× is now: **PIT S&
 
 ---
 
+## Improvement phase v2 (2026-07-18) — G4 retired, Candidate X selected, process automation
+
+Three governance decisions, frozen before any new computation (full texts: [`results/v7/candidate_x/DECISION_RULE.md`](results/v7/candidate_x/DECISION_RULE.md), [`results/v7/crash/CRASH1_PREREG.md`](results/v7/crash/CRASH1_PREREG.md)):
+
+1. **G4 is retired with a written finding.** Its absolute bars (mean ≥5.0 %/mo, MaxDD ≥−40 %) predate the audit corrections — the corrected champion itself (4.80 %/mo, −60.3 %) fails both. A gate the incumbent cannot pass cannot be the bar for replacing the incumbent. Replacement: relative shadow-slot protocols.
+2. **Candidate X = `ASM_Bst_BTF1`** (residual+dual+adaptive blend, static ⅓, book gate + tier + freeze-dd_v1), selected by a frozen rule whose every threshold cites a pre-validation commitment: the *only* menu row passing dev mean ≥4.0 %/mo AND dev MaxDD ≥−45 % (the live kill bar) AND turnover ≤30×. Dev: 4.28 %/mo, Calmar 1.234, MaxDD −41.7 % (vs champion 0.858/−60.2 %). The freeze layer ships **DISPUTED** (tainted V6 provenance) with a pre-registered live ablation replay as its adjudicator; CRASH1 (Daniel–Moskowitz crash overlay, pre-registered) is the v2 challenger to replace it. Deploys to a shadow paper slot under `protocol_exp.json` — the primary's 12-month test is untouched.
+3. **Process automation**: the walk-forward rule (WS3) goes live as shadow slot #3 under a versioned frozen spec v2 — annual Dec-31 re-selection, research-side computation, human-in-the-loop bundle swap, the bot never self-modifies.
+
+---
+
 ## ~~All 27 variants, ranked by mean monthly return~~ (DEPRECATED)
 
 > **DEPRECATED 2026-07-14** — this table was produced by the stale-execution legacy engine with free leverage and arithmetic means (Validity Notice §2–4). Superseded by the Corrected catalog above. Preserved as originally written.
