@@ -1,0 +1,78 @@
+loading cache + pool weight frames (warm from catalog_v2)…
+
+══ truncation-equivalence audit @ 2020-12-31 ══
+  OK   xs_momentum_12_1               maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   xs_momentum_top30              maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   mean_reversion_5d              maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   trend_following                maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   dual_momentum_vol              maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   sector_rotation                maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   xs_momentum_multi              maxdiff 0.00e+00 cover 100% (  0.3s)
+  OK   xs_momentum_concentrated       maxdiff 0.00e+00 cover 100% (  0.2s)
+  OK   ts_momentum_multiasset         maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   xs_momentum_fast               maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   xs_momentum_fast_top10         maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   low_vol_quality                maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   acceleration_momentum          maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   donchian_breakout              maxdiff 0.00e+00 cover 100% (  0.5s)
+  OK   multifactor_mvr                maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   risk_parity_etf                maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   vix_gated_trend                maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   calendar_tom                   maxdiff 0.00e+00 cover 100% (  0.2s)
+  OK   sector_momentum_rotation       maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   adaptive_voltarget_momentum    maxdiff 0.00e+00 cover 100% (  0.1s)
+  OK   momentum_quality_blend         maxdiff 0.00e+00 cover 100% (  0.1s)
+  wrote /Users/arsenkhanguieldyan/Documents/Trading/Traiding 11/results/v7/wf/equivalence.json — 0 exclusion(s)
+
+[spec] frozen NEW spec -> /Users/arsenkhanguieldyan/Documents/Trading/Traiding 11/results/v7/wf/process_spec.json (sha b75aa7e7fe34eec1…)
+[pool] 21 of 21 names in play
+
+══ scoring dev legs 2019-2022 ══
+  [leg 2019] scored 21 candidates (3s)
+  [leg 2020] scored 21 candidates (3s)
+  [leg 2021] scored 21 candidates (3s)
+  [leg 2022] scored 21 candidates (3s)
+
+══ dev-leg selections (top-3 by Sharpe at selection date) ══
+  2019 (cutoff 2018-12-31): dual_momentum_vol (SR 1.12), acceleration_momentum (SR 0.85), low_vol_quality (SR 0.83)
+  2020 (cutoff 2019-12-31): low_vol_quality (SR 1.41), dual_momentum_vol (SR 1.30), risk_parity_etf (SR 1.29)
+  2021 (cutoff 2020-12-31): dual_momentum_vol (SR 1.34), adaptive_voltarget_momentum (SR 1.15), donchian_breakout (SR 1.13)
+  2022 (cutoff 2021-12-31): dual_momentum_vol (SR 1.25), donchian_breakout (SR 1.19), acceleration_momentum (SR 1.09)
+
+══ sensitivity variants (dev legs only, family wf_sens) ══
+  k2_sharpe  dev 2019-2022: geo +2.59%/mo | SR 0.85 | maxDD -54.7%
+  k4_sharpe  dev 2019-2022: geo +2.43%/mo | SR 0.84 | maxDD -54.5%
+  k3_calmar  dev 2019-2022: geo +1.96%/mo | SR 0.74 | maxDD -50.8%
+
+══ scoring legs 2023-2026 ══
+  [leg 2023] scored 21 candidates (3s)
+  [leg 2024] scored 21 candidates (4s)
+  [leg 2025] scored 21 candidates (4s)
+  [leg 2026] scored 21 candidates (4s)
+
+══ all leg selections ══
+  2019 (cutoff 2018-12-31): dual_momentum_vol (SR 1.12), acceleration_momentum (SR 0.85), low_vol_quality (SR 0.83)
+  2020 (cutoff 2019-12-31): low_vol_quality (SR 1.41), dual_momentum_vol (SR 1.30), risk_parity_etf (SR 1.29)
+  2021 (cutoff 2020-12-31): dual_momentum_vol (SR 1.34), adaptive_voltarget_momentum (SR 1.15), donchian_breakout (SR 1.13)
+  2022 (cutoff 2021-12-31): dual_momentum_vol (SR 1.25), donchian_breakout (SR 1.19), acceleration_momentum (SR 1.09)
+  2023 (cutoff 2022-12-31): dual_momentum_vol (SR 1.07), calendar_tom (SR 1.02), xs_momentum_top30 (SR 0.98)
+  2024 (cutoff 2023-12-31): dual_momentum_vol (SR 1.10), xs_momentum_top30 (SR 1.03), xs_momentum_12_1 (SR 0.97)
+  2025 (cutoff 2024-12-31): dual_momentum_vol (SR 1.12), xs_momentum_top30 (SR 1.07), xs_momentum_12_1 (SR 1.02)
+  2026 (cutoff 2025-12-31): dual_momentum_vol (SR 1.13), xs_momentum_top30 (SR 1.09), xs_momentum_12_1 (SR 1.02)
+
+══ process curve (final=True, family wf_process) ══
+  2x: geo +3.40%/mo | SR 1.03 | maxDD -57.7%
+  1.5x: geo +2.91%/mo | SR 1.06 | maxDD -46.4%
+  1x: geo +2.23%/mo | SR 1.13 | maxDD -33.0%
+
+[champion] reference reproduces catalog_v2 row (sharpe diff 0.0e+00)
+wrote /Users/arsenkhanguieldyan/Documents/Trading/Traiding 11/results/v7/wf/wf_results.csv, process_curve.parquet, selections.csv
+wrote /Users/arsenkhanguieldyan/Documents/Trading/Traiding 11/results/v7/wf/WF_REPORT.md
+
+══ key numbers ══
+  wf_process_2x: geo +3.40%/mo | SR 1.03 | maxDD -57.7% | DSR 0.800 | gap vs 3.68%: -0.28pp/mo
+  wf_process_1.5x: geo +2.91%/mo | SR 1.06 | maxDD -46.4% | DSR 0.823 | gap vs 3.68%: -0.77pp/mo
+  wf_process_1x: geo +2.23%/mo | SR 1.13 | maxDD -33.0% | DSR 0.865 | gap vs 3.68%: -1.45pp/mo
+  champion 2019+: geo +4.44%/mo | SPY 2019+: geo +1.20%/mo
+
+done in 1.5 min

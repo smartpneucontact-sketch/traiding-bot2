@@ -1,0 +1,212 @@
+{
+  "xs_momentum_12_1": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 45,
+    "n_trunc_dates": 45,
+    "n_common_dates": 45,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "xs_momentum_top30": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 45,
+    "n_trunc_dates": 45,
+    "n_common_dates": 45,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "mean_reversion_5d": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 235,
+    "n_trunc_dates": 235,
+    "n_common_dates": 235,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "trend_following": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 48,
+    "n_trunc_dates": 48,
+    "n_common_dates": 48,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "dual_momentum_vol": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 51,
+    "n_trunc_dates": 51,
+    "n_common_dates": 51,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "sector_rotation": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 54,
+    "n_trunc_dates": 54,
+    "n_common_dates": 54,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "xs_momentum_multi": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 44,
+    "n_trunc_dates": 44,
+    "n_common_dates": 44,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "xs_momentum_concentrated": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 92,
+    "n_trunc_dates": 92,
+    "n_common_dates": 92,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "ts_momentum_multiasset": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 43,
+    "n_trunc_dates": 43,
+    "n_common_dates": 43,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "xs_momentum_fast": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 222,
+    "n_trunc_dates": 222,
+    "n_common_dates": 222,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "xs_momentum_fast_top10": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 222,
+    "n_trunc_dates": 222,
+    "n_common_dates": 222,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "low_vol_quality": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 54,
+    "n_trunc_dates": 54,
+    "n_common_dates": 54,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "acceleration_momentum": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 44,
+    "n_trunc_dates": 44,
+    "n_common_dates": 44,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "donchian_breakout": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 219,
+    "n_trunc_dates": 219,
+    "n_common_dates": 219,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "multifactor_mvr": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 45,
+    "n_trunc_dates": 45,
+    "n_common_dates": 45,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "risk_parity_etf": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 54,
+    "n_trunc_dates": 54,
+    "n_common_dates": 54,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "vix_gated_trend": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 48,
+    "n_trunc_dates": 48,
+    "n_common_dates": 48,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "calendar_tom": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 1133,
+    "n_trunc_dates": 1133,
+    "n_common_dates": 1133,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "sector_momentum_rotation": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 51,
+    "n_trunc_dates": 51,
+    "n_common_dates": 51,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "adaptive_voltarget_momentum": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 45,
+    "n_trunc_dates": 45,
+    "n_common_dates": 45,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  },
+  "momentum_quality_blend": {
+    "cutoff": "2020-12-31",
+    "n_full_dates": 45,
+    "n_trunc_dates": 45,
+    "n_common_dates": 45,
+    "ok": true,
+    "max_abs_diff": 0.0,
+    "coverage": 1.0,
+    "reason": ""
+  }
+}

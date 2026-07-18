@@ -7,3 +7,8 @@ __pycache__/
 # Binary artifact caches (regenerable from code + data_cache)
 *.parquet
 ml_track/cache/
+
+# Claude Code local state (personal, not for the repo)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json

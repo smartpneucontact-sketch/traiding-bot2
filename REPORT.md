@@ -178,6 +178,22 @@ Bottom line: the forward paper test is now clearly the *only* clean evidence for
 
 ---
 
+## Walk-forward process evaluation (2026-07-18, WS3) — the honest live estimate
+
+The right expectation for live performance is not the hindsight champion but the *selection process*: re-pick the top-3 single strategies by Sharpe each Dec-31 using only data available then, trade them equal-weight the next year. Spec pre-registered and frozen before any leg ran (`results/v7/wf/process_spec.json`, sha `b75aa7e7…`); all 21 pool sleeves passed a mandatory truncation-equivalence causality audit (max diff exactly 0.0); full method and fragility table in [`results/v7/wf/WF_REPORT.md`](results/v7/wf/WF_REPORT.md).
+
+| Leverage | Process geo/mo (2019–2026) | Sharpe | MaxDD | DSR | vs SPY (NW-t) |
+|---|---|---|---|---|---|
+| 2× | **+3.40 %** | 1.03 | −57.7 % | 0.80 | +3.02 |
+| 1.5× | +2.91 % | 1.06 | −46.4 % | 0.82 | +2.99 |
+| 1× | +2.23 % | 1.13 | −33.0 % | 0.87 | +2.62 |
+
+**Reading it honestly:** the process at 2× earns 3.40 %/mo vs the same-window hindsight champion's 4.44 %/mo — a −1.04 pp/mo hindsight tax that is statistically real (NW-t −2.10). But the process comfortably beats SPY (+1.20 %/mo same window) and, remarkably, lands within 0.3 pp of the published full-window champion figure. The selections are also stable: `dual_momentum_vol` was picked in 8/8 legs, and the 2024–2026 legs converge on exactly the sleeves the human picked for combo_v2 — evidence the champion wasn't a wild outlier of the search but roughly what honest annual re-selection would have found. Caveats unchanged: survivors-only universe (see the WS1c bound above), and 8 annual legs is a small sample.
+
+Taken together, the honest bracket for live expectations at 2× is now: **PIT S&P-only floor 1.08 %/mo · walk-forward process 3.40 %/mo · hindsight ceiling 3.68–4.44 %/mo** — with the forward paper test (12-month floor 1.8 %/mo) as the arbiter.
+
+---
+
 ## ~~All 27 variants, ranked by mean monthly return~~ (DEPRECATED)
 
 > **DEPRECATED 2026-07-14** — this table was produced by the stale-execution legacy engine with free leverage and arithmetic means (Validity Notice §2–4). Superseded by the Corrected catalog above. Preserved as originally written.

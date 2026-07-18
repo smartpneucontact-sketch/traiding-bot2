@@ -87,6 +87,7 @@ def run_trial(
     weights_are_daily: bool = False,
     final: bool = False,
     notes: str = "",
+    log: bool = True,
 ) -> dict:
     """Score a weight frame under the corrected engine and log the trial.
 
@@ -177,6 +178,13 @@ def run_trial(
     for ep, st in crash_table(eq).items():
         row[f"ep_{ep}_ret"] = st["ret"]
         row[f"ep_{ep}_dd"] = st["max_dd"]
+
+    if not log:
+        # Re-render of an already-ledgered config (caller verified): run the
+        # engine, return results, append nothing — identical re-runs are not
+        # new hypotheses and would only inflate raw ledger row counts.
+        return {"summary": s, "equity": eq, "returns": bt["returns"],
+                "weights": bt["weights"], "row": row}
 
     ledger = TRIALS_DIR / f"{family}.csv"
     row_df = pd.DataFrame([row])
