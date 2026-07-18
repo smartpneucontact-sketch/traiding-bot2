@@ -1,0 +1,208 @@
+{
+  "kind": "wf_process_v2_selection",
+  "spec_version": 2,
+  "spec_sha256": "162bdb25590d8d77ec7c160d121b4c5a1e820dd44b44d0dab0c5ed53f491255d",
+  "selection_year": 2026,
+  "cutoff": "2025-12-31",
+  "k": 3,
+  "blend": "equal",
+  "metric": "sharpe under next_open tc5 margin600 at 1x on all history to date",
+  "leverage": 2.0,
+  "picks": [
+    "dual_momentum_vol",
+    "xs_momentum_top30",
+    "xs_momentum_12_1"
+  ],
+  "picks_sharpe_at_selection": {
+    "dual_momentum_vol": 1.1266049364236408,
+    "xs_momentum_top30": 1.087108434663027,
+    "xs_momentum_12_1": 1.0238798466716308
+  },
+  "pool_scores": [
+    {
+      "rank": 1,
+      "name": "dual_momentum_vol",
+      "sharpe_at_selection": 1.1266049364236408,
+      "calmar_at_selection": 0.840261750250887,
+      "geo_at_selection": 0.0235373658763211,
+      "maxdd_at_selection": -0.3832608999073688
+    },
+    {
+      "rank": 2,
+      "name": "xs_momentum_top30",
+      "sharpe_at_selection": 1.087108434663027,
+      "calmar_at_selection": 0.8380602670972688,
+      "geo_at_selection": 0.0257794852290778,
+      "maxdd_at_selection": -0.4262382168093908
+    },
+    {
+      "rank": 3,
+      "name": "xs_momentum_12_1",
+      "sharpe_at_selection": 1.0238798466716308,
+      "calmar_at_selection": 0.6917415054302548,
+      "geo_at_selection": 0.0220378747350717,
+      "maxdd_at_selection": -0.4322196066533856
+    },
+    {
+      "rank": 4,
+      "name": "adaptive_voltarget_momentum",
+      "sharpe_at_selection": 0.9994589012349716,
+      "calmar_at_selection": 0.8450289379131742,
+      "geo_at_selection": 0.0182469431100862,
+      "maxdd_at_selection": -0.2867726212339708
+    },
+    {
+      "rank": 5,
+      "name": "xs_momentum_fast",
+      "sharpe_at_selection": 0.9083703627820056,
+      "calmar_at_selection": 0.6549974039938906,
+      "geo_at_selection": 0.0198007881695823,
+      "maxdd_at_selection": -0.4049980125657229
+    },
+    {
+      "rank": 6,
+      "name": "xs_momentum_multi",
+      "sharpe_at_selection": 0.8909564282164454,
+      "calmar_at_selection": 0.6588044572555987,
+      "geo_at_selection": 0.0172906682182327,
+      "maxdd_at_selection": -0.3466925581108949
+    },
+    {
+      "rank": 7,
+      "name": "acceleration_momentum",
+      "sharpe_at_selection": 0.8476010272740052,
+      "calmar_at_selection": 0.391818126561447,
+      "geo_at_selection": 0.0130997158959969,
+      "maxdd_at_selection": -0.4314037115393458
+    },
+    {
+      "rank": 8,
+      "name": "low_vol_quality",
+      "sharpe_at_selection": 0.7986480179840157,
+      "calmar_at_selection": 0.2991875984438352,
+      "geo_at_selection": 0.0056469241248593,
+      "maxdd_at_selection": -0.2336587622757374
+    },
+    {
+      "rank": 9,
+      "name": "risk_parity_etf",
+      "sharpe_at_selection": 0.7886756271226486,
+      "calmar_at_selection": 0.326238964861258,
+      "geo_at_selection": 0.0053319924526966,
+      "maxdd_at_selection": -0.2019809378396623
+    },
+    {
+      "rank": 10,
+      "name": "donchian_breakout",
+      "sharpe_at_selection": 0.7840352519127468,
+      "calmar_at_selection": 0.4552067114909194,
+      "geo_at_selection": 0.0088140854421743,
+      "maxdd_at_selection": -0.2439553553676093
+    },
+    {
+      "rank": 11,
+      "name": "xs_momentum_fast_top10",
+      "sharpe_at_selection": 0.7818333546429925,
+      "calmar_at_selection": 0.5580824480342659,
+      "geo_at_selection": 0.0193217391171014,
+      "maxdd_at_selection": -0.462581719593798
+    },
+    {
+      "rank": 12,
+      "name": "xs_momentum_concentrated",
+      "sharpe_at_selection": 0.768838111769676,
+      "calmar_at_selection": 0.4662260354196689,
+      "geo_at_selection": 0.0138564611971852,
+      "maxdd_at_selection": -0.3851213393009749
+    },
+    {
+      "rank": 13,
+      "name": "mean_reversion_5d",
+      "sharpe_at_selection": 0.7485626734089049,
+      "calmar_at_selection": 0.3325458533548129,
+      "geo_at_selection": 0.016447858290844,
+      "maxdd_at_selection": -0.6502728568123506
+    },
+    {
+      "rank": 14,
+      "name": "calendar_tom",
+      "sharpe_at_selection": 0.7429780857671391,
+      "calmar_at_selection": 0.3434440897263965,
+      "geo_at_selection": 0.0080342915257722,
+      "maxdd_at_selection": -0.2934625307237053
+    },
+    {
+      "rank": 15,
+      "name": "momentum_quality_blend",
+      "sharpe_at_selection": 0.7051358508420971,
+      "calmar_at_selection": 0.327232066544457,
+      "geo_at_selection": 0.0102626415159625,
+      "maxdd_at_selection": -0.3983298911167904
+    },
+    {
+      "rank": 16,
+      "name": "multifactor_mvr",
+      "sharpe_at_selection": 0.6896294790306704,
+      "calmar_at_selection": 0.2713944906412624,
+      "geo_at_selection": 0.0090596929599098,
+      "maxdd_at_selection": -0.4211597723637523
+    },
+    {
+      "rank": 17,
+      "name": "sector_momentum_rotation",
+      "sharpe_at_selection": 0.6847501258166426,
+      "calmar_at_selection": 0.3624970903056547,
+      "geo_at_selection": 0.0090179935401171,
+      "maxdd_at_selection": -0.3137900649662255
+    },
+    {
+      "rank": 18,
+      "name": "sector_rotation",
+      "sharpe_at_selection": 0.62188494131852,
+      "calmar_at_selection": 0.2891345526515571,
+      "geo_at_selection": 0.0077601346038553,
+      "maxdd_at_selection": -0.3361782264849149
+    },
+    {
+      "rank": 19,
+      "name": "ts_momentum_multiasset",
+      "sharpe_at_selection": 0.5784597390938501,
+      "calmar_at_selection": 0.313948920977421,
+      "geo_at_selection": 0.0031062110433308,
+      "maxdd_at_selection": -0.1207775338475312
+    },
+    {
+      "rank": 20,
+      "name": "vix_gated_trend",
+      "sharpe_at_selection": 0.3764345700474808,
+      "calmar_at_selection": 0.1245769089234439,
+      "geo_at_selection": 0.0046895389671126,
+      "maxdd_at_selection": -0.4635598634841776
+    },
+    {
+      "rank": 21,
+      "name": "trend_following",
+      "sharpe_at_selection": 0.3619477783322337,
+      "calmar_at_selection": 0.1045233474304333,
+      "geo_at_selection": 0.0048863020467935,
+      "maxdd_at_selection": -0.5763055748711865
+    }
+  ],
+  "scores_source": {
+    "mode": "reused",
+    "file": "results/v7/wf/scores.csv",
+    "file_sha256": "ff29d2bb234469ea0994e5ed2f94eda1953eda43c8a632cc6348bbb9711f1707",
+    "ledger_family": "wf_score",
+    "note": "complete leg already ledgered by the v1 evaluation; identical re-execution is not a new hypothesis (spec v2 score_family_note)"
+  },
+  "data_revision": {
+    "data_cache_pkl": {
+      "path": "data_cache.pkl",
+      "sha256": "53d148f19121fcbfd44c82ed52b7bbb2df9569f8de89554196a592e5e828e5c0"
+    },
+    "strategies_code_hash": "d96673b28e",
+    "note": "data_cache.pkl is the frozen input panel for all wf scoring; strategies_code_hash (sha1 of strategies.py/strategies_v2.py/ensemble.py) keys the weight cache \u2014 a different hash at the next selection means strategy code changed and the equivalence audit must be re-checked"
+  },
+  "created_at": "2026-07-18T13:45:04",
+  "sha256": "b08b063f9f87e557776c9b895d28482904da2d610b41b5aeda6e8fe02965ac43"
+}

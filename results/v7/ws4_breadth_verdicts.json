@@ -1,0 +1,33 @@
+{
+  "family": "regime_breadth",
+  "n_cells": 8,
+  "baseline": {
+    "calmar_dev": 0.7483592574939588,
+    "geo_dev": 0.031533489627785016,
+    "source": "results/v7/catalog_v2.csv combo_v2_2x dev"
+  },
+  "gates": {
+    "dsr_min": 0.95,
+    "calmar_min": 0.8231951832433547,
+    "geo_min": 0.029533489627785015,
+    "n_trials_at_eval": 715
+  },
+  "best_cell": {
+    "name": "breadth_above200_p10_m0.5",
+    "geo_monthly": 0.029278435445713846,
+    "mean_monthly": 0.0363998827608488,
+    "sharpe": 0.984159604159189,
+    "max_drawdown": -0.4763724578312481,
+    "calmar": 0.8686925210816699,
+    "dsr_dev": 0.7597995826242134,
+    "gate_dsr": false,
+    "gate_calmar": true,
+    "gate_geo": false,
+    "gate_all": false
+  },
+  "n_pass": 0,
+  "verdict": "FAIL dev gates \u2014 no val shot",
+  "survivorship_note": "breadth features from survivors-only panel; percentile transforms only (breadth.py)",
+  "generated": "2026-07-18T13:48:31",
+  "code_hash": "d96673b28e"
+}

@@ -62,3 +62,30 @@ ASM_rescore600) — same cost basis.
   protocol_exp sha binding, old record archived).
 - Pass dev, fail val: family BURNED. No second shot, no re-tuning.
 - Fail dev: no val shot; family closed.
+
+---
+
+## AMENDMENT 2026-07-18 (post-run disclosure; appended after the dev grid ran, before any further use of the family)
+
+Recorded per the reviewer's governance findings. None of these alter the
+dev verdict (FAIL → family CLOSED, no val shot); they are disclosed so the
+record is exact:
+
+1. **Track wording**: the body says "Engine: next_open" but the base
+   construction includes the tier layer, which requires the tier-loop
+   close-to-close track (the same track the ledgered ASM_Bst_BTF1 and the
+   ASM_rescore600 comparator use). All 8 cells AND the comparator were scored
+   on the identical tier_loop_cc track — the gate comparison is
+   like-for-like; no cell was advantaged. The body should have said
+   "tier-loop track, engine-fidelity-anchored" — wording defect only.
+2. **DM-response parameters** (target_vol for the continuous scale, clip
+   bounds) were fixed in-script at run time rather than enumerated here.
+   They were fixed BEFORE the grid ran and applied uniformly to the 4
+   dm-response cells; recorded in exp_crash_overlay.py and the ledger
+   params_json.
+3. **Champion context row**: exp_rescore600.py ledgered a champion dev@600
+   row beyond R6's strict mandate (context only, clearly named; it feeds no
+   gate).
+4. CRASH1_DEV_RESULTS.md carries a post-run "Observation" section (freeze
+   contributed ~+0.07 dev Calmar in-frame) — explicitly labeled report-only
+   evidence for the freeze-ablation replay, not a new hypothesis test.

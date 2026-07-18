@@ -1,0 +1,32 @@
+{
+  "family": "regime_vixterm",
+  "n_cells": 10,
+  "baseline": {
+    "calmar_dev": 0.7483592574939588,
+    "geo_dev": 0.031533489627785016,
+    "source": "results/v7/catalog_v2.csv combo_v2_2x dev"
+  },
+  "gates": {
+    "dsr_min": 0.95,
+    "calmar_min": 0.8231951832433547,
+    "geo_min": 0.029533489627785015,
+    "n_trials_at_eval": 707
+  },
+  "best_cell": {
+    "name": "vixterm_thr1.05_m0.5",
+    "geo_monthly": 0.03063268873660241,
+    "mean_monthly": 0.0390558544213048,
+    "sharpe": 0.9945600385829324,
+    "max_drawdown": -0.5137797765506819,
+    "calmar": 0.8492080756518477,
+    "dsr_dev": 0.7659999054037318,
+    "gate_dsr": false,
+    "gate_calmar": true,
+    "gate_geo": true,
+    "gate_all": false
+  },
+  "n_pass": 0,
+  "verdict": "FAIL dev gates \u2014 no val shot",
+  "generated": "2026-07-18T13:47:24",
+  "code_hash": "d96673b28e"
+}

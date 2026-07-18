@@ -1,0 +1,31 @@
+{
+  "family": "ASM_rescore600",
+  "source_ledger": "results/v7/trials/ASM_rescore600.csv",
+  "window": "dev",
+  "tc_bps_per_side": 5.0,
+  "margin_bps_annual": 600.0,
+  "leverage_for_reference": 2.0,
+  "engine": "tier_loop_cc",
+  "mean_monthly_return": 0.03963876893746916,
+  "sharpe": 1.1631679964965143,
+  "max_drawdown": -0.42097091136318787,
+  "calmar": 1.1006602123870939,
+  "row_name": "ASM_Bst_BTF1",
+  "ledger_ts": "2026-07-18T13:45:40",
+  "median_monthly": 0.020474877452964946,
+  "sortino": 1.635995105994045,
+  "cagr": 0.46334593270979485,
+  "ann_vol": 0.3950987743278061,
+  "worst_month": -0.2747619066746265,
+  "hit_rate": 0.5875,
+  "turnover_ann": 20.839147757262182,
+  "avg_gross": 1.4144841253676135,
+  "episodes": {
+    "2018Q4_dd": -0.39592770309472847,
+    "covid_dd": -0.20428900189748955,
+    "2022_dd": -0.32681509222024674
+  },
+  "r6_fall_through_check": "PASS (Calmar 1.101 >= 1.0; MaxDD -42.1% >= -45%; results/v7/candidate_x/RESCORE600_RESULTS.md)",
+  "decision_rule": "results/v7/candidate_x/DECISION_RULE.md sha256=fe482f8ee65d674d04061019d3cb227f143e385685fb90e8fff11dcc50e3e6ec",
+  "ledger_notes": "R6 margin re-score of the R2 selection (DECISION_RULE.md sha256=fe482f8ee65d674d..); margin drag replicated post-loop on gross_held (engine_v2 convention); doubles as CRASH1 comparator; events={'tier1': 14, 'tier2': 0, 'tier3': 0}"
+}

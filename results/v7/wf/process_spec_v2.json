@@ -1,0 +1,61 @@
+{
+  "program": "wf_process_v2 (Stream 3 process automation \u2014 live annual re-selection for shadow slot #3)",
+  "version": 2,
+  "supersedes": {
+    "spec": "results/v7/wf/process_spec.json",
+    "sha256": "b75aa7e7fe34eec11ebcd5b528c5a5f4d75f131fda1bd5e7cb54c773688503a0",
+    "note": "v1 is the WS3 walk-forward EVALUATION pre-registration and remains byte-immutable; v2 governs the LIVE process slot from the 2026 bootstrap leg onward"
+  },
+  "frozen_at": "2026-07-18T13:45:03",
+  "pool": [
+    "xs_momentum_12_1",
+    "xs_momentum_top30",
+    "mean_reversion_5d",
+    "trend_following",
+    "dual_momentum_vol",
+    "sector_rotation",
+    "xs_momentum_multi",
+    "xs_momentum_concentrated",
+    "ts_momentum_multiasset",
+    "xs_momentum_fast",
+    "xs_momentum_fast_top10",
+    "low_vol_quality",
+    "acceleration_momentum",
+    "donchian_breakout",
+    "multifactor_mvr",
+    "risk_parity_etf",
+    "vix_gated_trend",
+    "calendar_tom",
+    "sector_momentum_rotation",
+    "adaptive_voltarget_momentum",
+    "momentum_quality_blend"
+  ],
+  "pool_source": "exp_rescore.REGISTRY base single-strategy entries; EXCLUDED by construction: leverage/freeze/combo variants, shorts (xs_momentum_ls, xs_momentum_ls_neutral), ml (not in REGISTRY), benchmark buy_hold_spy",
+  "exclusion_rule": "mandatory truncation_equivalence_test at cutoff 2020-12-31 (build-on-full-then-slice vs build-on-truncated-panel must match on common decision dates, atol 1e-10, coverage >= 90%); failures are non-causal and excluded",
+  "exclusions": [],
+  "cadence": "annual re-selection at Dec-31 of Y-1, trade year Y (WS3 evidence: selections stable 8/8 legs 2019-2026; quarterly cadence has zero evidence and would be fresh selection pressure)",
+  "metric": "sharpe under next_open tc5 margin600 at 1x on all history to date",
+  "scoring_note": "ONE engine run per candidate per leg, weights sliced to <= Dec-31 of Y-1; the selection Sharpe is computed on the returned equity sliced to <= cutoff, which is identical to a truncated run because engine_v2 is day-causal",
+  "k": 3,
+  "blend": "equal",
+  "leverage": 2.0,
+  "leverage_note": "2.0x for comparability with the primary slot; the historical process MaxDD -57.7% vs the -45% kill bar is disclosed as ACCEPTED RISK (adjudicated in protocol_process.json, bot repo)",
+  "score_family": "wf_score_v2",
+  "score_family_note": "v2 scoring runs are ledgered under family 'wf_score_v2' with this spec's sha256 in notes, window='full', final=True through exp_lib's front door (live cutoffs are past DEV_END \u2014 the v1 dev_lock_note rationale applies: allowed ONLY because this spec is frozen before the runs). Rows already ledgered by the v1 evaluation (family wf_score) MAY be reused instead of re-run \u2014 an identical re-execution is not a new hypothesis; any reuse is recorded in the selection file's provenance block.",
+  "dev_end": "2022-12-31",
+  "selection_files": "results/v7/wf/selections/selection_<year>.json \u2014 written ONCE by wf_select.py, which hard-refuses a duplicate cutoff; each file carries picks, selection-time Sharpes for the full pool, this spec's sha256, data-revision info, and its own sha256 (canonical-json seal, same convention as this spec)",
+  "bootstrap": {
+    "selection_year": 2026,
+    "cutoff": "2025-12-31",
+    "picks": [
+      "dual_momentum_vol",
+      "xs_momentum_top30",
+      "xs_momentum_12_1"
+    ],
+    "source": "already-ledgered 2026 leg of the v1 evaluation (results/v7/wf/scores.csv leg_year=2026, family wf_score)"
+  },
+  "first_live_reselection": "2026-12-31",
+  "deployment_note": "the bot never self-modifies: selection_<year>.json -> scripts/build_variant.py --variant process -> versioned bundle combo_v2_process.<year>.<sha8> -> commit + deploy; an unported sleeve fails the build loudly (porting + parity is a deploy prerequisite)",
+  "amendment_rules": "pool additions ONLY via dated append-only amendment with orchestrator approval PLUS a fresh truncation-equivalence audit of the added names at the v1 settings (cutoff 2020-12-31, atol 1e-10, coverage >= 90%); amendments take effect at the NEXT selection date, never retroactively; removals only for data unavailability, documented the same way; the core rule (k=3 equal blend by Sharpe, annual Dec-31 cadence, leverage 2.0) is frozen \u2014 changing it requires a v3 spec with its own supersedes chain",
+  "sha256": "162bdb25590d8d77ec7c160d121b4c5a1e820dd44b44d0dab0c5ed53f491255d"
+}

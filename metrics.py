@@ -61,17 +61,35 @@ def annualized_vol(equity: pd.Series) -> float:
     return float(r.std() * np.sqrt(ANN)) if len(r) else float("nan")
 
 
-def sharpe(equity: pd.Series, rf: float = 0.0) -> float:
+def _excess_daily(r: pd.Series, rf: float | pd.Series) -> pd.Series:
+    """Daily excess returns for a scalar OR series risk-free rate.
+
+    `rf` convention (both forms): ANNUALIZED decimal rate (e.g. 0.052 for
+    5.2%); the daily deduction is rf/252. A Series rf (e.g. ^IRX/100) is
+    aligned to the return index by reindex + ffill (T-bill quotes gap on
+    market holidays), with any leading unquoted days treated as rf=0 — the
+    conservative choice for pre-history, and irrelevant for ^IRX (quoted
+    since 1960). The scalar path is byte-identical to the pre-2026-07-18
+    code: the published-record fidelity chain depends on the rf=0.0 default
+    producing unchanged numbers.
+    """
+    if isinstance(rf, pd.Series):
+        rf_ann = rf.reindex(r.index).ffill().fillna(0.0)
+        return r - rf_ann / ANN
+    return r - rf / ANN
+
+
+def sharpe(equity: pd.Series, rf: float | pd.Series = 0.0) -> float:
     r = daily_returns(equity)
     if len(r) == 0:
         return float("nan")
-    excess = r - rf / ANN
+    excess = _excess_daily(r, rf)
     if excess.std() == 0:
         return float("nan")
     return float(excess.mean() / excess.std() * np.sqrt(ANN))
 
 
-def sortino(equity: pd.Series, rf: float = 0.0) -> float:
+def sortino(equity: pd.Series, rf: float | pd.Series = 0.0) -> float:
     """Sortino ratio using the standard downside deviation (LPM2).
 
     downside_dev = sqrt(mean(min(excess, 0)**2)) over ALL observations —
@@ -82,7 +100,7 @@ def sortino(equity: pd.Series, rf: float = 0.0) -> float:
     r = daily_returns(equity)
     if len(r) == 0:
         return float("nan")
-    excess = r - rf / ANN
+    excess = _excess_daily(r, rf)
     downside_dev = float(np.sqrt(np.mean(np.minimum(excess, 0.0) ** 2)))
     if downside_dev == 0:
         return float("nan")
@@ -122,7 +140,8 @@ def yearly_returns(equity: pd.Series) -> pd.Series:
     return equity.resample("YE").last().pct_change().dropna()
 
 
-def summary(equity: pd.Series, name: str = "strategy", rf: float = 0.0) -> dict:
+def summary(equity: pd.Series, name: str = "strategy",
+            rf: float | pd.Series = 0.0) -> dict:
     return {
         "name": name,
         "start": str(equity.index[0].date()) if len(equity) else None,

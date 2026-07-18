@@ -202,6 +202,12 @@ Three governance decisions, frozen before any new computation (full texts: [`res
 2. **Candidate X = `ASM_Bst_BTF1`** (residual+dual+adaptive blend, static ⅓, book gate + tier + freeze-dd_v1), selected by a frozen rule whose every threshold cites a pre-validation commitment: the *only* menu row passing dev mean ≥4.0 %/mo AND dev MaxDD ≥−45 % (the live kill bar) AND turnover ≤30×. Dev: 4.28 %/mo, Calmar 1.234, MaxDD −41.7 % (vs champion 0.858/−60.2 %). The freeze layer ships **DISPUTED** (tainted V6 provenance) with a pre-registered live ablation replay as its adjudicator; CRASH1 (Daniel–Moskowitz crash overlay, pre-registered) is the v2 challenger to replace it. Deploys to a shadow paper slot under `protocol_exp.json` — the primary's 12-month test is untouched.
 3. **Process automation**: the walk-forward rule (WS3) goes live as shadow slot #3 under a versioned frozen spec v2 — annual Dec-31 re-selection, research-side computation, human-in-the-loop bundle swap, the bot never self-modifies.
 
+**Outcomes (2026-07-18, same day):**
+- **R6 margin re-score PASSED**: Candidate X at 600bp/yr financing: 3.96 %/mo, MaxDD −42.1 %, **Calmar 1.101** vs champion dev@600 0.748 — the selection stands; bundle reference uses these numbers.
+- **CRASH1 FAILED its frozen dev gates** (best cell Calmar 1.033 vs required 1.156) → **family CLOSED per prereg, no val shot**. The freeze stays DISPUTED under its ablation replay; report-only in-frame evidence suggests the freeze contributes ~+0.07 dev Calmar. A dated amendment on the prereg discloses a track-wording defect and in-script DM parameters (no gate impact).
+- **Stream 2: all three overlay families failed dev gates** (`regime_vixterm` 0/9, `regime_breadth` 0/8, `cov_voltarget` 0/8 — the cov grid confirms E4's falsification survives the corrected cost basis). **Gate-design finding**: the DSR ≥0.95 leg is structurally unreachable — the ungated champion itself scores dev DSR ~0.74 at 723 deduped trials. Two near-misses (vixterm thr1.05/m0.5; breadth ad63_p10/m0.5) pass Calmar+geo and cut MaxDD 9–11 pp, failing only that leg. Recorded as a miscalibration finding (the G4 lesson again); any re-test requires a NEW pre-registered family with a corrected DSR bar — the failed families stay failed.
+- **Ledger-vs-memory correction**: the roadmap's motivating prior "E4 vt35 dev Calmar 0.968" was actually E4's dev *Sharpe* (true ledgered Calmar 0.639) — documented in `exp_cov_voltarget.py`; the cov grid's failure makes the point moot.
+
 ---
 
 ## ~~All 27 variants, ranked by mean monthly return~~ (DEPRECATED)

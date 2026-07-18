@@ -1,0 +1,34 @@
+{
+  "family": "cov_voltarget",
+  "n_cells": 8,
+  "baseline": {
+    "calmar_dev": 0.7483592574939588,
+    "geo_dev": 0.031533489627785016,
+    "source": "results/v7/catalog_v2.csv combo_v2_2x dev"
+  },
+  "gates": {
+    "dsr_min": 0.95,
+    "calmar_min": 0.8231951832433547,
+    "geo_min": 0.029533489627785015,
+    "n_trials_at_eval": 723
+  },
+  "best_cell": {
+    "name": "cov_dual35_2x",
+    "geo_monthly": 0.03131419368044441,
+    "mean_monthly": 0.0412490041857642,
+    "sharpe": 0.9601870282891036,
+    "max_drawdown": -0.6032436999238027,
+    "calmar": 0.7422283046864554,
+    "avg_gross": 1.61261386738892,
+    "dsr_dev": 0.742366408756403,
+    "gate_dsr": false,
+    "gate_calmar": false,
+    "gate_geo": true,
+    "gate_all": false
+  },
+  "n_pass": 0,
+  "verdict": "FAIL dev gates \u2014 no val shot",
+  "e4_prior_correction": "plan cited 'vt35 dev Calmar 0.968'; ledger e4_vt35_eq_2x is Sharpe 0.967 / Calmar 0.639 (margin-free) \u2014 see docstring",
+  "generated": "2026-07-18T13:49:38",
+  "code_hash": "d96673b28e"
+}
