@@ -117,6 +117,54 @@ def _day_pl_fields(equity, last_equity) -> dict:
             "day_pl_pct": round(day_pl / le * 100.0, 4)}
 
 
+# Per-(model, ET-date) cache for the derived day-P&L baseline. Alpaca's
+# paper API has been observed returning last_equity='0' for ACTIVE funded
+# accounts (both slots, 2026-07-23), which the _day_pl_fields guard rightly
+# refuses to use — so the dashboard rendered a permanent "—". The baseline
+# only changes once per trading day, so one history fetch per model per ET
+# day is enough.
+_baseline_cache: dict = {}
+
+
+def _resolve_last_equity(mc, raw_last_equity, logger):
+    """(last_equity, source) with a portfolio-history fallback.
+
+    Prefers Alpaca's own last_equity when it is a positive finite number
+    ("alpaca"). Otherwise derives the previous trading day's closing equity
+    from portfolio history — the last daily mark strictly before today in
+    ET ("history") — the same padding-trimmed series /api/tracking uses.
+    Returns (None, "unavailable") when neither source works (genuinely
+    fresh account on its first day, or API failure): the UI shows "—".
+    """
+    try:
+        le = float(raw_last_equity)
+        if le > 0 and np.isfinite(le):
+            return le, "alpaca"
+    except (TypeError, ValueError):
+        pass
+
+    from zoneinfo import ZoneInfo
+    et_today = datetime.now(ZoneInfo("America/New_York")).date()
+    key = (mc.name, str(et_today))
+    if key in _baseline_cache:
+        return _baseline_cache[key]
+
+    result = (None, "unavailable")
+    try:
+        ts_list, eq_list = _fetch_equity_history(mc, logger)
+        for ts, eq in zip(reversed(ts_list), reversed(eq_list)):
+            ts_s = ts / 1000.0 if ts > 1e12 else float(ts)  # ms or s epochs
+            bar_date = datetime.fromtimestamp(
+                ts_s, ZoneInfo("America/New_York")).date()
+            if bar_date < et_today and eq and float(eq) > 0:
+                result = (float(eq), "history")
+                break
+    except Exception as e:
+        logger.warning(f"day-P&L baseline fallback failed [{mc.name}]: {e}")
+    _baseline_cache[key] = result
+    return result
+
+
 # In-memory store for live status
 bot_status = {
     "state": "idle",
@@ -708,13 +756,27 @@ def api_status():
     if live_next:
         s["next_run_at"] = live_next
     s["models"] = {}
+    persisted_last_runs = []
     for mc in pipeline.get_active_models():
         state = _load_model_state(mc.name)
+        if state.get("last_run"):
+            persisted_last_runs.append(str(state["last_run"]))
         s["models"][mc.name] = {
             "run_count": state.get("run_count", 0),
             "history": state.get("history", [])[-5:],
             **bot_status.get("models", {}).get(mc.name, {})
         }
+    # bot_status is in-memory and resets on every deploy — without a
+    # fallback the UI shows "LAST RUN Never" until the next cron fire.
+    # The per-model state files persist last_run on the volume; serve the
+    # newest one. Historical values are naive-UTC strings — tag them so
+    # the JS never guesses the timezone.
+    if not s.get("last_run_at") and persisted_last_runs:
+        lr = max(persisted_last_runs)
+        if not (lr.endswith("Z") or "+" in lr[10:]):
+            lr = lr + "+00:00"
+        s["last_run_at"] = lr
+        s["last_run_source"] = "persisted_state"
     return jsonify(s)
 
 
@@ -730,15 +792,17 @@ def api_account(model_name):
     def fetch():
         acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
         equity = float(acct.get("equity", 0) or 0)
-        last_equity = float(acct.get("last_equity", 0) or 0)
+        last_equity, le_source = _resolve_last_equity(
+            mc, acct.get("last_equity"), logger)
         return {
             "equity": equity,
             "portfolio_value": float(acct.get("portfolio_value", 0)),
             "cash": float(acct.get("cash", 0)),
             "buying_power": float(acct.get("buying_power", 0)),
             "last_equity": last_equity,
-            # day_pl/day_pl_pct are None (not equity!) when last_equity is
-            # 0/missing — the UI must render "—" in that case.
+            "day_pl_source": le_source,
+            # day_pl/day_pl_pct are None (not equity!) when no baseline
+            # exists from EITHER source — the UI must render "—" then.
             **_day_pl_fields(equity, last_equity),
             "long_market_value": float(acct.get("long_market_value", 0)),
             "short_market_value": float(acct.get("short_market_value", 0)),
@@ -2601,7 +2665,7 @@ def apiv1_model_detail(model_name):
         try:
             acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
             _eq = float(acct.get("equity", 0) or 0)
-            _le = float(acct.get("last_equity", 0) or 0)
+            _le, _src = _resolve_last_equity(mc, acct.get("last_equity"), logger)
             result["account"] = {
                 "equity": _eq,
                 "cash": float(acct.get("cash", 0)),
@@ -2609,6 +2673,7 @@ def apiv1_model_detail(model_name):
                 "buying_power": float(acct.get("buying_power", 0)),
                 "long_market_value": float(acct.get("long_market_value", 0)),
                 "last_equity": _le,
+                "day_pl_source": _src,
                 **_day_pl_fields(_eq, _le),
             }
         except Exception:
@@ -2721,7 +2786,7 @@ def apiv1_account(model_name):
     try:
         acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
         _eq = float(acct.get("equity", 0) or 0)
-        _le = float(acct.get("last_equity", 0) or 0)
+        _le, _src = _resolve_last_equity(mc, acct.get("last_equity"), logger)
         return _cors_response({
             "model": model_name,
             "equity": _eq,
@@ -2730,6 +2795,7 @@ def apiv1_account(model_name):
             "buying_power": float(acct.get("buying_power", 0)),
             "long_market_value": float(acct.get("long_market_value", 0)),
             "last_equity": _le,
+            "day_pl_source": _src,
             **_day_pl_fields(_eq, _le),
             "status": acct.get("status", "unknown"),
         })

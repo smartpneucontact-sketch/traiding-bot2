@@ -176,7 +176,11 @@ def test_api_account_last_equity_missing_yields_null_day_pl(dash, client, monkey
     d = client.get("/api/account/m_daypl_missing").get_json()
     assert d["day_pl"] is None
     assert d["day_pl_pct"] is None
-    assert d["last_equity"] == 0.0   # legacy field keeps its float contract
+    # last_equity is None (not 0.0) when no baseline resolves from Alpaca OR
+    # portfolio history — serving 0.0 as if it were real is the lie behind
+    # the original Infinity% bug.
+    assert d["last_equity"] is None
+    assert d["day_pl_source"] == "unavailable"
 
 
 # ───── BUG 2: timestamp emission (UTC-aware, JS never guesses) ───────────
@@ -330,3 +334,97 @@ def test_main_page_renders_run_tiles(client):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ───── BUG 1b: last_equity baseline fallback (Alpaca returns '0') ────────
+# Observed live 2026-07-23: both ACTIVE funded paper accounts returned
+# last_equity='0'. The guard correctly refused it, but the tile then showed
+# a permanent "—". _resolve_last_equity derives the baseline from portfolio
+# history (last daily mark strictly before today, ET) instead.
+
+def _et_epoch(days_ago: int) -> int:
+    d = datetime.now(ET) - timedelta(days=days_ago)
+    return int(d.replace(hour=16, minute=0, second=0, microsecond=0).timestamp())
+
+
+def test_resolve_prefers_alpaca_value_no_history_call(dash, monkeypatch):
+    def boom(mc, logger):
+        raise AssertionError("history must not be fetched when alpaca value is good")
+    monkeypatch.setattr(dash, "_fetch_equity_history", boom)
+    mc = types.SimpleNamespace(name="m_res_alpaca")
+    le, src = dash._resolve_last_equity(mc, "100000.5", None)
+    assert le == pytest.approx(100000.5) and src == "alpaca"
+
+
+def test_resolve_falls_back_to_history_yesterday_bar(dash, monkeypatch):
+    ts = [_et_epoch(2), _et_epoch(1), _et_epoch(0)]
+    eq = [78000.0, 79500.0, 80425.84]
+    monkeypatch.setattr(dash, "_fetch_equity_history", lambda mc, lg: (ts, eq))
+    mc = types.SimpleNamespace(name="m_res_hist")
+    le, src = dash._resolve_last_equity(mc, "0", None)
+    assert le == pytest.approx(79500.0) and src == "history"  # newest pre-today bar
+
+
+def test_resolve_handles_ms_epochs(dash, monkeypatch):
+    ts = [_et_epoch(1) * 1000, _et_epoch(0) * 1000]
+    eq = [79500.0, 80000.0]
+    monkeypatch.setattr(dash, "_fetch_equity_history", lambda mc, lg: (ts, eq))
+    mc = types.SimpleNamespace(name="m_res_ms")
+    le, src = dash._resolve_last_equity(mc, None, None)
+    assert le == pytest.approx(79500.0) and src == "history"
+
+
+def test_resolve_unavailable_when_only_today(dash, monkeypatch):
+    monkeypatch.setattr(dash, "_fetch_equity_history",
+                        lambda mc, lg: ([_et_epoch(0)], [100000.0]))
+    mc = types.SimpleNamespace(name="m_res_today")
+    le, src = dash._resolve_last_equity(mc, "0", None)
+    assert le is None and src == "unavailable"
+
+
+def test_resolve_caches_per_day(dash, monkeypatch):
+    calls = {"n": 0}
+    def counted(mc, lg):
+        calls["n"] += 1
+        return ([_et_epoch(1)], [79500.0])
+    monkeypatch.setattr(dash, "_fetch_equity_history", counted)
+    mc = types.SimpleNamespace(name="m_res_cache")
+    a = dash._resolve_last_equity(mc, "0", None)
+    b = dash._resolve_last_equity(mc, "0", None)
+    assert a == b == (79500.0, "history") and calls["n"] == 1
+
+
+def test_api_account_history_fallback_end_to_end(dash, client, monkeypatch):
+    """last_equity '0' from Alpaca + valid history ⇒ real day_pl, not '—'."""
+    _fake_account_route(dash, monkeypatch, "m_daypl_histfb", {
+        "equity": "80425.84", "last_equity": "0",
+        "portfolio_value": "80425.84", "cash": "34251.08",
+        "buying_power": "34251.08", "long_market_value": "46174.76",
+        "short_market_value": "0", "initial_margin": "0",
+        "status": "ACTIVE",
+    })
+    monkeypatch.setattr(dash, "_fetch_equity_history",
+                        lambda mc, lg: ([_et_epoch(1)], [79839.25]))
+    r = client.get("/api/account/m_daypl_histfb")
+    d = r.get_json()
+    assert d["day_pl_source"] == "history"
+    assert d["day_pl"] == pytest.approx(80425.84 - 79839.25)
+    assert d["day_pl_pct"] == pytest.approx((80425.84 - 79839.25) / 79839.25 * 100, abs=1e-3)
+
+
+# ───── BUG 2b: LAST RUN "Never" after deploy (in-memory reset) ───────────
+
+def test_status_last_run_falls_back_to_persisted_state(dash, client, monkeypatch,
+                                                       status_snapshot):
+    with dash.status_lock:
+        dash.bot_status["last_run_at"] = None
+    mc = types.SimpleNamespace(name="m_status_fb")
+    monkeypatch.setattr(dash.pipeline, "get_active_models", lambda: [mc])
+    monkeypatch.setattr(dash, "_load_model_state", lambda name: {
+        "run_count": 3, "history": [],
+        "last_run": "2026-07-21T13:37:29.991337",  # legacy naive-UTC form
+    })
+    d = client.get("/api/status").get_json()
+    assert d["last_run_at"] == "2026-07-21T13:37:29.991337+00:00"
+    assert d["last_run_source"] == "persisted_state"
+    assert JS_TZ_RE.search(d["last_run_at"])  # JS never guesses the offset
