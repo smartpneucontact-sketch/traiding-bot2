@@ -81,6 +81,42 @@ def _validate_model_name(model_name: str) -> bool:
         return False
     return model_name in pipeline.MODEL_REGISTRY
 
+def _utc_now_iso() -> str:
+    """Offset-aware UTC timestamp for status fields ('+00:00' suffix).
+
+    Every timestamp the status API emits must carry an explicit UTC offset.
+    The old naive datetime.now().isoformat() forced the dashboard JS to
+    GUESS that the string was UTC — wrong the moment the host TZ isn't
+    (e.g. TZ=America/New_York makes datetime.now() return ET wall time,
+    shifting every rendered LAST RUN by -4h).
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _day_pl_fields(equity, last_equity) -> dict:
+    """Day P&L delta + percent from Alpaca account equity fields.
+
+    day_pl = equity - last_equity (today's delta vs. previous close),
+    day_pl_pct = day_pl / last_equity * 100.
+
+    Guard: Alpaca's last_equity can be 0 or missing (fresh/reset paper
+    account, API hiccup). The daily delta is then UNKNOWN — return None for
+    both fields. Never fall back to the raw equity: that made the dashboard
+    show the full account equity as "Day P&L" (sum of equities on the top
+    tile) with a delta/0 = +Infinity percent.
+    """
+    try:
+        eq = float(equity)
+        le = float(last_equity)
+    except (TypeError, ValueError):
+        return {"day_pl": None, "day_pl_pct": None}
+    if not (le > 0) or not np.isfinite(le) or not np.isfinite(eq):
+        return {"day_pl": None, "day_pl_pct": None}
+    day_pl = eq - le
+    return {"day_pl": round(day_pl, 2),
+            "day_pl_pct": round(day_pl / le * 100.0, 4)}
+
+
 # In-memory store for live status
 bot_status = {
     "state": "idle",
@@ -90,11 +126,30 @@ bot_status = {
     "last_error": None,
     "next_run_at": None,
     "current_step": None,
-    "started_at": datetime.now().isoformat(),
+    "started_at": _utc_now_iso(),
     "total_runs": 0,
     "models": {},
 }
 status_lock = threading.Lock()
+
+# Live scheduler handle (set in __main__ after scheduler.start()). /api/status
+# reads the trading job's next_run_time through this on EVERY request — the
+# old code stamped next_run_at once at boot and never refreshed it, so after
+# that fire passed the dashboard kept showing a "NEXT RUN" in the past.
+_scheduler = None
+
+
+def _scheduler_next_run_iso() -> Optional[str]:
+    """Current next-fire time of the trading cron as offset-aware ISO."""
+    sched = _scheduler
+    if sched is None:
+        return None
+    try:
+        job = sched.get_job("trading_pipeline")
+        nrt = getattr(job, "next_run_time", None) if job is not None else None
+        return nrt.isoformat() if nrt else None
+    except Exception:
+        return None
 
 # Simple cache for Alpaca data (avoid hammering API)
 from collections import OrderedDict
@@ -521,7 +576,7 @@ def run_trading_pipeline(force=False, model_filter=None):
 
         with status_lock:
             bot_status["state"] = "idle"
-            bot_status["last_run_at"] = datetime.now().isoformat()
+            bot_status["last_run_at"] = _utc_now_iso()
             bot_status["last_run_status"] = "success"
             bot_status["last_run_duration"] = round(elapsed, 1)
             bot_status["last_error"] = None
@@ -536,7 +591,7 @@ def run_trading_pipeline(force=False, model_filter=None):
                         "state": "idle",
                         "run_count": state.get("run_count", 0),
                         "last_run_status": "success",
-                        "last_run_at": datetime.now().isoformat(),
+                        "last_run_at": _utc_now_iso(),
                         "last_run_duration": round(elapsed, 1),
                     })
 
@@ -549,7 +604,7 @@ def run_trading_pipeline(force=False, model_filter=None):
 
         with status_lock:
             bot_status["state"] = "error"
-            bot_status["last_run_at"] = datetime.now().isoformat()
+            bot_status["last_run_at"] = _utc_now_iso()
             bot_status["last_run_status"] = "error"
             bot_status["last_run_duration"] = round(elapsed, 1)
             bot_status["last_error"] = safe_error
@@ -563,6 +618,13 @@ def run_trading_pipeline(force=False, model_filter=None):
                     bot_status["models"][mn]["last_run_status"] = "error"
 
         logging.getLogger("dashboard").error(f"Pipeline failed: {full_error}")
+
+    # The job just fired, so the scheduler's next_run_time moved forward —
+    # refresh the stored value (it was previously frozen at boot).
+    nr = _scheduler_next_run_iso()
+    if nr:
+        with status_lock:
+            bot_status["next_run_at"] = nr
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -640,6 +702,11 @@ def _read_log(path: Path, tail: int = 200, level: str = None) -> tuple[str, int,
 def api_status():
     with status_lock:
         s = dict(bot_status)
+    # Always report the scheduler's LIVE next fire time — the stored value
+    # goes stale as soon as a fire passes (the "NEXT RUN in the past" bug).
+    live_next = _scheduler_next_run_iso()
+    if live_next:
+        s["next_run_at"] = live_next
     s["models"] = {}
     for mc in pipeline.get_active_models():
         state = _load_model_state(mc.name)
@@ -662,12 +729,17 @@ def api_account(model_name):
 
     def fetch():
         acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
+        equity = float(acct.get("equity", 0) or 0)
+        last_equity = float(acct.get("last_equity", 0) or 0)
         return {
-            "equity": float(acct.get("equity", 0)),
+            "equity": equity,
             "portfolio_value": float(acct.get("portfolio_value", 0)),
             "cash": float(acct.get("cash", 0)),
             "buying_power": float(acct.get("buying_power", 0)),
-            "last_equity": float(acct.get("last_equity", 0)),
+            "last_equity": last_equity,
+            # day_pl/day_pl_pct are None (not equity!) when last_equity is
+            # 0/missing — the UI must render "—" in that case.
+            **_day_pl_fields(equity, last_equity),
             "long_market_value": float(acct.get("long_market_value", 0)),
             "short_market_value": float(acct.get("short_market_value", 0)),
             "initial_margin": float(acct.get("initial_margin", 0)),
@@ -2368,7 +2440,7 @@ def trigger_run():
                 pipeline.run_pipeline(dry_run=True, force=True, model_filter=model_filter)
                 with status_lock:
                     bot_status["state"] = "idle"
-                    bot_status["last_run_at"] = datetime.now().isoformat()
+                    bot_status["last_run_at"] = _utc_now_iso()
                     bot_status["last_run_status"] = "success (dry)"
                     bot_status["current_step"] = None
             except Exception as e:
@@ -2528,13 +2600,16 @@ def apiv1_model_detail(model_name):
         # Account
         try:
             acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
+            _eq = float(acct.get("equity", 0) or 0)
+            _le = float(acct.get("last_equity", 0) or 0)
             result["account"] = {
-                "equity": float(acct.get("equity", 0)),
+                "equity": _eq,
                 "cash": float(acct.get("cash", 0)),
                 "portfolio_value": float(acct.get("portfolio_value", 0)),
                 "buying_power": float(acct.get("buying_power", 0)),
                 "long_market_value": float(acct.get("long_market_value", 0)),
-                "last_equity": float(acct.get("last_equity", 0)),
+                "last_equity": _le,
+                **_day_pl_fields(_eq, _le),
             }
         except Exception:
             result["account"] = None
@@ -2645,14 +2720,17 @@ def apiv1_account(model_name):
     logger = logging.getLogger("dashboard")
     try:
         acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
+        _eq = float(acct.get("equity", 0) or 0)
+        _le = float(acct.get("last_equity", 0) or 0)
         return _cors_response({
             "model": model_name,
-            "equity": float(acct.get("equity", 0)),
+            "equity": _eq,
             "cash": float(acct.get("cash", 0)),
             "portfolio_value": float(acct.get("portfolio_value", 0)),
             "buying_power": float(acct.get("buying_power", 0)),
             "long_market_value": float(acct.get("long_market_value", 0)),
-            "last_equity": float(acct.get("last_equity", 0)),
+            "last_equity": _le,
+            **_day_pl_fields(_eq, _le),
             "status": acct.get("status", "unknown"),
         })
     except Exception as e:
@@ -2809,7 +2887,13 @@ def ready():
     last = bot_status.get("last_run_at")
     if last:
         try:
-            age = (datetime.now() - datetime.fromisoformat(last)).total_seconds()
+            last_dt = datetime.fromisoformat(last)
+            # Aware-safe: last_run_at now carries '+00:00'; treat legacy
+            # naive strings as UTC. (Naive-vs-aware subtraction raises and
+            # used to silently DISABLE this staleness alert.)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - last_dt).total_seconds()
             if age > 4 * 86400:
                 problems.append(f"last run {age / 86400:.1f} days ago (stale)")
         except Exception:
@@ -3126,9 +3210,11 @@ function renderSlot(r) {
   const a = r.account || {};
   const positions = (r.positions && r.positions.positions) || [];
   const equity = +(a.equity ?? a.portfolio_value ?? 0);
-  const lastEquity = +(a.last_equity ?? equity);
-  const dayPnl = equity - lastEquity;
-  const dayPnlPct = lastEquity ? dayPnl / lastEquity : 0;
+  const lastEquity = +(a.last_equity ?? 0);
+  // Daily delta baseline unknown when last_equity is 0/missing — render a
+  // dash, never fall back to the raw equity (sum-of-equities bug).
+  const dayPnl = a.day_pl != null ? +a.day_pl : (lastEquity > 0 ? equity - lastEquity : null);
+  const dayPnlPct = dayPnl != null && lastEquity > 0 ? dayPnl / lastEquity : null;
 
   const s1M = pickEquitySeries(r.equity1M);
   const s1W = pickEquitySeries(r.equity1W);
@@ -3198,16 +3284,20 @@ async function refresh() {
     const grid = document.getElementById('slot-grid');
     grid.innerHTML = '';
 
-    let totalEquity = 0, totalDayPnl = 0;
+    let totalEquity = 0, totalDayPnl = 0, totalLastEq = 0, haveDayPnl = false;
     const allPositions = [];
     const slotResults = await Promise.all(all.map(m => loadSlot(m.name)));
     for (const r of slotResults) {
       grid.appendChild(renderSlot(r));
       if (r.active && r.account) {
         const eq = +(r.account.equity || 0);
-        const lastEq = +(r.account.last_equity || eq);
+        const lastEq = +(r.account.last_equity || 0);
         totalEquity += eq;
-        totalDayPnl += (eq - lastEq);
+        // Only slots with a known previous-close baseline contribute to
+        // the day P&L aggregate (last_equity 0/missing => unknown delta).
+        const dp = r.account.day_pl != null ? +r.account.day_pl
+                 : (lastEq > 0 ? eq - lastEq : null);
+        if (dp != null) { totalDayPnl += dp; totalLastEq += lastEq; haveDayPnl = true; }
       }
       const positions = (r.positions && r.positions.positions) || [];
       for (const p of positions) {
@@ -3227,9 +3317,9 @@ async function refresh() {
 
     document.getElementById('hero-equity').textContent = fmtUSDc(totalEquity);
     document.getElementById('hero-equity-sub').textContent = `across ${all.length} slot${all.length === 1 ? '' : 's'}`;
-    document.getElementById('hero-day-pnl').textContent = fmtUSD(totalDayPnl);
-    document.getElementById('hero-day-pnl').className = 'value ' + cls(totalDayPnl);
-    const dpp = totalEquity ? (totalDayPnl / (totalEquity - totalDayPnl)) : 0;
+    document.getElementById('hero-day-pnl').textContent = haveDayPnl ? fmtUSD(totalDayPnl) : '—';
+    document.getElementById('hero-day-pnl').className = 'value ' + (haveDayPnl ? cls(totalDayPnl) : 'neutral');
+    const dpp = haveDayPnl && totalLastEq > 0 ? (totalDayPnl / totalLastEq) : null;
     document.getElementById('hero-day-pnl-sub').textContent = fmtPct(dpp) + ' all slots combined';
 
     renderTopMovers(allPositions);
@@ -3828,16 +3918,24 @@ def index():
     // ── Data loaders ────────────────────────────────────
     async function loadGlobalSummary() {{
         // Aggregate across all models
-        let totalEquity = 0, totalPL = 0, totalPositions = 0;
+        let totalEquity = 0, totalPL = 0, totalLastEq = 0, havePL = false, totalPositions = 0;
         const modelSummaries = [];
 
         for (const m of MODELS) {{
             const acct = await api(`/api/account/${{m}}`);
             const pos = await api(`/api/positions/${{m}}`);
             if (acct) {{
-                const dayPL = acct.equity - acct.last_equity;
+                // day_pl is server-computed (equity - last_equity) and null
+                // when last_equity is 0/missing. Never fall back to raw
+                // equity — that rendered the SUM OF EQUITIES as "Day P&L"
+                // with a delta/0 = +Infinity percent.
+                const dayPL = acct.day_pl == null ? null : acct.day_pl;
                 totalEquity += acct.equity;
-                totalPL += dayPL;
+                if (dayPL != null) {{
+                    totalPL += dayPL;
+                    totalLastEq += acct.last_equity;
+                    havePL = true;
+                }}
                 modelSummaries.push({{ name: m, equity: acct.equity, dayPL, positions: pos ? pos.length : 0 }});
                 totalPositions += pos ? pos.length : 0;
             }}
@@ -3857,8 +3955,8 @@ def index():
             </div>
             <div class="metric">
                 <div class="label">Day P&L</div>
-                <div class="val ${{cls(totalPL)}}">${{fmt$(totalPL)}}</div>
-                <div class="sub">${{totalEquity > 0 ? fmtPct(totalPL / (totalEquity - totalPL) * 100) : '-'}}</div>
+                <div class="val ${{havePL ? cls(totalPL) : ''}}">${{havePL ? fmt$(totalPL) : '—'}}</div>
+                <div class="sub">${{havePL && totalLastEq > 0 ? fmtPct(totalPL / totalLastEq * 100) : '—'}}</div>
             </div>
             <div class="metric">
                 <div class="label">Total Positions</div>
@@ -3871,7 +3969,7 @@ def index():
             <div class="metric">
                 <div class="label">${{ms.name.toUpperCase()}} Equity</div>
                 <div class="val">${{fmt$(ms.equity)}}</div>
-                <div class="sub"><span class="${{cls(ms.dayPL)}}">${{fmt$(ms.dayPL)}} today</span> &middot; ${{ms.positions}} pos</div>
+                <div class="sub"><span class="${{cls(ms.dayPL)}}">${{ms.dayPL == null ? '—' : fmt$(ms.dayPL)}} today</span> &middot; ${{ms.positions}} pos</div>
             </div>`;
         }});
 
@@ -3910,14 +4008,19 @@ def index():
         // Account card
         html += '<div class="card"><h2>Account</h2>';
         if (acct) {{
-            const dayPL = acct.equity - acct.last_equity;
+            // Server-computed daily delta; null when last_equity is
+            // 0/missing (unknown baseline) -> render an em-dash, never the
+            // raw equity.
+            const dayPL = acct.day_pl == null ? null : acct.day_pl;
+            const dayPLCell = dayPL == null ? '&mdash;'
+                : fmt$(dayPL) + ' (' + fmtPct(acct.day_pl_pct) + ')';
             html += `
                 <table>
                     <tr><td>Equity</td><td class="text-right mono"><strong>${{fmt$(acct.equity)}}</strong></td></tr>
                     <tr><td>Cash</td><td class="text-right mono">${{fmt$(acct.cash)}}</td></tr>
                     <tr><td>Long Market Value</td><td class="text-right mono">${{fmt$(acct.long_market_value)}}</td></tr>
                     <tr><td>Buying Power</td><td class="text-right mono">${{fmt$(acct.buying_power)}}</td></tr>
-                    <tr><td>Day P&L</td><td class="text-right mono ${{cls(dayPL)}}">${{fmt$(dayPL)}} (${{fmtPct(acct.last_equity>0 ? dayPL/acct.last_equity*100 : 0)}})</td></tr>
+                    <tr><td>Day P&L</td><td class="text-right mono ${{cls(dayPL)}}">${{dayPLCell}}</td></tr>
                     <tr><td>Status</td><td class="text-right"><span class="badge badge-green">${{acct.status}}</span></td></tr>
                 </table>`;
         }} else {{
@@ -5120,9 +5223,12 @@ if __name__ == "__main__":
         logger.info(f"Cut-loss scanner enabled for: {[mc.name for mc in cutloss_models]}")
 
     scheduler.start()
+    _scheduler = scheduler  # expose to /api/status for LIVE next-run reads
 
     next_run = scheduler.get_job("trading_pipeline").next_run_time
-    bot_status["next_run_at"] = str(next_run)
+    # ISO with explicit offset ("2026-07-22T09:35:00-04:00") — str() produced
+    # a space-separated form some browsers refuse to parse.
+    bot_status["next_run_at"] = next_run.isoformat() if next_run else None
     logger.info(f"Scheduler started. Next run: {next_run}")
     logger.info(f"Dashboard: http://0.0.0.0:{PORT}")
     logger.info(f"Active models: {[m.name for m in pipeline.get_active_models()]}")
