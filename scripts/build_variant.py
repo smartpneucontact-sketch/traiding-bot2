@@ -71,13 +71,27 @@ REQUIRED_REFERENCE_KEYS = (
 
 # Research pool name → ComboConfig weight field, for sleeves that have a
 # ported live twin in core.combo_strategy. Anything not listed here is
-# UNPORTED and fails the process build loudly (e.g. xs_momentum_12_1,
-# needed by the 2026 bootstrap leg, still requires its port + parity).
+# UNPORTED and fails the process build loudly.
 PORTED_SLEEVES = {
     "xs_momentum_top30": "xs_mom_weight",
     "dual_momentum_vol": "dual_mom_weight",          # research pool name
     "dual_momentum_voltarget": "dual_mom_weight",    # bot-side alias
     "adaptive_voltarget_momentum": "adaptive_weight",
+    # xs_momentum_12_1 = strategies.xs_momentum(n_long=50) — the SAME 12-1
+    # signal as xs_momentum_top30, top-50. Ported 2026-07-25 as the second
+    # xs instance (ComboConfig.xs2_*) so a selection can blend BOTH xs
+    # parameterizations at once (2026 bootstrap leg). Parity:
+    # tests/test_xs2_parity.py (1e-9 vs research strategies.xs_momentum).
+    "xs_momentum_12_1": "xs2_weight",
+}
+
+# Non-weight ComboConfig knobs a pick pins down (research exp_rescore.py
+# REGISTRY params → live-twin fields). Set EXPLICITLY at build time even
+# where they match the ComboConfig class default, so the bundle does not
+# silently drift if a default ever changes.
+PORTED_SLEEVE_PARAMS = {
+    "xs_momentum_top30": {"xs_mom_top_n": 30},   # REGISTRY {"n_long": 30}
+    "xs_momentum_12_1": {"xs2_top_n": 50},       # REGISTRY {"n_long": 50}
 }
 
 SURVIVORSHIP_CAVEAT = (
@@ -392,7 +406,9 @@ def _build_candidate_x(reference: dict, sector_map: dict) -> dict:
 # Variant: process  (walk-forward annual re-selection, spec v2)
 # ═══════════════════════════════════════════════════════════════════════════
 
-REQUIRED_SELECTION_KEYS = ("year", "picks", "spec_sha256")
+# wf_select.py (research) emits "selection_year"; accept both spellings —
+# the loud-failure contract is about MISSING data, not key naming drift.
+REQUIRED_SELECTION_KEYS = ("picks", "spec_sha256")
 
 
 def _build_process(selection_json_path: str, reference: dict) -> dict:
@@ -420,12 +436,14 @@ def _build_process(selection_json_path: str, reference: dict) -> dict:
         _die(f"--selection-json is not valid JSON ({e}): {p}")
 
     missing = [k for k in REQUIRED_SELECTION_KEYS if k not in sel]
+    if "year" not in sel and "selection_year" not in sel:
+        missing.append("year|selection_year")
     if missing:
         _die(f"selection file {p} missing required keys: {missing}. "
-             f"Required: {list(REQUIRED_SELECTION_KEYS)} "
+             f"Required: {list(REQUIRED_SELECTION_KEYS)} + year|selection_year "
              f"(wf_select.py output schema).")
 
-    year = int(sel["year"])
+    year = int(sel.get("year", sel.get("selection_year")))
     picks = list(sel["picks"])
     if len(picks) != 3:
         _die(f"selection has {len(picks)} picks {picks}; process spec v2 "
@@ -439,10 +457,9 @@ def _build_process(selection_json_path: str, reference: dict) -> dict:
             f"no ported live twin in core/combo_strategy.py: {unported}.\n"
             f"Ported sleeves: {sorted(set(PORTED_SLEEVES))}.\n"
             "Porting + parity on the bot's data path is a DEPLOY "
-            "PREREQUISITE (plan Stream 3.2 — e.g. xs_momentum_12_1 needs a "
-            "small port now). Port the sleeve, add it to PORTED_SLEEVES "
-            "with its ComboConfig weight field, land its parity test, then "
-            "rebuild. Never substitute or drop a pick.")
+            "PREREQUISITE (plan Stream 3.2). Port the sleeve, add it to "
+            "PORTED_SLEEVES with its ComboConfig weight field, land its "
+            "parity test, then rebuild. Never substitute or drop a pick.")
 
     fields = [PORTED_SLEEVES[name] for name in picks]
     if len(set(fields)) != len(fields):
@@ -451,11 +468,17 @@ def _build_process(selection_json_path: str, reference: dict) -> dict:
              f"selection file / PORTED_SLEEVES mapping.")
 
     # Equal blend, no in-strategy overlays: the measured walk-forward
-    # object (process spec) is the PLAIN equal-weight blend at 2.0x.
+    # object (process_spec_v2) is the PLAIN equal-weight blend at 2.0x —
+    # NO book gate, NO SPY gate, NO freeze (the WS3 process curve carried
+    # none of them; the tier stop lives in the slot cutloss config, not
+    # this bundle). All three overlay flags are therefore forced False
+    # below and echoed in provenance["overlays_config"].
     kwargs = {f.name: 0.0 for f in dataclasses.fields(cs.ComboConfig)
               if f.name.endswith("_weight") and f.name != "min_position_weight"}
     for field in fields:
         kwargs[field] = 1.0 / 3.0
+    for name in picks:
+        kwargs.update(PORTED_SLEEVE_PARAMS.get(name, {}))
     kwargs.update(
         enable_spy_dd_gate=False,
         enable_book_dd_gate=False,
@@ -503,6 +526,21 @@ def _build_process(selection_json_path: str, reference: dict) -> dict:
         "overlays": "NONE in-strategy (plain equal blend = the measured "
                     "walk-forward object). Risk control: slot tier config + "
                     "PK1 kill DD<=-45%.",
+        # Verified against process_spec_v2 (sha 162bdb25...): the measured
+        # WS3 process curve had NO overlays, so every in-strategy gate is
+        # OFF. Echoed from the BUILT config, not hand-written, so a drift
+        # in the builder shows up here.
+        "overlays_config": {
+            "enable_spy_dd_gate": bool(config.enable_spy_dd_gate),
+            "enable_book_dd_gate": bool(config.enable_book_dd_gate),
+            "enable_drawdown_freeze": bool(config.enable_drawdown_freeze),
+            "tier_stop": "slot cutloss config, NOT this bundle (operator "
+                         "runs the process slot with enable_cutloss=false "
+                         "to match the measured object)",
+        },
+        "sleeve_params": {
+            name: dict(PORTED_SLEEVE_PARAMS.get(name, {})) for name in picks
+        },
         "target_leverage_required": 2.0,
         "protocol": "protocol_process.json",
     }

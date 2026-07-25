@@ -200,16 +200,19 @@ def test_refuses_primary_dir():
 
 
 def test_process_fails_loudly_on_unported_sleeve(tmp_path):
-    sel = tmp_path / "selection_2026.json"
+    """mean_reversion_5d is a real pool member (process_spec_v2) with no
+    ported live twin. (xs_momentum_12_1, the original fixture here, was
+    ported 2026-07-25 as the xs2 sleeve — see tests/test_xs2_parity.py.)"""
+    sel = tmp_path / "selection_2027.json"
     sel.write_text(json.dumps({
-        "year": 2026,
+        "year": 2027,
         "picks": ["dual_momentum_vol", "xs_momentum_top30",
-                  "xs_momentum_12_1"],
+                  "mean_reversion_5d"],
         "spec_sha256": "deadbeef"}))
     r = _run("--variant", "process", "--selection-json", str(sel), "--dry")
     assert r.returncode == 2
     assert "PORTING PREREQUISITE NOT MET" in r.stderr
-    assert "xs_momentum_12_1" in r.stderr
+    assert "mean_reversion_5d" in r.stderr
 
 
 def test_process_requires_selection_and_schema(tmp_path):

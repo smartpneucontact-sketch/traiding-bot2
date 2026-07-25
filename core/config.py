@@ -222,9 +222,10 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
                         "year's selected sleeves (equal 1/3 each), from the frozen "
                         "21-name pool. Bootstrap 2026 leg (already ledgered): "
                         "dual_momentum_vol + xs_momentum_top30 + xs_momentum_12_1 "
-                        "(the latter needs a bot port before deploy — the build "
-                        "fails loudly on unported sleeves). No in-strategy gates: "
-                        "the measured walk-forward object is the plain blend.",
+                        "(the latter ported 2026-07-25 as the second xs instance, "
+                        "ComboConfig.xs2_* — same 12-1 signal, top-50; the build "
+                        "still fails loudly on unported sleeves). No in-strategy "
+                        "gates: the measured walk-forward object is the plain blend.",
         "features": "Inline raw-OHLCV computation per sleeve. No ML model.",
         "portfolio": "Depends on the year's picks (~30-90 names), 21-trading-day "
                      "rebalance, target_leverage 2.0x on the slot (comparability "

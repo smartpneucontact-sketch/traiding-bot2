@@ -465,8 +465,10 @@ class ComboConfig:
     #
     # xs_mom_top_n=30 is the primary's xs_momentum_top30; the catalog's
     # `xs_momentum_12_1` variant is the SAME signal with n_long=50
-    # (verified: exp_rescore.py REGISTRY, {"n_long": 50}) — set
-    # xs_mom_top_n=50 to trade it (needed by the Stream-3 process slot).
+    # (verified: exp_rescore.py REGISTRY, {"n_long": 50}). A blend that
+    # needs BOTH instances at once (the Stream-3 process slot's 2026
+    # selection) uses the second instance fields xs2_weight / xs2_top_n
+    # below — never repurpose xs_mom_top_n for that.
     xs_mom_weight: float = 1.0 / 3.0
     xs_mom_top_n: int = 30
     dual_mom_weight: float = 1.0 / 3.0
@@ -501,6 +503,18 @@ class ComboConfig:
     # market_sector mode then degrades to market-only betas per spec.
     # Variant bundles must ship their sector map here (build_variant.py).
     residual_sector_map: dict | None = None
+
+    # Sleeve 5: SECOND xs-momentum instance (Stream-3 process port,
+    # 2026-07-25) — the research catalog's `xs_momentum_12_1` =
+    # strategies.xs_momentum(n_long=50), the SAME 12-1 signal as the
+    # primary xs sleeve but top-50. Needed because the process slot's 2026
+    # selection blends xs_momentum_top30 AND xs_momentum_12_1 at once.
+    # DISABLED by default: xs2_weight=0.0 reproduces pre-port behavior
+    # exactly, and both defaults are class-level immutables, so bundles
+    # pickled BEFORE these fields existed resolve them via the class
+    # attribute (same back-compat pattern as the residual_* fields).
+    xs2_weight: float = 0.0
+    xs2_top_n: int = 50
 
     # SPY drawdown gate (soft, in-strategy). Disabled in the 2026-06
     # calibration: stacked on the book gate it costs 0.40pp/mo for only
@@ -544,12 +558,14 @@ class ComboConfig:
 
     def __post_init__(self):
         total = (self.xs_mom_weight + self.dual_mom_weight
-                 + self.adaptive_weight + self.residual_weight)
+                 + self.adaptive_weight + self.residual_weight
+                 + self.xs2_weight)
         if abs(total - 1.0) > 1e-6:
             raise ValueError(
                 f"ComboConfig sleeve weights sum to {total:.6f}, expected 1.0. "
                 f"Got xs={self.xs_mom_weight}, dual={self.dual_mom_weight}, "
-                f"adapt={self.adaptive_weight}, residual={self.residual_weight}."
+                f"adapt={self.adaptive_weight}, residual={self.residual_weight}, "
+                f"xs2={self.xs2_weight}."
             )
 
 
@@ -580,7 +596,10 @@ class ComboStrategy:
         # `residual_weight` is getattr-guarded: bundles pickled before the
         # 2026-07-18 residual port lack the field on the instance, and the
         # class-level dataclass default (0.0) reproduces pre-port behavior.
+        # `xs2_weight` (2026-07-25 second-xs-instance port) follows the
+        # identical back-compat pattern.
         res_weight = getattr(c, "residual_weight", 0.0)
+        xs2_weight = getattr(c, "xs2_weight", 0.0)
 
         w_xs = (_xs_momentum_weights(stock_px, n_long=c.xs_mom_top_n)
                 if c.xs_mom_weight != 0.0 else {})
@@ -608,6 +627,13 @@ class ComboStrategy:
                 lookback_long=getattr(c, "residual_lookback_long", 252),
                 lookback_skip=getattr(c, "residual_lookback_skip", 21),
             )
+        # Second xs-momentum instance (xs_momentum_12_1 = same signal,
+        # top_n=50). Reuses the EXISTING xs sleeve logic — only n_long
+        # differs; the primary xs path above is untouched.
+        w_xs2: dict[str, float] = {}
+        if xs2_weight != 0.0:
+            w_xs2 = _xs_momentum_weights(
+                stock_px, n_long=getattr(c, "xs2_top_n", 50))
 
         combined: dict[str, float] = {}
         # Per-sleeve post-blend contributions (sleeve_weight × sleeve's own
@@ -617,9 +643,9 @@ class ComboStrategy:
         # that matches what the backtest's per-sleeve references measure.
         sleeve_contrib: dict[str, dict[str, float]] = {}
         # The three legacy sleeve names always appear in diagnostics (the
-        # attribution layer keys off them); "residual_momentum" appears
-        # only when the sleeve is enabled, so primary-slot diagnostics are
-        # unchanged by the port.
+        # attribution layer keys off them); "residual_momentum" and
+        # "xs_momentum_2" appear only when their sleeve is enabled, so
+        # primary-slot diagnostics are unchanged by either port.
         sleeve_specs = [
             ("xs_momentum", w_xs, c.xs_mom_weight),
             ("dual_momentum", w_dual, c.dual_mom_weight),
@@ -627,6 +653,8 @@ class ComboStrategy:
         ]
         if res_weight != 0.0:
             sleeve_specs.append(("residual_momentum", w_res, res_weight))
+        if xs2_weight != 0.0:
+            sleeve_specs.append(("xs_momentum_2", w_xs2, xs2_weight))
         for name, sleeve, sleeve_weight in sleeve_specs:
             contrib: dict[str, float] = {}
             for sym, w in sleeve.items():
