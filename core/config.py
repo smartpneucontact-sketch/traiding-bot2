@@ -77,6 +77,30 @@ class ModelConfig:
     # accounts default to ~2.37x buying_power; orders will fail if the
     # requested leverage exceeds Alpaca's available buying power.
     target_leverage: float = 1.0
+    # ── Rebalance execution style (2026-07-25, Task B) ────────────────────
+    # Measured live cost of plain MARKET orders in mid-caps: +29.9 bp/side
+    # vs arrival (91 fills, 2026-07-20/21) against the 5 bp research
+    # assumption. "marketable_limit" places REBALANCE orders as LIMIT day
+    # orders at arrival*(1 + buffer) for buys / *(1 - buffer) for sells to
+    # cap the crossing cost; cutloss/scanner sells ALWAYS stay MARKET —
+    # risk reduction is never delayed.
+    #
+    # SEQUENCING — DO NOT ENABLE FOR ANY SLOT YET: the default "market"
+    # must stay in force through the Monday 2026-07-27 09:35 process-slot
+    # rebalance, which is the first clean vs-open market-order baseline
+    # read. Flipping any slot to "marketable_limit" is a deliberate
+    # post-Monday decision, taken after that baseline is journaled.
+    exec_style: str = "market"          # "market" (default, byte-identical
+                                        # legacy path) | "marketable_limit"
+    # Marketable-limit price buffer in bps past arrival (buys above /
+    # sells below) — wide enough to cross the spread, capping the cost.
+    exec_limit_buffer_bps: float = 10.0
+    # Seconds to wait for limit fills before exec_timeout_action applies.
+    exec_fill_timeout_s: int = 120
+    # What to do with orders still unfilled at timeout: "market" =
+    # cancel-and-market-replace the unfilled remainder; "cancel" = cancel
+    # and leave unfilled (reconciliation reports the shortfall).
+    exec_timeout_action: str = "market"
 
     def __post_init__(self):
         if self.state_path is None:

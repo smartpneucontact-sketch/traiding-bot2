@@ -17,14 +17,26 @@ Three entry points:
   `target_weights` (conviction sizing) — equal-weight is just the
   fallback if `target_weights` is None.
 
+Execution style (2026-07-25): `ModelConfig.exec_style` selects how
+REBALANCE orders are placed. "market" (default) is the legacy path,
+byte-identical to before. "marketable_limit" places LIMIT day orders at
+arrival*(1 + buffer) for buys / *(1 - buffer) for sells (arrival from the
+same `fetch_snapshots` decision-price capture), polls up to
+`exec_fill_timeout_s`, then applies `exec_timeout_action` per unfilled
+order. Cutloss/scanner sells and `liquidate_all_positions` ALWAYS stay
+MARKET — risk reduction is never delayed. Every limit-path failure for a
+symbol falls back to a market order for that symbol.
+
 All Alpaca I/O goes through `core.alpaca.alpaca_request`.
 """
 
 from __future__ import annotations
 
+import math
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from core.alpaca import (
     _make_alpaca_headers, _to_alpaca_symbol, alpaca_request,
@@ -36,6 +48,209 @@ if TYPE_CHECKING:
     from core.config import ModelConfig
     from core.journal import TradeJournal
     from core.run_report import RunReport
+
+
+# Alpaca order states after which no further fills can arrive.
+_TERMINAL_ORDER_STATES = {"filled", "canceled", "expired", "rejected",
+                          "suspended", "replaced"}
+
+
+@dataclass
+class ExecTradeRecord(TradeRecord):
+    """TradeRecord + marketable-limit execution telemetry.
+
+    Defined HERE (not core.journal) so the default market path keeps
+    journaling plain TradeRecord rows byte-identically. Only slots with
+    exec_style="marketable_limit" emit this wider schema;
+    `TradeJournal.log_trade` serializes subclasses via asdict() and its
+    CSV schema-roll handles the wider header.
+    """
+    exec_style: Optional[str] = None            # "marketable_limit" | "market" (fallback)
+    limit_price: Optional[float] = None         # submitted limit price (None for market)
+    timed_out: Optional[bool] = None            # unfilled at exec_fill_timeout_s
+    replaced_to_market: Optional[bool] = None   # remainder re-sent as a market order
+    replacement_order_id: Optional[str] = None  # Alpaca id of the replacement order
+
+
+def _limit_price_for(side: str, arrival: float, buffer_bps: float) -> float:
+    """Marketable-limit price: arrival plus `buffer_bps` in the crossing
+    direction (buys above arrival, sells below), rounded to the penny
+    TOWARD marketability (buys up, sells down) so rounding never makes
+    the order less likely to fill. Floors at $0.01 — Alpaca rejects
+    non-positive limit prices.
+    """
+    frac = float(buffer_bps) / 1e4
+    raw = arrival * (1.0 + frac) if side == "buy" else arrival * (1.0 - frac)
+    cents = round(raw * 100.0, 6)  # shave float artifacts pre-ceil/floor
+    lp = (math.ceil(cents) if side == "buy" else math.floor(cents)) / 100.0
+    return max(lp, 0.01)
+
+
+def _apply_order_fill(trade: TradeRecord, order_state: dict) -> None:
+    """Copy status / filled qty / filled avg price from an Alpaca order
+    payload onto a trade record (same semantics as the market-path poll)."""
+    trade.order_status = order_state.get("status", trade.order_status)
+    fq = order_state.get("filled_qty")
+    fp = order_state.get("filled_avg_price")
+    if fq and fq != "0":
+        trade.shares = float(fq)
+    if fp and fp != "0":
+        trade.fill_price = float(fp)
+
+
+def _compute_slippage(trade: TradeRecord) -> None:
+    """Slippage vs the backtest's assumed fill (same-day open) and vs the
+    arrival price. Sign convention: +1 buy / -1 sell, so positive bps =
+    execution cost either direction (a sell filling ABOVE the reference
+    is favorable → negative). No-op when fill_price is missing."""
+    try:
+        if trade.fill_price:
+            sign = 1.0 if trade.side == "buy" else -1.0
+            if trade.reference_open:
+                trade.slippage_bps = round(
+                    sign * (trade.fill_price / trade.reference_open - 1.0)
+                    * 1e4, 2)
+            if trade.decision_price:
+                trade.slippage_vs_arrival_bps = round(
+                    sign * (trade.fill_price / trade.decision_price - 1.0)
+                    * 1e4, 2)
+    except Exception:
+        pass
+
+
+def _cancel_order_and_get_final(trade: TradeRecord, mc: "ModelConfig",
+                                logger) -> dict:
+    """Cancel an open order and return its final state (fills applied to
+    `trade`). A failed cancel (e.g. the order filled in the race) is not
+    an error — the follow-up poll reports whatever actually happened."""
+    try:
+        alpaca_request("DELETE", f"v2/orders/{trade.order_id}", mc,
+                       logger=logger)
+    except Exception as e:
+        logger.warning(
+            f"    Cancel request failed for {trade.symbol} "
+            f"({trade.order_id}): {e} — polling final state anyway")
+    final = poll_order_status(trade.order_id, mc, logger, max_wait=5.0)
+    _apply_order_fill(trade, final)
+    return final
+
+
+def _cancel_and_market_replace(trade: TradeRecord, order: dict,
+                               mc: "ModelConfig", logger) -> bool:
+    """Timeout action "market": cancel the unfilled limit order and re-send
+    the unfilled remainder as a MARKET order. Returns True iff a
+    replacement order was actually submitted (False when the limit order
+    filled during the cancel race or the remainder is negligible)."""
+    _cancel_order_and_get_final(trade, mc, logger)
+    if trade.order_status == "filled":
+        return False  # filled while we were cancelling — nothing to replace
+
+    prev_qty = float(trade.shares or 0.0)
+    prev_px = float(trade.fill_price or 0.0)
+    alpaca_sym = _to_alpaca_symbol(trade.symbol)
+
+    if order["action"] == "sell":
+        # Full exit: DELETE closes whatever position remains after any
+        # partial limit fills — exactly the unfilled remainder.
+        resp = alpaca_request(
+            "DELETE", f"v2/positions/{alpaca_sym}", mc, logger=logger) or {}
+    else:
+        filled_notional = prev_qty * prev_px
+        remainder = round(float(order["notional"]) - filled_notional, 2)
+        if remainder < 1.0:
+            return False  # effectively filled; nothing worth replacing
+        resp = alpaca_request("POST", "v2/orders", mc, {
+            "symbol": alpaca_sym,
+            "notional": remainder,
+            "side": order["side"],
+            "type": "market",
+            "time_in_force": "day",
+        }, logger=logger) or {}
+
+    trade.replaced_to_market = True
+    trade.replacement_order_id = resp.get("id")
+    logger.info(
+        f"    TIMEOUT->MKT {trade.symbol}: limit unfilled at timeout, "
+        f"remainder replaced as market (order_id={trade.replacement_order_id})")
+
+    if trade.replacement_order_id:
+        final = poll_order_status(trade.replacement_order_id, mc, logger)
+        mq = float(final.get("filled_qty") or 0.0)
+        mp = float(final.get("filled_avg_price") or 0.0)
+        if mq > 0:
+            total = prev_qty + mq
+            trade.shares = total
+            if mp > 0:
+                if prev_qty > 0 and prev_px > 0:
+                    # Blend partial limit fill with the market remainder.
+                    trade.fill_price = round(
+                        (prev_qty * prev_px + mq * mp) / total, 6)
+                else:
+                    trade.fill_price = mp
+        trade.order_status = final.get("status", trade.order_status)
+    return True
+
+
+def _resolve_limit_orders(limit_pending: list[tuple[TradeRecord, dict]],
+                          mc: "ModelConfig", logger,
+                          timeout_s: float, timeout_action: str) -> dict:
+    """Poll submitted marketable-limit orders until all reach a terminal
+    state or `timeout_s` elapses, then apply `timeout_action` per order
+    still unfilled ("market" = cancel-and-market-replace the remainder;
+    anything else = cancel and leave unfilled — reconciliation reports the
+    shortfall). Failure-tolerant per order: an error resolving one order
+    never blocks the others.
+
+    Returns {"n_timeout_replaced": int, "n_unfilled_cancelled": int}.
+    """
+    n_timeout_replaced = 0
+    n_unfilled_cancelled = 0
+    deadline = time.monotonic() + max(float(timeout_s or 0), 0.0)
+    pending = list(limit_pending)
+
+    while pending:
+        still_open: list[tuple[TradeRecord, dict]] = []
+        for trade, order in pending:
+            try:
+                state = alpaca_request("GET", f"v2/orders/{trade.order_id}", mc)
+                _apply_order_fill(trade, state)
+                if state.get("status") not in _TERMINAL_ORDER_STATES:
+                    still_open.append((trade, order))
+            except Exception:
+                still_open.append((trade, order))  # retry until deadline
+        pending = still_open
+        if not pending:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(2.0, remaining))
+
+    if pending:
+        logger.warning(
+            f"  [LIMIT] {len(pending)} order(s) unfilled at "
+            f"{timeout_s}s timeout — action={timeout_action}")
+    for trade, order in pending:
+        trade.timed_out = True
+        try:
+            if timeout_action == "market":
+                if _cancel_and_market_replace(trade, order, mc, logger):
+                    n_timeout_replaced += 1
+            else:
+                _cancel_order_and_get_final(trade, mc, logger)
+                if trade.order_status != "filled":
+                    n_unfilled_cancelled += 1
+                    logger.warning(
+                        f"    TIMEOUT CANCEL {trade.symbol}: limit order "
+                        f"cancelled unfilled (status={trade.order_status}) — "
+                        f"shortfall reported in reconciliation")
+        except Exception as e:
+            logger.warning(
+                f"    Timeout action failed for {trade.symbol}: {e} — "
+                f"order left as-is (status={trade.order_status})")
+
+    return {"n_timeout_replaced": n_timeout_replaced,
+            "n_unfilled_cancelled": n_unfilled_cancelled}
 
 
 def fetch_inactive_assets(symbols: list[str], mc: "ModelConfig",
@@ -493,6 +708,23 @@ def rebalance_portfolio(
         snapshots = {}
 
     # -- Execute orders + log each trade ----------------------------------
+    # Marketable-limit execution (opt-in per slot, default "market" keeps
+    # the legacy path byte-identical). Applies ONLY to this rebalance flow
+    # — cutloss/scanner sells and liquidate_all_positions stay MARKET.
+    exec_style = str(getattr(mc, "exec_style", "market") or "market")
+    limit_mode = exec_style == "marketable_limit"
+    limit_buffer = float(getattr(mc, "exec_limit_buffer_bps", 10.0) or 0.0)
+    limit_timeout = float(getattr(mc, "exec_fill_timeout_s", 120) or 0)
+    timeout_action = str(getattr(mc, "exec_timeout_action", "market") or "market")
+    # Limit orders awaiting fills: journaled AFTER resolution so the row
+    # carries the final outcome (fill/timeout/replacement).
+    limit_pending: list[tuple[TradeRecord, dict]] = []
+    if limit_mode:
+        rb_data["exec_style"] = exec_style
+        logger.info(
+            f"  Execution: MARKETABLE-LIMIT (buffer {limit_buffer:.0f}bp, "
+            f"timeout {limit_timeout:.0f}s, on-timeout={timeout_action})")
+
     logger.info(f"\n  Executing {len(orders)} orders...")
     executed = 0
     failed = 0
@@ -510,7 +742,11 @@ def rebalance_portfolio(
         trade_ts = datetime.now(timezone.utc).isoformat()
         trade_id = f"{mc.name}_{trade_ts.replace(':', '').replace('-', '')}_{sym}_{order['side']}"
 
-        trade = TradeRecord(
+        # In limit mode the wider ExecTradeRecord schema is journaled (so
+        # market-fallback rows still carry exec_style="market"); the
+        # default path keeps emitting plain TradeRecord rows unchanged.
+        record_cls = ExecTradeRecord if limit_mode else TradeRecord
+        trade = record_cls(
             trade_id=trade_id,
             run_id=run_id,
             model=mc.name,
@@ -538,10 +774,73 @@ def rebalance_portfolio(
             prev_close=(snapshots.get(sym) or {}).get("prev_close"),
         )
 
+        placed_limit = False
         try:
             order_ok = False
             alpaca_sym = _to_alpaca_symbol(sym)
-            if order["action"] == "sell":
+
+            # Marketable-limit attempt (rebalance orders only). ANY failure
+            # here — missing arrival snapshot, placement exception, venue
+            # reject — falls through to the market path for this symbol.
+            if limit_mode:
+                trade.exec_style = "market"  # overwritten on limit success
+                arrival = (snapshots.get(sym) or {}).get("arrival")
+                if not arrival:
+                    logger.info(
+                        f"    LIMIT->MKT {sym}: no arrival snapshot — "
+                        f"market order")
+                else:
+                    try:
+                        lp = _limit_price_for(
+                            order["side"], float(arrival), limit_buffer)
+                        payload = {
+                            "symbol": alpaca_sym,
+                            "side": order["side"],
+                            "type": "limit",
+                            "limit_price": lp,
+                            "time_in_force": "day",
+                        }
+                        if order["action"] == "sell":
+                            # Full exit: qty-based limit sell of the whole
+                            # position (the market path uses DELETE
+                            # /v2/positions, which can't carry a price).
+                            payload["qty"] = order["qty"]
+                        else:
+                            payload["notional"] = round(order["notional"], 2)
+                        resp = alpaca_request(
+                            "POST", "v2/orders", mc, payload, logger=logger
+                        ) or {}
+                        status = resp.get("status", "submitted")
+                        if (status in ("rejected", "canceled", "expired")
+                                or not resp.get("id")):
+                            logger.warning(
+                                f"    LIMIT->MKT {sym}: limit order {status} "
+                                f"({resp.get('reject_reason', 'no id')}) — "
+                                f"market fallback")
+                        else:
+                            placed_limit = True
+                            order_ok = True
+                            trade.order_id = resp.get("id")
+                            trade.order_status = status
+                            trade.order_type = "limit"
+                            trade.exec_style = "marketable_limit"
+                            trade.limit_price = lp
+                            limit_pending.append((trade, order))
+                            logger.info(
+                                f"    OK  LIMIT {order['trade_action'].upper():14s} "
+                                f"{sym:6s}: {order['side']} @ ${lp:.2f} "
+                                f"(arrival ${float(arrival):.2f} "
+                                f"{'+' if order['side'] == 'buy' else '-'}"
+                                f"{limit_buffer:.0f}bp), "
+                                f"order_id={trade.order_id}")
+                    except Exception as e:
+                        logger.warning(
+                            f"    LIMIT->MKT {sym}: limit placement failed "
+                            f"({e}) — market fallback")
+
+            if placed_limit:
+                pass
+            elif order["action"] == "sell":
                 resp = alpaca_request(
                     "DELETE", f"v2/positions/{alpaca_sym}", mc, logger=logger
                 )
@@ -621,44 +920,44 @@ def rebalance_portfolio(
             report.add_error(f"Order failed: {order['trade_action']} {sym} - {e}")
             failed += 1
 
-        # Poll for final order status (fills, price, qty)
-        if trade.order_id and trade.order_status not in (
+        # Poll for final order status (fills, price, qty). Limit-pending
+        # orders skip this quick poll — they get the dedicated batch poll
+        # (up to exec_fill_timeout_s) right after the placement loop.
+        if not placed_limit and trade.order_id and trade.order_status not in (
             "failed", "rejected", "canceled", "expired"
         ):
             try:
                 final = poll_order_status(trade.order_id, mc, logger)
-                trade.order_status = final.get("status", trade.order_status)
-                filled_qty = final.get("filled_qty")
-                filled_price = final.get("filled_avg_price")
-                if filled_qty and filled_qty != "0":
-                    trade.shares = float(filled_qty)
-                if filled_price and filled_price != "0":
-                    trade.fill_price = float(filled_price)
+                _apply_order_fill(trade, final)
             except Exception:
                 pass
 
-        # Slippage vs the backtest's assumed fill (same-day open) and vs
-        # the arrival price. Sign convention: +1 buy / -1 sell, so positive
-        # bps = execution cost either direction (a sell filling ABOVE the
-        # reference is favorable → negative).
-        try:
-            if trade.fill_price:
-                sign = 1.0 if trade.side == "buy" else -1.0
-                if trade.reference_open:
-                    trade.slippage_bps = round(
-                        sign * (trade.fill_price / trade.reference_open - 1.0)
-                        * 1e4, 2)
-                if trade.decision_price:
-                    trade.slippage_vs_arrival_bps = round(
-                        sign * (trade.fill_price / trade.decision_price - 1.0)
-                        * 1e4, 2)
-        except Exception:
-            pass
+        _compute_slippage(trade)
 
-        journal.log_trade(trade)
+        # Limit-pending rows are journaled after resolution so the row
+        # carries the final outcome (fill / timed_out / replacement).
+        if not placed_limit:
+            journal.log_trade(trade)
         submitted_trades.append(trade)
         trade_count += 1
         time.sleep(0.1)
+
+    # -- Resolve marketable-limit orders (poll → timeout action) ----------
+    limit_stats = {"n_timeout_replaced": 0, "n_unfilled_cancelled": 0}
+    if limit_pending:
+        try:
+            limit_stats = _resolve_limit_orders(
+                limit_pending, mc, logger,
+                timeout_s=limit_timeout, timeout_action=timeout_action)
+        except Exception as e:
+            logger.warning(f"  Limit-order resolution failed (non-fatal): {e}")
+        for l_trade, _l_order in limit_pending:
+            _compute_slippage(l_trade)
+            try:
+                journal.log_trade(l_trade)
+            except Exception as e:
+                logger.warning(
+                    f"  Journal append failed for {l_trade.symbol}: {e}")
 
     rb_data.update({"executed": executed, "failed": failed})
     report.set("trade_log_summary", {
@@ -722,6 +1021,13 @@ def rebalance_portfolio(
             "book": None,
             "computed_at": datetime.now(timezone.utc).isoformat(),
         }
+        # Marketable-limit outcome counters — only present in limit mode so
+        # the default market-path report stays byte-identical.
+        if limit_mode:
+            reconciliation["flow"]["n_timeout_replaced"] = (
+                limit_stats["n_timeout_replaced"])
+            reconciliation["flow"]["n_unfilled_cancelled"] = (
+                limit_stats["n_unfilled_cancelled"])
         try:
             positions_after = get_positions(mc, logger)
             achieved_gross = sum(
