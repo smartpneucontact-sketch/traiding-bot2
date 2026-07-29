@@ -1,0 +1,31 @@
+[repro] margin-0: mm=4.2758% calmar=1.233776 dd=-41.7449% events={'tier1': 14, 'tier2': 0, 'tier3': 0}
+[repro] PASS — ledgered ASM_Bst_BTF1 (margin 0) reproduced
+[candidate] ASM_Bst_BTF1_tc25    dev geo=+2.864%/mo calmar=0.931
+[candidate] ASM_Bst_BTF1_tc30    dev geo=+2.774%/mo calmar=0.888
+[candidate] ASM_Bst_BTF1_tc50    dev geo=+2.415%/mo calmar=0.708
+[gate champion] |dSR|=0.00e+00 |dCAGR|=0.00e+00 vs pit.csv combo_v2_baseline_2x full
+[champion] combo_v2_2x_tc50         full geo=+3.097%/mo (0s)
+[champion] combo_v2_2x_tc50         dev  geo=+2.608%/mo (0s)
+[champion] combo_v2_1.5x_tc50       full geo=+2.834%/mo (0s)
+[champion] combo_v2_1.5x_tc50       dev  geo=+2.340%/mo (0s)
+[champion] combo_v2_1x_tc50         full geo=+2.199%/mo (0s)
+[champion] combo_v2_1x_tc50         dev  geo=+1.842%/mo (0s)
+[wf] frozen spec loaded, sha b75aa7e7fe34eec1… (NOT modified)
+[gate wf 2x] |dSR|=0.00e+00 |dgeo|=2.78e-17 vs wf_results.csv
+[wf] wf_process_2x_tc25     2019on geo=+2.957%/mo (0s)
+[wf] wf_process_2x_tc30     2019on geo=+2.847%/mo (0s)
+[wf] wf_process_2x_tc50     2019on geo=+2.406%/mo (0s)
+[gate wf 1.5x] |dSR|=0.00e+00 |dgeo|=2.78e-17 vs wf_results.csv
+[wf] wf_process_1.5x_tc25   2019on geo=+2.571%/mo (0s)
+[wf] wf_process_1.5x_tc30   2019on geo=+2.487%/mo (0s)
+[wf] wf_process_1.5x_tc50   2019on geo=+2.153%/mo (0s)
+wrote /Users/arsenkhanguieldyan/Documents/Trading/Traiding 11/results/v7/tc_recal.csv (48 rows)
+wrote /Users/arsenkhanguieldyan/Documents/Trading/Traiding 11/results/v7/RECAL_REPORT.md
+
+== revised bracket (2x, geo %/mo) ==
+  combo_v2_2x      full         tc5 +3.68 | tc25 +3.42 | tc30 +3.36
+  combo_v2_2x      2019on       tc5 +4.44 | tc25 +4.15 | tc30 +4.08
+  wf_process_2x    2019on       tc5 +3.40 | tc25 +2.96 | tc30 +2.85
+  ASM_Bst_BTF1     dev          tc5 +3.22 | tc25 +2.86 | tc30 +2.77
+
+total 1.0 min

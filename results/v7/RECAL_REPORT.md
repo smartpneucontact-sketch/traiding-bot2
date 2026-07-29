@@ -73,28 +73,40 @@ difference vs the tc=5 reference row. **0 row(s) flagged >30%.**
 |---|---|---|---|---|---|---|---|
 | ASM_Bst_BTF1 | dev | 25 | 20.8 | +0.360 | +0.347 | +3.6% |  |
 | ASM_Bst_BTF1 | dev | 30 | 20.8 | +0.450 | +0.434 | +3.6% |  |
+| ASM_Bst_BTF1 | dev | 50 | 20.8 | +0.809 | +0.781 | +3.5% |  |
 | combo_v2_2x | full | 25 | 15.1 | +0.260 | +0.252 | +3.1% |  |
 | combo_v2_2x | 2019on | 25 | 16.7 | +0.289 | +0.278 | +4.0% |  |
 | combo_v2_2x | dev | 25 | 14.1 | +0.242 | +0.236 | +2.8% |  |
 | combo_v2_2x | full | 30 | 15.1 | +0.325 | +0.315 | +3.1% |  |
 | combo_v2_2x | 2019on | 30 | 16.7 | +0.361 | +0.347 | +4.0% |  |
 | combo_v2_2x | dev | 30 | 14.1 | +0.303 | +0.295 | +2.8% |  |
+| combo_v2_2x | full | 50 | 15.1 | +0.585 | +0.567 | +3.1% |  |
+| combo_v2_2x | 2019on | 50 | 16.7 | +0.650 | +0.625 | +4.0% |  |
+| combo_v2_2x | dev | 50 | 14.1 | +0.545 | +0.530 | +2.9% |  |
 | combo_v2_1.5x | full | 25 | 12.3 | +0.211 | +0.205 | +2.8% |  |
 | combo_v2_1.5x | dev | 25 | 11.4 | +0.194 | +0.190 | +2.5% |  |
 | combo_v2_1.5x | full | 30 | 12.3 | +0.264 | +0.257 | +2.8% |  |
 | combo_v2_1.5x | dev | 30 | 11.4 | +0.243 | +0.237 | +2.5% |  |
+| combo_v2_1.5x | full | 50 | 12.3 | +0.475 | +0.462 | +2.8% |  |
+| combo_v2_1.5x | dev | 50 | 11.4 | +0.437 | +0.427 | +2.5% |  |
 | combo_v2_1x | full | 25 | 8.2 | +0.140 | +0.137 | +2.1% |  |
 | combo_v2_1x | dev | 25 | 7.6 | +0.129 | +0.126 | +1.9% |  |
 | combo_v2_1x | full | 30 | 8.2 | +0.175 | +0.171 | +2.1% |  |
 | combo_v2_1x | dev | 30 | 7.6 | +0.161 | +0.158 | +1.9% |  |
+| combo_v2_1x | full | 50 | 8.2 | +0.314 | +0.308 | +2.1% |  |
+| combo_v2_1x | dev | 50 | 7.6 | +0.290 | +0.284 | +2.0% |  |
 | wf_process_2x | 2019on | 25 | 25.7 | +0.441 | +0.429 | +2.8% |  |
 | wf_process_2x | dev(2019-22) | 25 | 27.6 | +0.469 | +0.459 | +2.1% |  |
 | wf_process_2x | 2019on | 30 | 25.7 | +0.551 | +0.536 | +2.8% |  |
 | wf_process_2x | dev(2019-22) | 30 | 27.6 | +0.586 | +0.574 | +2.1% |  |
+| wf_process_2x | 2019on | 50 | 25.7 | +0.991 | +0.965 | +2.7% |  |
+| wf_process_2x | dev(2019-22) | 50 | 27.6 | +1.054 | +1.033 | +2.0% |  |
 | wf_process_1.5x | 2019on | 25 | 19.6 | +0.335 | +0.327 | +2.4% |  |
 | wf_process_1.5x | dev(2019-22) | 25 | 21.3 | +0.362 | +0.355 | +1.9% |  |
 | wf_process_1.5x | 2019on | 30 | 19.6 | +0.419 | +0.409 | +2.4% |  |
 | wf_process_1.5x | dev(2019-22) | 30 | 21.3 | +0.452 | +0.444 | +1.9% |  |
+| wf_process_1.5x | 2019on | 50 | 19.6 | +0.754 | +0.737 | +2.3% |  |
+| wf_process_1.5x | dev(2019-22) | 50 | 21.3 | +0.813 | +0.798 | +1.8% |  |
 
 Deviations are small and uniformly positive (+2% to +4%): the measured GEO
 drag slightly exceeds the arithmetic prediction because the extra daily cost
@@ -126,6 +138,6 @@ second-order term. Any FLAG rows are listed above verbatim.
   read comes in materially different, this family gets ONE further
   correction re-render, same precedent.
 
-Rows generated 2026-07-25T23:20:15; every
+Rows generated 2026-07-29T18:09:47; every
 number above traces to `results/v7/tc_recal.csv` (column `source` cites the
 ledger file + row for each entry).

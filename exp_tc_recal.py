@@ -82,7 +82,12 @@ from metrics_v2 import DEV_END
 
 FAMILY = "tc_recal"
 MARGIN_BPS = 600.0
-TCS = (25.0, 30.0)
+TCS = (25.0, 30.0, 50.0)
+# 50.0 added 2026-07-29 under the RECAL_REPORT one-further-render
+# allowance: the CLEAN vs-open read (2026-07-27 process rebalance,
+# 58 scheduled at-the-open fills) measured +52.4bp/side notional-wtd
+# (median +50.7; vs-arrival median +42.5) — materially above the
+# interim 29.9bp CI [21.2, 38.5]. Resume-safe: existing 25/30 rows skip.
 TC_REF = 5.0
 LEDGER = TRIALS_DIR / f"{FAMILY}.csv"
 OUT_CSV = ROOT / "results" / "v7" / "tc_recal.csv"
