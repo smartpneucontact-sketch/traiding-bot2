@@ -8,6 +8,12 @@ __pycache__/
 *.parquet
 ml_track/cache/
 
+# Norgate exported data — LICENSED, must never enter any shared/public repo
+# (subscriber-only license; see SETUP_NORGATE_VM.md). Whole trees ignored,
+# including manifest.json / .meta.json sidecars, not just parquets.
+data_norgate_raw/
+data_norgate/
+
 # Claude Code local state (personal, not for the repo)
 .claude/settings.local.json
 .claude/scheduled_tasks.lock

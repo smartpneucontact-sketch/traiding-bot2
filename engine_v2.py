@@ -42,6 +42,24 @@ next to combo_v2_2x's 4.96%/mo headline. Both default to legacy values
 (margin 0.0) so every existing result reproduces bit-for-bit; charging margin
 is opt-in, mirroring the engine_v2-supersedes-backtest.py pattern.
 
+Delisting (opt-in, Norgate plan Phase N0 / N1 prereg)
+------------------------------------------------------
+Default behavior when a name stops trading (prices go NaN): pct_change →
+NaN → ``fillna(0.0)``, so the ffilled position earns exactly zero forever
+while still consuming gross exposure in ``_clip_and_cap`` and in the
+margin/borrow notionals — no exit is ever booked. With
+``BTConfigV2(delist_exit=True)`` and ``last_quote`` (symbol → last quoted
+date), each delisted position instead EXITS AT ITS LAST QUOTED CLOSE
+(zipline-norgatedata ``auto_close_date`` convention): the decision-side
+weight is forced to 0.0 from the last-quote date onward, so the effective
+book (``shift(1)``) drops the name the day AFTER — turnover + tc are
+charged on the exit like any sell, and the name leaves the gross/cap math.
+Sensitivity arm ``delist_haircut_pct``: bankruptcy-class names (terminal
+adjusted close < 20% of the close 252 trading days earlier) get an extra
+one-day return of −haircut × exited weight on the exit day. Both default
+off → the published record chain stays bit-identical
+(validation/test_delisting_hook.py proves all of this).
+
 Conventions match backtest.py: weights rows are decision dates with
 POST-leverage values (e.g. blend × 2.0); shorts clipped unless allowed;
 per-day gross capped at ``leverage_cap``; 5bp one-way costs on turnover;
@@ -66,6 +84,8 @@ class BTConfigV2:
     allow_shorts: bool = False
     exec_model: str = "next_open"  # "next_open" | "next_close" | "legacy_period"
     margin_bps_annual: float = 0.0  # on long gross > 1.0x NAV; 0.0 = published record
+    delist_exit: bool = False       # exit at last quoted close (needs last_quote=)
+    delist_haircut_pct: float = 0.0  # extra -haircut on bankruptcy-class exit days
 
 
 def expand_daily(weights_sparse: pd.DataFrame, daily_index: pd.Index) -> pd.DataFrame:
@@ -82,6 +102,63 @@ def _clip_and_cap(target: pd.DataFrame, cfg: BTConfigV2) -> pd.DataFrame:
     return target.mul(scale.fillna(1.0), axis=0)
 
 
+# ───── delisting hook helpers (opt-in; see module docstring) ──────────────
+
+BANKRUPTCY_TERMINAL_FRAC = 0.20  # terminal close < 20% of the 252d-ago close
+BANKRUPTCY_LOOKBACK_TD = 252     # trading days (N1 prereg classification)
+
+
+def _delist_masks(
+    daily: pd.DataFrame, last_quote: pd.Series
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Force delisted names to 0 on the DECISION-side daily frame.
+
+    Zeroing from each symbol's last-quote date ONWARD means the effective
+    book (``daily.shift(1)``) still holds the name through its last quoted
+    close and is flat from the day after — i.e. an exit fill AT the last
+    quoted close. Composes exactly like ``apply_gate`` (pre-shift, so the
+    downstream turnover/cost/gross logic prices the exit like any sell), and
+    overrides any later decision that re-selects a dead name.
+
+    Returns ``(masked_daily, exit_flag)`` where ``exit_flag`` (decision-side,
+    delisted columns only) marks each symbol's first forced date; shifted one
+    day it locates the exit day in the effective book. ``None`` if no
+    delisted symbol intersects the frame.
+    """
+    lq = pd.to_datetime(pd.Series(last_quote).dropna())
+    syms = [c for c in daily.columns if c in lq.index]
+    if not syms:
+        return daily, None
+    idx = daily.index.values.astype("datetime64[ns]")
+    cut = lq[syms].values.astype("datetime64[ns]")
+    dead = pd.DataFrame(idx[:, None] >= cut[None, :],
+                        index=daily.index, columns=syms)
+    daily = daily.mask(dead.reindex(columns=daily.columns, fill_value=False), 0.0)
+    exit_flag = dead & ~dead.shift(1, fill_value=False)
+    return daily, exit_flag
+
+
+def _bankruptcy_class(
+    prices: pd.DataFrame, last_quote: pd.Series, syms: list[str]
+) -> list[str]:
+    """Symbols whose terminal adjusted close is < ``BANKRUPTCY_TERMINAL_FRAC``
+    of their own close ``BANKRUPTCY_LOOKBACK_TD`` quoted trading days earlier
+    (computed on each symbol's OWN quoted series up to its last-quote date).
+    Names with insufficient history are not classified (no haircut) — the
+    conservative direction for the sensitivity arm."""
+    lq = pd.to_datetime(pd.Series(last_quote).dropna())
+    out = []
+    for s in syms:
+        if s not in prices.columns or s not in lq.index:
+            continue
+        px = prices[s].loc[: lq[s]].dropna()
+        if len(px) <= BANKRUPTCY_LOOKBACK_TD:
+            continue
+        if px.iloc[-1] < BANKRUPTCY_TERMINAL_FRAC * px.iloc[-1 - BANKRUPTCY_LOOKBACK_TD]:
+            out.append(s)
+    return out
+
+
 def run_backtest_v2(
     weights: pd.DataFrame,
     prices: pd.DataFrame,
@@ -89,6 +166,7 @@ def run_backtest_v2(
     name: str = "strategy",
     open_prices: pd.DataFrame | None = None,
     weights_are_daily: bool = False,
+    last_quote: pd.Series | None = None,
 ) -> dict:
     """Run a backtest under the configured execution model.
 
@@ -98,9 +176,22 @@ def run_backtest_v2(
     `open_prices`: daily open panel; tickers absent from it (e.g. macro ETFs,
     close-only) fall back to prior-close execution and are counted in
     ``summary["n_close_fallback_names"]``. Only used by ``next_open``.
+    `last_quote`: symbol → last quoted date (unique index; e.g. Norgate
+    ``last_quoted_date``). Only read when ``cfg.delist_exit`` — positions in
+    those names exit at the last quoted close (see module docstring).
+    Ignored entirely when ``cfg.delist_exit=False`` (bit-identical default).
     """
     if weights.empty:
         return {"equity": pd.Series(dtype=float), "name": name}
+
+    if cfg.delist_exit:
+        if last_quote is None:
+            raise ValueError(
+                "delist_exit=True requires last_quote (symbol -> last quoted date)")
+        if cfg.exec_model == "legacy_period":
+            raise ValueError(
+                "delist_exit is not supported under legacy_period "
+                "(record-reproduction mode must stay byte-identical)")
 
     rets = prices.pct_change(fill_method=None).fillna(0.0)
 
@@ -118,6 +209,12 @@ def run_backtest_v2(
         daily = daily.reindex(rets.index).ffill().fillna(0.0)
         common = [c for c in daily.columns if c in rets.columns]
         daily, r = daily[common], rets[common]
+        exit_flag = None
+        if cfg.delist_exit:
+            # Decision-side delisting mask BEFORE clip/cap: dead names leave
+            # the gross/cap math from the last-quote date on (effective book
+            # exits the day after — fill at the last quoted close).
+            daily, exit_flag = _delist_masks(daily, last_quote)
         daily = _clip_and_cap(daily, cfg)
         # Effective book during day t: decided at close t-1. next_close earns
         # the full close t-1 → close t move (fill AT the decision close, not
@@ -149,6 +246,23 @@ def run_backtest_v2(
         else:
             raise ValueError(f"unknown exec_model: {cfg.exec_model}")
 
+        if exit_flag is not None:
+            # Exit accounting: on each symbol's exit day (effective side =
+            # decision-side first-forced date shifted 1) the book change is
+            # exactly −(held weight); tc flows through the normal turnover
+            # path above. Haircut arm: bankruptcy-class exits get an extra
+            # −haircut × exited weight one-day return on that exit day.
+            exit_eff = exit_flag.shift(1, fill_value=False)
+            exited = (-delta[exit_flag.columns]).where(exit_eff, 0.0)
+            n_delist_exits = int((exited.abs() > 1e-12).to_numpy().sum())
+            delist_bk: list[str] = []
+            if cfg.delist_haircut_pct != 0.0:
+                delist_bk = _bankruptcy_class(prices, last_quote,
+                                              list(exit_flag.columns))
+                if delist_bk:
+                    daily_port_ret = daily_port_ret - (
+                        cfg.delist_haircut_pct * exited[delist_bk].sum(axis=1))
+
     tc = turnover * (cfg.tc_bps / 10_000.0)
     short_notional = effective.clip(upper=0.0).abs().sum(axis=1)
     borrow = short_notional * (cfg.borrow_bps_annual / 10_000.0) / 252.0
@@ -168,6 +282,11 @@ def run_backtest_v2(
     s["margin_bps_annual"] = cfg.margin_bps_annual
     if cfg.exec_model == "next_open":
         s["n_close_fallback_names"] = n_fallback
+    if cfg.delist_exit:  # provenance keys only when the hook is active
+        s["delist_exit"] = True
+        s["delist_haircut_pct"] = cfg.delist_haircut_pct
+        s["n_delist_exits"] = n_delist_exits if exit_flag is not None else 0
+        s["n_delist_bankruptcy"] = len(delist_bk) if exit_flag is not None else 0
     return {
         "equity": equity, "summary": s, "name": name,
         "weights": effective, "returns": daily_net,
