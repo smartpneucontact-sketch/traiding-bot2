@@ -1,0 +1,7 @@
+{
+  "source": "alphavantage LISTING_STATUS state=delisted",
+  "fetched_at": "2026-07-31T04:53:50.424360+00:00",
+  "rows": 9395,
+  "sha256_of_parquet": "a9d2bb6346c919fea02fe830480b0c9dc71fda81b838c6e9a8553b19d2de5c02",
+  "note": "authoritative free dead-name inventory WITH delisting dates; prices NOT included (AV free tier serves unadjusted only, 25 req/day). Cross-check source for Stooq/Tiingo/Norgate delisting coverage."
+}
