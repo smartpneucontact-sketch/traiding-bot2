@@ -477,3 +477,45 @@ def test_exec_fields_only_on_subclass():
         assert f not in base
         assert f in ext
     assert ext == base | set(EXEC_FIELDS)
+
+
+def test_slot_config_exec_style_passthrough(tmp_path, monkeypatch):
+    """model_config.json slot fields MUST reach ModelConfig — setting
+    exec_style in the config was silently ignored before 2026-07-31 (the
+    same fault class as the 07-25 target_leverage incident)."""
+    import json
+    import core.config as cfg
+    slots = {"slots": [{
+        "slot_id": 1, "model": "combo_v2", "enabled": True,
+        "alpaca_key": "k", "alpaca_secret": "s",
+        "target_leverage": 2,
+        "exec_style": "marketable_limit",
+        "exec_limit_buffer_bps": 12.5,
+        "exec_fill_timeout_s": 90,
+        "exec_timeout_action": "cancel",
+    }]}
+    p = tmp_path / "model_config.json"
+    p.write_text(json.dumps(slots))
+    monkeypatch.setattr(cfg, "CONFIG_PATH", p)
+    models = cfg.get_active_models()
+    assert len(models) == 1
+    mc = models[0]
+    assert mc.exec_style == "marketable_limit"
+    assert mc.exec_limit_buffer_bps == 12.5
+    assert mc.exec_fill_timeout_s == 90
+    assert mc.exec_timeout_action == "cancel"
+
+
+def test_slot_config_exec_style_defaults_market(tmp_path, monkeypatch):
+    import json
+    import core.config as cfg
+    slots = {"slots": [{
+        "slot_id": 1, "model": "combo_v2", "enabled": True,
+        "alpaca_key": "k", "alpaca_secret": "s",
+    }]}
+    p = tmp_path / "model_config.json"
+    p.write_text(json.dumps(slots))
+    monkeypatch.setattr(cfg, "CONFIG_PATH", p)
+    mc = cfg.get_active_models()[0]
+    assert mc.exec_style == "market"
+    assert mc.exec_timeout_action == "market"

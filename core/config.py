@@ -742,6 +742,17 @@ def get_active_models() -> list[ModelConfig]:
                 cutloss_reentry_delay_days=int(
                     slot.get("cutloss_reentry_delay_days", 2) or 2),
                 target_leverage=float(slot.get("target_leverage", 1.0) or 1.0),
+                # Execution-style passthrough (2026-07-31). Without these,
+                # setting exec_style in model_config.json was silently
+                # ignored — the same config-read fault class as the 07-25
+                # target_leverage incident.
+                exec_style=str(slot.get("exec_style", "market") or "market"),
+                exec_limit_buffer_bps=float(
+                    slot.get("exec_limit_buffer_bps", 10.0) or 10.0),
+                exec_fill_timeout_s=int(
+                    slot.get("exec_fill_timeout_s", 120) or 120),
+                exec_timeout_action=str(
+                    slot.get("exec_timeout_action", "market") or "market"),
             ))
 
     # -- Fallback to env vars if no slot in the config actually activated.
