@@ -1,0 +1,25 @@
+{
+  "_doc": [
+    "Program deadline calendar, surfaced on the dashboard (/api/status).",
+    "Motivation: the Norgate Platinum trial expired ~2026-08-21 UNUSED",
+    "because no system tracked it. Every date the program cares about",
+    "lives here — checkpoints from the pre-registered protocols, decision",
+    "deadlines, measurement events. kind: checkpoint | verdict | decision",
+    "| measurement. severity: info | high. Past 'decision' entries render",
+    "as OVERDUE until resolved (set resolved: true rather than deleting)."
+  ],
+  "events": [
+    {"date": "2026-08-30", "label": "Norgate decision: paid Platinum ($346.50/6mo) or trial-extension email — Truth Run pipeline is armed and waiting", "kind": "decision", "severity": "high"},
+    {"date": "2026-08-31", "label": "Triple rebalance 09:35 ET (all slots overdue post-outage) + FIRST marketable-limit fills -> execution cost measurement vs 52.4bp baseline", "kind": "measurement", "severity": "high"},
+    {"date": "2026-09-21", "label": "Candidate X freeze-ablation monthly report #2", "kind": "measurement", "severity": "info"},
+    {"date": "2026-10-20", "label": "Primary slot 3-month operational checkpoint (fts 2026-07-20) — include Aug 18-28 outage disclosure", "kind": "checkpoint", "severity": "high"},
+    {"date": "2026-10-21", "label": "Candidate X 3-month operational checkpoint (fts 2026-07-21)", "kind": "checkpoint", "severity": "high"},
+    {"date": "2026-10-27", "label": "Process slot 3-month operational checkpoint (fts 2026-07-27)", "kind": "checkpoint", "severity": "high"},
+    {"date": "2027-01-20", "label": "Primary slot 6-month checkpoint", "kind": "checkpoint", "severity": "info"},
+    {"date": "2027-01-21", "label": "Candidate X 6-month checkpoint (XK1 kill floor / relative legs interim read)", "kind": "checkpoint", "severity": "info"},
+    {"date": "2027-01-27", "label": "Process slot 6-month checkpoint (PK1 kill floor interim read)", "kind": "checkpoint", "severity": "info"},
+    {"date": "2027-07-20", "label": "PRIMARY 12-MONTH VERDICT — protocol.json pre-registered evaluation", "kind": "verdict", "severity": "high"},
+    {"date": "2027-07-21", "label": "CANDIDATE X 12-MONTH VERDICT — protocol_exp.json legs (XK1, relative 12mo)", "kind": "verdict", "severity": "high"},
+    {"date": "2027-07-27", "label": "PROCESS 12-MONTH VERDICT — protocol_process.json (P12-GEO >= 1.65%/mo, P12-REL-PRIMARY)", "kind": "verdict", "severity": "high"}
+  ]
+}

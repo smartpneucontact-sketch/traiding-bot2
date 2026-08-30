@@ -1,0 +1,45 @@
+{
+  "_doc": [
+    "Operator-intended runtime spec, checked against the RUNNING system by",
+    "core/invariants.py at every pipeline start and via /api/invariants.",
+    "A slot field listed here must match the loaded ModelConfig exactly;",
+    "a field omitted here is not checked. Update this file ONLY when the",
+    "operator deliberately changes the live setup — the whole point is",
+    "that silent divergence between intention and runtime becomes loud.",
+    "History that motivated it: tier scale base, slot target_leverage,",
+    "exec_* passthrough, missing protocol COPY, MIN_STOCKS_REQUIRED=500."
+  ],
+  "frozen": "2026-08-30",
+  "slots": {
+    "combo_v2": {
+      "enabled": true,
+      "target_leverage": 2.0,
+      "exec_style": "marketable_limit",
+      "exec_limit_buffer_bps": 10.0,
+      "enable_cutloss": true,
+      "cutloss_portfolio_stop": -4.0,
+      "cutloss_scale_by_leverage": true
+    },
+    "combo_v2_exp": {
+      "enabled": true,
+      "target_leverage": 2.0,
+      "exec_style": "marketable_limit",
+      "exec_limit_buffer_bps": 10.0,
+      "enable_cutloss": true,
+      "cutloss_portfolio_stop": -4.0,
+      "cutloss_scale_by_leverage": true
+    },
+    "combo_v2_process": {
+      "enabled": true,
+      "target_leverage": 2.0,
+      "exec_style": "marketable_limit",
+      "exec_limit_buffer_bps": 10.0
+    }
+  },
+  "runtime": {
+    "min_stocks_required": 400,
+    "tier_fractions": {"1": 0.6, "2": 0.3, "3": 0.0},
+    "gate_daily_update": true,
+    "gate_update_band_max": 0.5
+  }
+}

@@ -761,10 +761,18 @@ def api_status():
         state = _load_model_state(mc.name)
         if state.get("last_run"):
             persisted_last_runs.append(str(state["last_run"]))
+        gate_trace = state.get("gate_update_history") or []
         s["models"][mc.name] = {
             "run_count": state.get("run_count", 0),
             "data_guard_aborts": int(state.get("data_guard_aborts", 0) or 0),
             "history": state.get("history", [])[-5:],
+            # Gate-cadence posture (core/gate_update.py): the multiplier
+            # the book currently carries + the latest daily check.
+            "gate": {
+                "applied_exposure_multiplier":
+                    state.get("applied_exposure_multiplier"),
+                "last_check": gate_trace[-1] if gate_trace else None,
+            },
             **bot_status.get("models", {}).get(mc.name, {})
         }
     # bot_status is in-memory and resets on every deploy — without a
@@ -778,7 +786,48 @@ def api_status():
             lr = lr + "+00:00"
         s["last_run_at"] = lr
         s["last_run_source"] = "persisted_state"
+    # Program-health surfaces (2026-08-30): spec-manifest invariants,
+    # universe decay trend, and the deadline calendar. All best-effort —
+    # a broken surface must never take /api/status down.
+    try:
+        from core.invariants import load_last_status
+        s["invariants"] = load_last_status()
+    except Exception:
+        s["invariants"] = None
+    try:
+        from core.universe_monitor import load_universe_status
+        s["universe"] = load_universe_status()
+    except Exception:
+        s["universe"] = None
+    try:
+        s["calendar"] = _program_calendar_view()
+    except Exception:
+        s["calendar"] = None
     return jsonify(s)
+
+
+def _program_calendar_view() -> dict | None:
+    """Overdue decisions + the next few upcoming program deadlines from
+    program_calendar.json (committed with the repo)."""
+    cal_path = Path(__file__).resolve().parent / "program_calendar.json"
+    if not cal_path.exists():
+        return None
+    events = json.loads(cal_path.read_text()).get("events", [])
+    today = datetime.now().strftime("%Y-%m-%d")
+    overdue = [e for e in events
+               if e.get("date", "") < today and not e.get("resolved")
+               and e.get("kind") == "decision"]
+    upcoming = sorted([e for e in events
+                       if e.get("date", "") >= today and not e.get("resolved")],
+                      key=lambda e: e.get("date", ""))[:5]
+    return {"overdue": overdue, "upcoming": upcoming}
+
+
+@app.route("/api/invariants")
+def api_invariants():
+    """Recompute the spec-manifest invariant sweep on demand."""
+    from core.invariants import run_invariant_checks
+    return jsonify(run_invariant_checks(logging.getLogger("dashboard")))
 
 
 @app.route("/api/account/<model_name>")
@@ -2954,6 +3003,18 @@ def ready():
                     f"MIN_STOCKS_REQUIRED)")
     except Exception:
         pass
+    # Spec-manifest invariants: a divergence between the running config and
+    # the committed spec (spec_manifest.json) is exactly the fault class
+    # that has bitten five times — surface it here so external alerting
+    # (and the deploy healthcheck) sees it.
+    try:
+        from core.invariants import load_last_status
+        inv = load_last_status()
+        if inv and not inv.get("pass", True):
+            for f in inv.get("failures", [])[:5]:
+                problems.append(f"invariant: {f}")
+    except Exception:
+        pass
     # Ephemeral-storage guard: an empty state dir means trailing-stop peaks and
     # re-entry timers were wiped (no persistent volume mounted at DATA_DIR).
     try:
@@ -4065,6 +4126,41 @@ def index():
                 <div class="val" style="font-size:16px">${{status.next_run_at ? fmtET(status.next_run_at) : '-'}}</div>
                 <div class="sub">Total: ${{status.total_runs}} runs</div>
             </div>`;
+
+            // Program health: spec-manifest invariants + universe decay +
+            // per-slot gate posture (2026-08-30 improvements pass).
+            const inv = status.invariants;
+            const uni = status.universe;
+            const invOk = inv ? inv.pass : null;
+            const invColor = invOk === null ? '' : invOk ? 'green' : 'red';
+            const invText = invOk === null ? '—' : invOk ? 'PASS' : `${{inv.failures.length}} VIOLATION(S)`;
+            const uniText = uni ? `${{uni.count}} names${{uni.warn ? ' ⚠ decaying' : ''}}` : '—';
+            let gateBits = [];
+            for (const [mName, mData] of Object.entries(status.models || {{}})) {{
+                const g = mData.gate || {{}};
+                if (g.applied_exposure_multiplier != null) {{
+                    gateBits.push(`${{mName.replace('combo_v2', 'cv2')}}: ${{(g.applied_exposure_multiplier * 100).toFixed(0)}}%`);
+                }}
+            }}
+            html += `
+            <div class="metric">
+                <div class="label">Program Health</div>
+                <div class="val ${{invColor}}" style="font-size:16px">${{invText}}</div>
+                <div class="sub">universe: ${{uniText}}${{gateBits.length ? ' · gate ' + gateBits.join(' · ') : ''}}</div>
+            </div>`;
+
+            // Deadline calendar: overdue decisions scream; next deadline shows.
+            const cal = status.calendar;
+            if (cal && (cal.overdue.length || cal.upcoming.length)) {{
+                const overdue = cal.overdue[0];
+                const next = cal.upcoming[0];
+                html += `
+            <div class="metric">
+                <div class="label">Program Calendar</div>
+                <div class="val ${{overdue ? 'red' : ''}}" style="font-size:14px">${{overdue ? 'OVERDUE: ' + overdue.label.split(' — ')[0].slice(0, 60) : (next ? next.date : '—')}}</div>
+                <div class="sub">${{next ? (next.date + ' · ' + next.label.slice(0, 80)) : ''}}</div>
+            </div>`;
+            }}
 
             if (status.last_error) {{
                 $('error-card').style.display = 'block';

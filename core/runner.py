@@ -346,6 +346,22 @@ def run_single_model(
             f"  Skipping - last rebalance {days_since}d ago, "
             f"next in {days_until}d"
         )
+        # Daily gate-cadence tracking (2026-08-30 alignment fix): the
+        # validated backtests re-evaluate the drawdown gates DAILY
+        # (validation/book_gate.py prices base_daily * g_t), while live
+        # the gate was sampled only at 21-day rebalances — so between
+        # rebalances the book could be cut (tiers) but never re-levered.
+        # This pass recomputes the same gate stack on the HELD book and
+        # pro-rata scales toward it when it moved ≥ GATE_UPDATE_BAND.
+        # Runs ONLY here: every stop/freeze/cool-down guard has already
+        # returned above, and rebalance days set the gate themselves.
+        # Never raises (all failures are contained + reported).
+        from core.gate_update import maybe_daily_gate_update
+        maybe_daily_gate_update(
+            mc, model_bundle, strategy_type, stock_data, macro_data,
+            journal, logger, report,
+            min_stocks_required=MIN_STOCKS_REQUIRED, dry_run=dry_run,
+        )
         state["last_run"] = datetime.now().isoformat()
         _save_state_merged(state, mc)
         logger.info(report.format_summary())
@@ -737,6 +753,18 @@ def run_single_model(
             logger.warning(
                 f"  day-start book anchor refresh failed (non-fatal): {e}"
             )
+        # Gate-cadence bookkeeping: record the multiplier this rebalance
+        # actually applied (compute_weights' exposure_multiplier) so the
+        # daily gate pass (core/gate_update.py) scales relative to it.
+        # Scanner-owned-key contract: written straight to disk under the
+        # lock; the merged save below adopts it from disk.
+        if strategy_type == "direct_weights":
+            try:
+                from core.gate_update import config_has_gates, set_applied_multiplier
+                if config_has_gates(model_bundle.get("combo_config")):
+                    set_applied_multiplier(mc, regime_exposure, logger)
+            except Exception as e:
+                logger.warning(f"  applied-multiplier write failed (non-fatal): {e}")
         # Forward-test clock: the first FUNDED rebalance starts the
         # pre-registered paper test, binding it to the exact protocol
         # bytes committed beforehand (any later edit → hash mismatch →
@@ -845,6 +873,17 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
 
     logger.info(f"Active models: {[m.name for m in models]}")
 
+    # Spec-manifest invariant sweep (2026-08-30): compare the running
+    # configuration against spec_manifest.json before touching the market.
+    # Violations are CRITICAL-logged, persisted for /api/status, and turn
+    # /ready red — but never halt the pipeline (a guard that stops
+    # trading does its own damage; see the Aug 18-28 outage).
+    try:
+        from core.invariants import run_invariant_checks
+        run_invariant_checks(logger)
+    except Exception as e:
+        logger.error(f"invariant sweep failed to run (non-fatal): {e}")
+
     # -- Download data once (shared across models) --------------------------
     report = RunReport()
 
@@ -866,6 +905,15 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
         if not stock_data:
             logger.error("No stock data downloaded - cannot proceed")
             return
+
+        # Universe churn monitor (Aug 18-28 outage follow-up): record the
+        # daily usable-bars count + name churn so universe decay is a
+        # visible trend, not a silent walk toward the data guard.
+        try:
+            from core.universe_monitor import record_universe_snapshot
+            record_universe_snapshot(sorted(stock_data.keys()), logger)
+        except Exception as e:
+            logger.warning(f"universe churn snapshot failed (non-fatal): {e}")
 
         logger.info("\n[2/2] COMPUTING MACRO FEATURES (shared)")
         macro_features = compute_macro_features(macro_data)

@@ -55,6 +55,12 @@ from core.market import is_market_open
 from core.orders import poll_order_status
 from core.state import load_state, save_state, state_lock
 
+# stop_grid.py TIER_F — the validated tier targets as fractions of the
+# DAY-START gross book. Lifted to a module constant (2026-08-30) so the
+# spec-manifest invariant checker (core/invariants.py) can verify the
+# value the scanner actually trades with. Tier 3 is the full liquidation.
+TIER_FRACTIONS = {1: 0.60, 2: 0.30, 3: 0.0}
+
 if TYPE_CHECKING:
     from core.config import ModelConfig
 
@@ -352,8 +358,9 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
                 # (stop_grid TIER_F, NOT 30% of equity). No trip flag.
                 n_scaled = _soft_scale_portfolio(
                     mc, positions, daily_book_start,
-                    book_fraction=0.30,
+                    book_fraction=TIER_FRACTIONS[2],
                     tier="Tier2", dd_pct=daily_drawdown_pct, logger=logger,
+                    state=state,
                 )
                 # Already at/below the tier target on later ticks → DEBUG,
                 # not a repeated WARN every 60s.
@@ -373,8 +380,9 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
                 # over-sale). No trip flag.
                 n_scaled = _soft_scale_portfolio(
                     mc, positions, daily_book_start,
-                    book_fraction=0.60,
+                    book_fraction=TIER_FRACTIONS[1],
                     tier="Tier1", dd_pct=daily_drawdown_pct, logger=logger,
+                    state=state,
                 )
                 log_fn = logger.warning if n_scaled else logger.debug
                 log_fn(
@@ -1072,7 +1080,8 @@ def _liquidate_all(mc: "ModelConfig", positions: list, reason: str, logger) -> N
 
 def _soft_scale_portfolio(mc: "ModelConfig", positions: list,
                           daily_book_start: float, book_fraction: float,
-                          tier: str, dd_pct: float, logger) -> int:
+                          tier: str, dd_pct: float, logger,
+                          state: dict | None = None) -> int:
     """Scale gross exposure down to `book_fraction` of the DAY-START book
     by selling pro-rata across positions. Used by Tier 1 (0.60) and
     Tier 2 (0.30) of the soft portfolio stop.
@@ -1114,6 +1123,28 @@ def _soft_scale_portfolio(mc: "ModelConfig", positions: list,
         return 0  # already at/below the tier target (idempotent re-scans)
 
     fraction_to_sell = min(max(excess_mv / total_mv, 0.0), 1.0)
+    # Gate-cadence bookkeeping (core/gate_update.py): the tier cut shrinks
+    # the book by (1 - fraction_to_sell) relative to what the gate had
+    # applied — record it so tomorrow's daily gate pass scales against the
+    # book's TRUE cumulative multiplier, not the pre-cut one. Optimistic
+    # (written before fills confirm), same convention as the tier targets
+    # themselves; the next rebalance resets it from fresh diagnostics.
+    #
+    # LOCKING: the scanner's tier calls happen INSIDE _cutloss_state_lock
+    # (acquiring it here would deadlock — the lock is non-reentrant), so
+    # locked callers MUST pass their own `state` dict: it is mutated in
+    # place (their later saves keep the update) and saved through
+    # immediately. The `state=None` fallback does a bare load-modify-save
+    # for direct callers that hold no lock (tests).
+    try:
+        target = state if state is not None else load_state(mc)
+        applied = target.get("applied_exposure_multiplier")
+        if applied is not None and float(applied) > 0:
+            target["applied_exposure_multiplier"] = round(
+                float(applied) * (1.0 - fraction_to_sell), 4)
+            save_state(target, mc)
+    except Exception as e:
+        logger.error(f"[CUTLOSS] {mc.name}: gate-multiplier update failed: {e}")
     journal = TradeJournal(mc.name)
     reason = f"soft_scale_{tier.lower()}"
     records: list[TradeRecord] = []

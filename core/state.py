@@ -48,6 +48,12 @@ SCANNER_OWNED_KEYS = (
     "portfolio_stop_tripped_date",
     "reentry_cooldown_until",
     "cutloss_sold_today",
+    # Gate-cadence tracking (core/gate_update.py): the applied multiplier
+    # is written straight to disk under the lock by THREE writers — the
+    # rebalance path, the daily gate pass, and the tier scaler — so the
+    # pipeline's merged save must always adopt the disk copy.
+    "applied_exposure_multiplier",
+    "gate_update_history",
 )
 
 
