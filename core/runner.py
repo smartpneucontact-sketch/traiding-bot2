@@ -21,6 +21,7 @@ artifacts deserialize cleanly regardless of how they were trained.
 
 from __future__ import annotations
 
+import os
 import pickle
 import traceback
 from datetime import datetime, timezone
@@ -63,9 +64,15 @@ DEFAULT_HORIZON = 21
 DEFAULT_LOOKBACK_DAYS = 365
 
 # Data-quality safeguards: refuse to rebalance with partial yfinance pulls.
-# Full universe ≈ 1000 stocks; <500 means rate-limiting hit. Macro is normally
-# 22 features; <15 means partial download.
-MIN_STOCKS_REQUIRED = 500
+# CALIBRATION FIX 2026-08-29: the normal POST-FILTER count (names with the
+# required >=250d history out of the ~1,000-name union) is ~500, not ~1,000
+# — the old threshold of 500 sat exactly at the normal operating point, so
+# natural universe shrinkage (delistings) tipped it under in mid-August and
+# silently aborted every run Aug 18-28 (counts 497-499, deterministic; all
+# three slots missed their scheduled rebalances). 400 catches the guard's
+# actual target — a catastrophic half-degraded download — without tripping
+# on ordinary universe drift. Env-overridable for ops.
+MIN_STOCKS_REQUIRED = int(os.environ.get("MIN_STOCKS_REQUIRED", "400"))
 MIN_MACRO_FEATURES = 15
 
 
@@ -360,6 +367,15 @@ def run_single_model(
         )
         logger.error(msg)
         report.add_error(msg)
+        # Consecutive-abort counter: the Aug 18-28 outage ran 8+ days with
+        # no operator-visible alarm because errored runs still refresh the
+        # "last run" tile. /ready and /api/status surface this counter as a
+        # problem at >=2 so a repeating guard abort cannot stay silent.
+        try:
+            state["data_guard_aborts"] = int(state.get("data_guard_aborts", 0)) + 1
+            save_state(state, mc)
+        except Exception:
+            pass
         report.end_step("compute_features")
         logger.info(report.format_summary())
         return
@@ -374,6 +390,14 @@ def run_single_model(
         report.end_step("compute_features")
         logger.info(report.format_summary())
         return
+
+    # Data guards passed — reset the consecutive-abort alarm counter.
+    if state.get("data_guard_aborts"):
+        try:
+            state["data_guard_aborts"] = 0
+            save_state(state, mc)
+        except Exception:
+            pass
 
     report.end_step("compute_features")
 

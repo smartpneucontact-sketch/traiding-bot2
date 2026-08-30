@@ -476,3 +476,44 @@ def test_reconciliation_still_flags_genuinely_missing_and_unexpected(tmp_path, m
     book = rb["reconciliation"]["book"]
     assert book["missing_positions"] == ["AAA"]
     assert book["unexpected_positions"] == ["STRAY"]
+
+
+# ───── Aug 18-28 outage mode: data-guard threshold + silent-abort alarm ──
+
+def test_min_stocks_threshold_below_normal_operating_point():
+    """The normal post-filter universe is ~500 names; the old threshold of
+    500 sat AT that point and natural delistings caused an 8+ day silent
+    outage (counts 497-499). The bar must sit well below normal but still
+    catch a true half-degraded download."""
+    import core.runner as runner
+    assert runner.MIN_STOCKS_REQUIRED <= 450, "threshold must clear normal universe drift"
+    assert runner.MIN_STOCKS_REQUIRED >= 300, "threshold must still catch real degradation"
+
+
+def test_min_stocks_env_override(monkeypatch):
+    import importlib
+    import core.runner as runner
+    monkeypatch.setenv("MIN_STOCKS_REQUIRED", "123")
+    importlib.reload(runner)
+    try:
+        assert runner.MIN_STOCKS_REQUIRED == 123
+    finally:
+        monkeypatch.delenv("MIN_STOCKS_REQUIRED")
+        importlib.reload(runner)
+
+
+def test_ready_flags_consecutive_data_guard_aborts(monkeypatch):
+    """Runs that 'complete' without trading must not stay silent: >=2
+    consecutive data-guard aborts surface as a /ready problem."""
+    import types
+    import dashboard as dash
+    mc = types.SimpleNamespace(name="m_guard")
+    monkeypatch.setattr(dash.pipeline, "get_active_models", lambda: [mc])
+    monkeypatch.setattr(dash, "_load_model_state",
+                        lambda name: {"data_guard_aborts": 3})
+    dash.app.config["TESTING"] = True
+    with dash.app.test_client() as c:
+        r = c.get("/ready")
+    d = r.get_json()
+    assert any("data-guard aborts" in p for p in d.get("problems", [])), d
+    assert r.status_code == 503

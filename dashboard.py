@@ -763,6 +763,7 @@ def api_status():
             persisted_last_runs.append(str(state["last_run"]))
         s["models"][mc.name] = {
             "run_count": state.get("run_count", 0),
+            "data_guard_aborts": int(state.get("data_guard_aborts", 0) or 0),
             "history": state.get("history", [])[-5:],
             **bot_status.get("models", {}).get(mc.name, {})
         }
@@ -2940,6 +2941,19 @@ def ready():
     problems = []
     if bot_status.get("last_run_status") == "error":
         problems.append(f"last run errored: {bot_status.get('last_error')}")
+    # Repeating data-guard aborts: runs "complete" (refreshing the last-run
+    # tile) while never reaching the rebalance step — the Aug 18-28 outage
+    # mode. The runner counts consecutive aborts per slot; >=2 is a problem.
+    try:
+        for mc in pipeline.get_active_models():
+            n = int((_load_model_state(mc.name) or {}).get("data_guard_aborts", 0) or 0)
+            if n >= 2:
+                problems.append(
+                    f"{mc.name}: {n} consecutive data-guard aborts — runs are "
+                    f"completing without trading (check stock count vs "
+                    f"MIN_STOCKS_REQUIRED)")
+    except Exception:
+        pass
     # Ephemeral-storage guard: an empty state dir means trailing-stop peaks and
     # re-entry timers were wiped (no persistent volume mounted at DATA_DIR).
     try:
