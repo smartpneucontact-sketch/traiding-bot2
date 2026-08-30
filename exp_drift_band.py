@@ -1,11 +1,11 @@
 """exp_drift_band.py — DRIFT1: drift-band rebalancing on the champion at
-measured costs (DRAFT — governed by results/v7/improve3/DRAFT_DRIFT1_PREREG.md).
+measured costs (governed by results/v7/improve3/DRIFT1_PREREG.md).
 
-STATUS: DRAFT. The prereg is NOT frozen. main() is guarded with a hard
-SystemExit; every run_trial call is log=PREREG_FROZEN (False) so nothing can
-reach a ledger even if the guard is bypassed. Freeze procedure (prereg doc):
-remove the DRAFT_ prefix, record the sha256, THEN delete the guard line and
-set PREREG_FROZEN = True in the same commit.
+STATUS: FROZEN 2026-08-30 (prereg sha256
+ee52fe6c3be1f6961a8b471e6ea52dd66a96d6928ddba141020e2d963ca13811, recorded
+in the freeze commit). The do-not-run guard was removed and PREREG_FROZEN
+set True in this commit, per the freeze terms — dev cells now ledger to
+family drift1 on first render.
 
 Design (verbatim from the prereg — the prereg is authoritative):
   - Construction: champion combo_v2 2x via exp_pit_survivorship.
@@ -48,9 +48,9 @@ sys.path.insert(0, str(ROOT))
 from exp_lib import TRIALS_DIR, load_cache, run_trial
 
 # ── prereg freeze switch ────────────────────────────────────────────────────
-# False until results/v7/improve3/DRAFT_DRIFT1_PREREG.md is frozen (DRAFT_
-# prefix removed + sha256 recorded). While False, NOTHING is ledgered.
-PREREG_FROZEN = False
+# results/v7/improve3/DRIFT1_PREREG.md frozen 2026-08-30 (sha in the freeze
+# commit) — ledgering enabled per the freeze terms.
+PREREG_FROZEN = True
 
 FAMILY = "drift1"
 LEDGER = TRIALS_DIR / f"{FAMILY}.csv"
@@ -295,8 +295,4 @@ def validate(winner_band: float) -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit("DRAFT — do not run before prereg freeze "
-                     "(results/v7/improve3/DRAFT_DRIFT1_PREREG.md; remove "
-                     "this guard + set PREREG_FROZEN=True in the freeze "
-                     "commit).")
-    main()  # unreachable until the freeze commit removes the guard
+    main()
