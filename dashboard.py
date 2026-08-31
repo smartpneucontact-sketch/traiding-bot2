@@ -807,16 +807,25 @@ def api_status():
 
 
 def _program_calendar_view() -> dict | None:
-    """Overdue decisions + the next few upcoming program deadlines from
-    program_calendar.json (committed with the repo)."""
+    """Overdue + upcoming program deadlines from program_calendar.json.
+
+    'Today' is market time (ET), not the container's UTC clock — UTC
+    flipped events up to 4h early. Overdue covers EVERY unresolved past
+    event, not just decisions: a missed checkpoint or verdict slipping
+    silently was the exact failure mode the calendar exists to prevent
+    (2026-08-31 audit)."""
     cal_path = Path(__file__).resolve().parent / "program_calendar.json"
     if not cal_path.exists():
         return None
     events = json.loads(cal_path.read_text()).get("events", [])
-    today = datetime.now().strftime("%Y-%m-%d")
-    overdue = [e for e in events
-               if e.get("date", "") < today and not e.get("resolved")
-               and e.get("kind") == "decision"]
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    except Exception:
+        today = datetime.now().strftime("%Y-%m-%d")
+    overdue = sorted([e for e in events
+                      if e.get("date", "") < today and not e.get("resolved")],
+                     key=lambda e: e.get("date", ""))
     upcoming = sorted([e for e in events
                        if e.get("date", "") >= today and not e.get("resolved")],
                       key=lambda e: e.get("date", ""))[:5]
@@ -3007,12 +3016,19 @@ def ready():
     # the committed spec (spec_manifest.json) is exactly the fault class
     # that has bitten five times — surface it here so external alerting
     # (and the deploy healthcheck) sees it.
+    inv_warnings: list[str] = []
     try:
         from core.invariants import load_last_status
         inv = load_last_status()
         if inv and not inv.get("pass", True):
             for f in inv.get("failures", [])[:5]:
                 problems.append(f"invariant: {f}")
+        # Warnings and degraded checks ride along (200, non-blocking) so
+        # external monitors can see them without a 503.
+        if inv:
+            inv_warnings = (inv.get("warnings", [])
+                            + [f"degraded: {e}" for e in
+                               inv.get("checker_errors", [])])[:5]
     except Exception:
         pass
     # Ephemeral-storage guard: an empty state dir means trailing-stop peaks and
@@ -3043,6 +3059,7 @@ def ready():
     return jsonify({
         "ready": ok,
         "problems": problems,
+        "warnings": inv_warnings,
         "last_run_at": bot_status.get("last_run_at"),
         "last_run_status": bot_status.get("last_run_status"),
     }), (200 if ok else 503)
@@ -4132,8 +4149,9 @@ def index():
             const inv = status.invariants;
             const uni = status.universe;
             const invOk = inv ? inv.pass : null;
-            const invColor = invOk === null ? '' : invOk ? 'green' : 'red';
-            const invText = invOk === null ? '—' : invOk ? 'PASS' : `${{inv.failures.length}} VIOLATION(S)`;
+            const invWarn = inv ? ((inv.warnings || []).length + (inv.checker_errors || []).length) : 0;
+            const invColor = invOk === null ? '' : invOk ? (invWarn ? '' : 'green') : 'red';
+            const invText = invOk === null ? '—' : invOk ? (invWarn ? `PASS · ${{invWarn}}⚠` : 'PASS') : `${{inv.failures.length}} VIOLATION(S)`;
             const uniText = uni ? `${{uni.count}} names${{uni.warn ? ' ⚠ decaying' : ''}}` : '—';
             let gateBits = [];
             for (const [mName, mData] of Object.entries(status.models || {{}})) {{

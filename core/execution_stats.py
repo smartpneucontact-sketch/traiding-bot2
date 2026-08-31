@@ -156,12 +156,26 @@ def compute_slippage_stats(trades: list[dict]) -> dict:
     the research repo's TC parameter). `vs_arrival` mirrors the same shape
     on `slippage_vs_arrival_bps` (fill vs decision-time arrival price).
     """
+    # Protocol-facing calibration measures REBALANCE execution only:
+    # risk-layer trades (tier scales, gate-cadence scales, cutloss,
+    # redistributes, liquidations) are always-market by design or carry
+    # no slippage stamps, and letting them into the calibrated number —
+    # or into by_run rows the K2 slippage criterion reads — polluted the
+    # pre-registered measurement (2026-08-31 audit).
+    excluded_prefixes = ("gate_", "soft_scale", "redistribute",
+                         "cutloss", "freeze_", "portfolio_stop", "stop_")
+    risk_layer = [t for t in trades
+                  if str(t.get("action", "")).startswith(excluded_prefixes)]
+    trades = [t for t in trades
+              if not str(t.get("action", "")).startswith(excluded_prefixes)]
+
     measured = _measured_rows(trades, "slippage_bps")
     headline = _stats_block(measured)
     calibrated = headline["notional_weighted_mean_bps"]
 
     return {
         "n_trades": len(trades),
+        "n_excluded_risk_layer": len(risk_layer),
         "n_measured": len(measured),
         "n_unmeasured": len(trades) - len(measured),
         "by_side": headline["by_side"],

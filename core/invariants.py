@@ -63,6 +63,7 @@ def run_invariant_checks(logger=None) -> dict:
     volume). Never raises."""
     failures: list[str] = []
     warnings: list[str] = []
+    checker_errors: list[str] = []
     n_checks = 0
 
     def fail(msg: str) -> None:
@@ -70,6 +71,13 @@ def run_invariant_checks(logger=None) -> dict:
 
     def warn(msg: str) -> None:
         warnings.append(msg)
+
+    def broke(msg: str) -> None:
+        # The CHECKER could not run a check — that is a degraded sweep,
+        # not a proven spec divergence. Kept out of `failures` so a
+        # transient introspection error can never stick /ready at 503
+        # (2026-08-31 audit).
+        checker_errors.append(msg)
 
     try:
         manifest = json.loads(MANIFEST_PATH.read_text())
@@ -90,7 +98,7 @@ def run_invariant_checks(logger=None) -> dict:
         active = {mc.name: mc for mc in get_active_models()}
     except Exception as e:
         active = {}
-        fail(f"get_active_models() failed: {e}")
+        broke(f"get_active_models() failed: {e}")
 
     for slot_name, expect in (manifest.get("slots") or {}).items():
         n_checks += 1
@@ -121,6 +129,23 @@ def run_invariant_checks(logger=None) -> dict:
         if not Path(mc.model_path).exists():
             fail(f"slot '{slot_name}': model bundle missing at "
                  f"{mc.model_path}")
+        # Gate enablement — the one config the whole gate-cadence layer
+        # keys on, previously unchecked (2026-08-31 audit). Lives in the
+        # bundle's combo_config, so this loads the pickle (seconds).
+        if "gated" in expect and Path(mc.model_path).exists():
+            n_checks += 1
+            try:
+                from core.gate_update import config_has_gates
+                from core.runner import load_model_bundle
+                bundle = load_model_bundle(mc.model_path)
+                actually_gated = config_has_gates(bundle.get("combo_config"))
+                if actually_gated != bool(expect["gated"]):
+                    fail(f"slot '{slot_name}': bundle gates are "
+                         f"{'ON' if actually_gated else 'OFF'}, spec says "
+                         f"{'ON' if expect['gated'] else 'OFF'}")
+            except Exception as e:
+                broke(f"slot '{slot_name}': gate enablement check "
+                      f"errored: {e}")
         # Protocol binding: once the forward test started, the protocol
         # file's bytes must still hash to the sha bound at first funded
         # rebalance (edits after start void the pre-registration).
@@ -130,7 +155,15 @@ def run_invariant_checks(logger=None) -> dict:
             with state_lock:
                 st = load_state(mc)
             bound = st.get("protocol_sha256")
-            if st.get("forward_test_start") and bound:
+            if st.get("forward_test_start") and not bound:
+                # The exact July failure mode this check exists for: the
+                # clock started but no sha ever bound. Silently skipping
+                # it here defeated the check (2026-08-31 audit).
+                n_checks += 1
+                fail(f"slot '{slot_name}': forward test started "
+                     f"{st['forward_test_start']} but NO protocol sha256 "
+                     f"is bound")
+            elif st.get("forward_test_start") and bound:
                 n_checks += 1
                 ppath = protocol_path_for(slot_name)
                 actual_sha = _sha256_file(ppath)
@@ -142,7 +175,7 @@ def run_invariant_checks(logger=None) -> dict:
                          f"{actual_sha[:12]} != bound {bound[:12]} "
                          f"(MODIFIED_AFTER_START)")
         except Exception as e:
-            warn(f"slot '{slot_name}': protocol binding check errored: {e}")
+            broke(f"slot '{slot_name}': protocol binding check errored: {e}")
 
     extra = set(active) - set(manifest.get("slots") or {})
     for name in sorted(extra):
@@ -164,7 +197,7 @@ def run_invariant_checks(logger=None) -> dict:
                     fail(f"MIN_STOCKS_REQUIRED is {MIN_STOCKS_REQUIRED}, "
                          f"spec says {wanted}")
         except Exception as e:
-            fail(f"MIN_STOCKS_REQUIRED check errored: {e}")
+            broke(f"MIN_STOCKS_REQUIRED check errored: {e}")
 
     n_checks += 1
     try:
@@ -188,7 +221,7 @@ def run_invariant_checks(logger=None) -> dict:
         except ImportError:
             fail("core.risk.TIER_FRACTIONS constant is missing")
         except Exception as e:
-            fail(f"tier fraction check errored: {e}")
+            broke(f"tier fraction check errored: {e}")
 
     n_checks += 1
     try:
@@ -207,6 +240,10 @@ def run_invariant_checks(logger=None) -> dict:
         "pass": not failures,
         "failures": failures,
         "warnings": warnings,
+        # Checks the checker itself could not run — a degraded sweep, not
+        # a proven divergence; /ready stays 200 on these.
+        "checker_errors": checker_errors,
+        "degraded": bool(checker_errors),
         "n_checks": n_checks,
     }
     _persist(result, logger)
@@ -216,19 +253,26 @@ def run_invariant_checks(logger=None) -> dict:
 def _persist(result: dict, logger=None) -> None:
     try:
         STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATUS_PATH.write_text(json.dumps(result, indent=1))
+        tmp = STATUS_PATH.with_name(STATUS_PATH.name + ".tmp")
+        tmp.write_text(json.dumps(result, indent=1))
+        os.replace(tmp, STATUS_PATH)
     except Exception:
         pass
     if logger is not None:
         if result["failures"]:
             for f in result["failures"]:
                 logger.critical(f"[INVARIANT VIOLATION] {f}")
+        for e in result.get("checker_errors", []):
+            logger.error(f"[invariant DEGRADED] {e}")
         for w in result["warnings"]:
             logger.warning(f"[invariant] {w}")
         if result["pass"]:
             logger.info(f"[invariant] all {result['n_checks']} checks passed"
                         + (f" ({len(result['warnings'])} warnings)"
-                           if result["warnings"] else ""))
+                           if result["warnings"] else "")
+                        + (f" ({len(result['checker_errors'])} checks "
+                           f"DEGRADED)" if result.get("checker_errors")
+                           else ""))
 
 
 def load_last_status() -> dict | None:

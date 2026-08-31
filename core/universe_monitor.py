@@ -36,13 +36,27 @@ def record_universe_snapshot(symbols_with_bars: list[str], logger) -> dict:
     try:
         history: list[dict] = []
         prev_names: list[str] | None = None
+        prev_date: str | None = None
         if CHURN_PATH.exists():
-            payload = json.loads(CHURN_PATH.read_text())
+            try:
+                payload = json.loads(CHURN_PATH.read_text())
+            except Exception:
+                # A torn/corrupt file must not kill the monitor forever —
+                # restart the record with a marker (2026-08-31 audit).
+                payload = {"history": [{"date": today, "count": -1,
+                                        "note": "corrupt file, restarted"}]}
             history = payload.get("history", [])
             prev_names = payload.get("last_names")
-        # Same-day re-run: drop today's earlier entry, diff vs yesterday's
-        # names is preserved because last_names is only rewritten below.
+            prev_date = payload.get("last_names_date")
+        # Same-day re-run: drop today's earlier entry AND keep diffing
+        # against the PREVIOUS day's baseline — the baseline only rotates
+        # when the stored date changes (2026-08-31 audit: the old code
+        # rotated last_names every run, so a re-run diffed against this
+        # morning instead of yesterday, erasing the day's churn record).
         history = [h for h in history if h.get("date") != today]
+        same_day_rerun = prev_date == today
+        if same_day_rerun:
+            prev_names = payload.get("baseline_names", prev_names)
 
         if prev_names is not None:
             prev_set, cur_set = set(prev_names), set(symbols_with_bars)
@@ -55,12 +69,20 @@ def record_universe_snapshot(symbols_with_bars: list[str], logger) -> dict:
         history = history[-_MAX_SNAPSHOTS:]
 
         CHURN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CHURN_PATH.write_text(json.dumps({
+        tmp = CHURN_PATH.with_name(CHURN_PATH.name + ".tmp")
+        tmp.write_text(json.dumps({
             "history": history,
             "last_names": sorted(symbols_with_bars),
+            "last_names_date": today,
+            # The diff baseline: yesterday's names, held stable across
+            # same-day re-runs.
+            "baseline_names": (payload.get("baseline_names", prev_names)
+                               if same_day_rerun
+                               else prev_names) or sorted(symbols_with_bars),
             "warn_threshold": WARN_THRESHOLD,
             "updated": datetime.now().isoformat(),
         }, indent=1))
+        os.replace(tmp, CHURN_PATH)
 
         if snap["warn"]:
             logger.warning(

@@ -70,3 +70,54 @@ Also shipped in this pass:
 Disclosure: the daily gate pass changes live behavior of running
 forward tests toward their validated reference. It will be disclosed in
 the 3-month checkpoint documents alongside the Aug 18-28 outage.
+
+## 2026-08-31 — Adversarial audit of the 08-30 pass: 1 critical + 10 majors fixed
+
+An 81-agent adversarial audit (8 review lenses, 2-refuter verification per
+finding, completeness critic) of Saturday's Tier A-D code confirmed 43
+findings (many duplicates across lenses). Unique defects fixed today,
+BEFORE the first live daily gate pass (Tue 09:35):
+
+1. CRITICAL — daily gate pass dead on arrival: get_positions() returns
+   {symbol: {...}} with no 'symbol' key in the values; the pass raised
+   KeyError on every real book, swallowed it, and returned without
+   trading — the whipsaw fix was inert. Masked by test mocks that
+   injected the key. Fixed (symbol injected from dict key; mocks now
+   mirror the real shape); dot-form Alpaca symbols (BRK.B) also mapped
+   back to the universe's dash-form for the book-DD lookup.
+2. Tier anchor inflated after a buying-power-capped re-lever (stale
+   pre-cap delta) — could disable the soft stop for the day. Anchors and
+   multiplier commits now derive from SUBMITTED notional only; zero
+   placed orders commit nothing.
+3. Lost-update race: the pass could overwrite a concurrent tier cut's
+   multiplier write. Final write is now compositional (fresh disk value ×
+   achieved factor) with a pre-trade abort on stop-trip/state-change.
+4. Tier cuts are now STICKY until the next rebalance
+   (tier_floor_multiplier; stop_grid semantics) — a recovered gate no
+   longer re-buys a tier stop's risk reduction.
+5. Applied multiplier now records the REALIZED rebalance scaling
+   (gross_final/gross_pre_gate, includes the gross cap + dust filter) and
+   the daily pass re-applies the cap via gate_ref — effective leverage
+   can no longer exceed design when the cap binds.
+6. Raw gate ~0 now liquidates fully and clears last_rebalance (validated
+   g=0 + re-entry through the normal rebalance the day the gate
+   re-opens); the history bootstrap (which ignored interim tier cuts) is
+   removed.
+7. Gate/tier/cutloss rows are excluded from the protocol-facing slippage
+   calibration (K2 reads rebalance execution only).
+8. Invariants: fts-without-bound-sha now FAILS (the July half-bound
+   state was silently skipped); per-slot gate enablement checked against
+   the bundle; checker errors are 'degraded' (no more transient 503s);
+   protocol binding computes the sha before setting the clock.
+9. Universe monitor: same-day re-runs no longer clobber the day's churn
+   baseline; corrupt-file recovery; atomic writes (also state files and
+   invariants status — torn-read fix for out-of-process readers).
+10. data_guard_aborts writes are locked+targeted (no more clobbering
+    scanner state); universe snapshots skipped on partial downloads.
+11. Calendar: ET clock (was UTC), overdue covers ALL unresolved past
+    events (was decisions only); invariant warnings visible on the tile
+    and in /ready's 200 payload.
+
+Tests: 249 passing (40 in tests/test_improvements_ad.py, rewritten with
+production-shape mocks). Refuted by verification: 3 findings. Remaining
+accepted-risk notes live in the audit result (task w6aw0s0mk).

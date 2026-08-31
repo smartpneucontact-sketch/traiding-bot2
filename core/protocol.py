@@ -115,8 +115,13 @@ def bind_forward_test_start(state: dict, model_name: str,
     """
     if state.get("forward_test_start"):
         return False
+    # Sha FIRST: if hashing throws (missing/unreadable protocol file),
+    # neither key is set and the binding retries next run — setting the
+    # clock first left fts bound with no sha, the exact half-bound state
+    # the invariant sweep flags (2026-08-31 audit).
+    sha = file_sha256(protocol_path_for(model_name))
     state["forward_test_start"] = today_iso
-    state["protocol_sha256"] = file_sha256(protocol_path_for(model_name))
+    state["protocol_sha256"] = sha
     return True
 
 # Every criterion must carry exactly these keys (extras like

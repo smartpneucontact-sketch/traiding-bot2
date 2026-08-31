@@ -621,7 +621,11 @@ def _redistribute_after_cutloss(mc: "ModelConfig", sold_symbols: list[str],
 
     n_to_replace = len(sold_symbols)
 
-    state = load_state(mc)
+    # Locked read (2026-08-31 audit): this runs OUTSIDE the scan's lock
+    # scope, and save_state is atomic now, but the lock also serializes
+    # against an in-flight locked read-modify-write in the same process.
+    with _cutloss_state_lock:
+        state = load_state(mc)
     history = state.get("history", [])
 
     # Never re-buy a name that any scan stopped out today — not just the
@@ -1140,8 +1144,14 @@ def _soft_scale_portfolio(mc: "ModelConfig", positions: list,
         target = state if state is not None else load_state(mc)
         applied = target.get("applied_exposure_multiplier")
         if applied is not None and float(applied) > 0:
+            kept = 1.0 - fraction_to_sell
             target["applied_exposure_multiplier"] = round(
-                float(applied) * (1.0 - fraction_to_sell), 4)
+                float(applied) * kept, 4)
+            # Tier cuts are STICKY until the next rebalance (stop_grid
+            # semantics, 2026-08-31 audit): the floor caps the daily gate
+            # pass's target so a recovered gate never re-buys this cut.
+            floor = float(target.get("tier_floor_multiplier", 1.0) or 1.0)
+            target["tier_floor_multiplier"] = round(floor * kept, 4)
             save_state(target, mc)
     except Exception as e:
         logger.error(f"[CUTLOSS] {mc.name}: gate-multiplier update failed: {e}")

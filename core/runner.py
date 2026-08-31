@@ -388,8 +388,15 @@ def run_single_model(
         # "last run" tile. /ready and /api/status surface this counter as a
         # problem at >=2 so a repeating guard abort cannot stay silent.
         try:
-            state["data_guard_aborts"] = int(state.get("data_guard_aborts", 0)) + 1
-            save_state(state, mc)
+            # Locked, targeted write onto a fresh disk copy: the Step-2
+            # `state` snapshot predates concurrent scanner/gate writes,
+            # and a bare save of it here would clobber them
+            # (2026-08-31 audit).
+            with state_lock:
+                disk = load_state(mc)
+                disk["data_guard_aborts"] = int(disk.get("data_guard_aborts", 0)) + 1
+                save_state(disk, mc)
+            state["data_guard_aborts"] = disk["data_guard_aborts"]
         except Exception:
             pass
         report.end_step("compute_features")
@@ -410,8 +417,11 @@ def run_single_model(
     # Data guards passed — reset the consecutive-abort alarm counter.
     if state.get("data_guard_aborts"):
         try:
+            with state_lock:
+                disk = load_state(mc)
+                disk["data_guard_aborts"] = 0
+                save_state(disk, mc)
             state["data_guard_aborts"] = 0
-            save_state(state, mc)
         except Exception:
             pass
 
@@ -753,18 +763,22 @@ def run_single_model(
             logger.warning(
                 f"  day-start book anchor refresh failed (non-fatal): {e}"
             )
-        # Gate-cadence bookkeeping: record the multiplier this rebalance
-        # actually applied (compute_weights' exposure_multiplier) so the
-        # daily gate pass (core/gate_update.py) scales relative to it.
+        # Gate-cadence bookkeeping: record the REALIZED book scaling this
+        # rebalance applied (gross_final/gross_pre_gate — includes the
+        # gross cap and dust filter, not just the raw gate), the gate_ref
+        # for the daily pass's cap re-application, and reset the tier
+        # floor (core/gate_update.py, 2026-08-31 audit semantics).
         # Scanner-owned-key contract: written straight to disk under the
         # lock; the merged save below adopts it from disk.
         if strategy_type == "direct_weights":
             try:
-                from core.gate_update import config_has_gates, set_applied_multiplier
-                if config_has_gates(model_bundle.get("combo_config")):
-                    set_applied_multiplier(mc, regime_exposure, logger)
+                from core.gate_update import config_has_gates, set_gate_state_at_rebalance
+                cfg_obj = model_bundle.get("combo_config")
+                if config_has_gates(cfg_obj):
+                    diag_now = getattr(model, "last_diagnostics", None) or {}
+                    set_gate_state_at_rebalance(mc, diag_now, cfg_obj, logger)
             except Exception as e:
-                logger.warning(f"  applied-multiplier write failed (non-fatal): {e}")
+                logger.warning(f"  gate-state write failed (non-fatal): {e}")
         # Forward-test clock: the first FUNDED rebalance starts the
         # pre-registered paper test, binding it to the exact protocol
         # bytes committed beforehand (any later edit → hash mismatch →
@@ -908,10 +922,18 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
 
         # Universe churn monitor (Aug 18-28 outage follow-up): record the
         # daily usable-bars count + name churn so universe decay is a
-        # visible trend, not a silent walk toward the data guard.
+        # visible trend, not a silent walk toward the data guard. A
+        # partially-failed download is NOT a universe snapshot — skipping
+        # it keeps the churn baseline clean (2026-08-31 audit).
         try:
-            from core.universe_monitor import record_universe_snapshot
-            record_universe_snapshot(sorted(stock_data.keys()), logger)
+            if len(stock_data) >= MIN_STOCKS_REQUIRED:
+                from core.universe_monitor import record_universe_snapshot
+                record_universe_snapshot(sorted(stock_data.keys()), logger)
+            else:
+                logger.warning(
+                    f"universe snapshot skipped: only {len(stock_data)} "
+                    f"names downloaded (< {MIN_STOCKS_REQUIRED}) — likely a "
+                    f"data problem, not real churn")
         except Exception as e:
             logger.warning(f"universe churn snapshot failed (non-fatal): {e}")
 

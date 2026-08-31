@@ -18,7 +18,8 @@
       "exec_limit_buffer_bps": 10.0,
       "enable_cutloss": true,
       "cutloss_portfolio_stop": -4.0,
-      "cutloss_scale_by_leverage": true
+      "cutloss_scale_by_leverage": true,
+      "gated": true
     },
     "combo_v2_exp": {
       "enabled": true,
@@ -27,13 +28,15 @@
       "exec_limit_buffer_bps": 10.0,
       "enable_cutloss": true,
       "cutloss_portfolio_stop": -4.0,
-      "cutloss_scale_by_leverage": true
+      "cutloss_scale_by_leverage": true,
+      "gated": true
     },
     "combo_v2_process": {
       "enabled": true,
       "target_leverage": 2.0,
       "exec_style": "marketable_limit",
-      "exec_limit_buffer_bps": 10.0
+      "exec_limit_buffer_bps": 10.0,
+      "gated": false
     }
   },
   "runtime": {

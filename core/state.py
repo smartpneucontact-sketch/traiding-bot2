@@ -13,6 +13,7 @@ ratchet up coupling for no real safety win.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -52,7 +53,15 @@ SCANNER_OWNED_KEYS = (
     # is written straight to disk under the lock by THREE writers — the
     # rebalance path, the daily gate pass, and the tier scaler — so the
     # pipeline's merged save must always adopt the disk copy.
+    # tier_floor_multiplier: cumulative tier-cut fraction for the current
+    # rebalance cycle (stop_grid cuts persist to the next rebalance —
+    # 2026-08-31 audit); gate_ref: rebalance-time {gross_pre_gate,
+    # max_gross_exposure} so the daily pass can re-apply the gross cap;
+    # gate_data_skips: consecutive thin-data gate-pass skips (stall alarm).
     "applied_exposure_multiplier",
+    "tier_floor_multiplier",
+    "gate_ref",
+    "gate_data_skips",
     "gate_update_history",
 )
 
@@ -70,9 +79,15 @@ def load_state(mc: "ModelConfig") -> dict:
 
 
 def save_state(state: dict, mc: "ModelConfig") -> None:
-    """Save pipeline state to JSON for a specific model."""
+    """Save pipeline state to JSON for a specific model.
+
+    Atomic (write-to-temp + os.replace, 2026-08-31 audit): the dashboard
+    and other processes read these files without the in-process lock, so
+    a plain write_text could hand them a torn file mid-write."""
     mc.state_path.parent.mkdir(parents=True, exist_ok=True)
-    mc.state_path.write_text(json.dumps(state, indent=2, default=str))
+    tmp = mc.state_path.with_name(mc.state_path.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, default=str))
+    os.replace(tmp, mc.state_path)
 
 
 def merge_scanner_state(state: dict, mc: "ModelConfig") -> dict:
