@@ -101,15 +101,30 @@ def fidelity_gate(base: pd.DataFrame) -> None:
 
 
 def result_row(lev: float, tc: float, window: str, s: dict, turnover: float,
-               source: str) -> dict:
+               source: str, avg_gross: float | None = None) -> dict:
+    # avg_gross is a prereg-declared output column (2026-08-31 audit: it
+    # was missing from the first render of lev_recal.csv).
     return {"name": f"combo_v2_{lev:g}x", "leverage": lev, "tc_bps": tc,
             "window": window, "geo_monthly": s["geo_monthly"],
             "mean_monthly": s["mean_monthly"], "sharpe": s["sharpe"],
             "max_drawdown": s["max_drawdown"], "calmar": s["calmar"],
-            "turnover_ann": turnover, "source": source}
+            "turnover_ann": turnover,
+            "avg_gross": (avg_gross if avg_gross is not None
+                          else s.get("avg_gross_exposure")),
+            "source": source}
 
 
-def cited_rows(rows: list[dict]) -> None:
+def _sliced_avg_gross(weights: pd.DataFrame, start: str) -> float | None:
+    """2019on avg gross from the daily-ffilled decision frame (pre-cap
+    approximation, labeled as derived in the source column)."""
+    try:
+        daily = weights.ffill().abs().sum(axis=1)
+        return float(daily.loc[start:].mean())
+    except Exception:
+        return None
+
+
+def cited_rows(base: pd.DataFrame, rows: list[dict]) -> None:
     led = pd.read_csv(TRIALS_DIR / "tc_recal.csv")
     for lev, tc in sorted(CITED_FROM_TC_RECAL):
         for window in ("full", "dev"):
@@ -122,7 +137,31 @@ def cited_rows(rows: list[dict]) -> None:
                 lev, tc, window, ledger_row_to_summary(r),
                 float(r["turnover_ann"]),
                 f"results/v7/trials/tc_recal.csv "
-                f"name=combo_v2_{lev:g}x_tc{tc:g} window={window}"))
+                f"name=combo_v2_{lev:g}x_tc{tc:g} window={window}",
+                avg_gross=float(r["avg_gross"]) if "avg_gross" in r else None))
+        # 2019on for the cited cells (prereg-declared table completeness,
+        # 2026-08-31 audit): log=False full re-render asserted against the
+        # cited full row, then sliced — no new ledger rows.
+        name = f"combo_v2_{lev:g}x_tc{tc:g}"
+        fref = led[(led["name"] == name) & (led["window"] == "full")].iloc[-1]
+        w = base * lev
+        res = run_trial(w, name=f"{name}_2019on_gate", family=FAMILY,
+                        params={"derived": True}, window="full",
+                        exec_model="next_open", tc_bps=tc, leverage_cap=2.0,
+                        margin_bps_annual=MARGIN_BPS, final=True, log=False,
+                        notes="cited-cell 2019on derivation re-render, NOT ledgered")
+        d_sr = abs(res["summary"]["sharpe"] - float(fref["sharpe"]))
+        assert d_sr < GATE_TOL_SR, \
+            f"2019on derivation re-render mismatch vs tc_recal.csv {name}"
+        rows.append(result_row(
+            lev, tc, "2019on",
+            sliced_summary(res["equity"], "2019-01-01", None,
+                           f"{name}_2019on"),
+            sliced_turnover(res["weights"], "2019-01-01", None),
+            f"derived: log=False re-render asserted == "
+            f"results/v7/trials/tc_recal.csv name={name} window=full, "
+            f"equity sliced >=2019-01-01",
+            avg_gross=_sliced_avg_gross(res["weights"], "2019-01-01")))
 
 
 def render_cells(base: pd.DataFrame, rows: list[dict]) -> None:
@@ -151,10 +190,19 @@ def render_cells(base: pd.DataFrame, rows: list[dict]) -> None:
                                 margin_bps_annual=MARGIN_BPS,
                                 final=(window == "full"), log=log, notes=NOTE)
                 s = res["summary"]
-                src = (f"results/v7/trials/lev1.csv name={name} "
-                       f"window={window}" if log else
-                       f"UNLEDGERED (log=False, prereg not frozen) "
-                       f"name={name} window={window}")
+                # Provenance must reflect the ACTUAL reason a row is not
+                # freshly ledgered: on resume the cell already sits in the
+                # family ledger (2026-08-31 audit — the old string claimed
+                # 'prereg not frozen' for resumed cells).
+                if log:
+                    src = (f"results/v7/trials/lev1.csv name={name} "
+                           f"window={window}")
+                elif (name, window) in done:
+                    src = (f"results/v7/trials/lev1.csv name={name} "
+                           f"window={window} (resume: already ledgered)")
+                else:
+                    src = (f"UNLEDGERED (log=False, prereg not frozen) "
+                           f"name={name} window={window}")
                 rows.append(result_row(lev, tc, window, s,
                                        float(s["turnover_annualized"]), src))
                 print(f"[lev1] {name:22s} {window:4s} "
@@ -166,7 +214,9 @@ def render_cells(base: pd.DataFrame, rows: list[dict]) -> None:
                         sliced_summary(res["equity"], "2019-01-01", None,
                                        f"{name}_2019on"),
                         sliced_turnover(res["weights"], "2019-01-01", None),
-                        f"derived: {src} equity sliced >=2019-01-01"))
+                        f"derived: {src} equity sliced >=2019-01-01",
+                        avg_gross=_sliced_avg_gross(res["weights"],
+                                                    "2019-01-01")))
 
 
 def summarize(df: pd.DataFrame) -> None:
@@ -200,7 +250,7 @@ def main() -> None:
     base = build_base()
     fidelity_gate(base)
     rows: list[dict] = []
-    cited_rows(rows)
+    cited_rows(base, rows)
     render_cells(base, rows)
     df = pd.DataFrame(rows).drop_duplicates(
         subset=["leverage", "tc_bps", "window"], keep="last")

@@ -40,11 +40,27 @@ ORIGINALS = {  # cited context from ws4_*_results.csv (prereg "Cells")
 }
 
 
+# Pin: the prereg cites these exact ledgered dev Sharpes; a re-run after
+# any ledger drift (duplicate rows, re-renders) must fail loudly rather
+# than silently score a different row (2026-08-31 audit).
+_PINNED_SHARPE = {
+    "vixterm_thr1.05_m0.5": 0.994560,
+    "breadth_ad63_p10_m0.5": 0.988219,
+    "combo_v2_2x": 0.963057,
+}
+
+
 def dev_row(fname: str, name: str) -> pd.Series:
     led = pd.read_csv(TRIALS_DIR / fname)
     r = led[(led["name"] == name) & (led["window"] == "dev")]
     assert len(r) >= 1, f"missing {name} dev in trials/{fname}"
-    return r.iloc[-1]
+    row = r.iloc[-1]
+    pin = _PINNED_SHARPE.get(name)
+    if pin is not None:
+        assert abs(float(row["sharpe"]) - pin) < 1e-6, (
+            f"{name}: ledgered sharpe {float(row['sharpe']):.6f} != "
+            f"prereg-cited {pin:.6f} — ledger drifted, refusing to score")
+    return row
 
 
 def geo_from_cagr(cagr: float) -> float:

@@ -258,6 +258,27 @@ def validate(winner_band: float) -> None:
     if not PREREG_FROZEN:
         raise SystemExit("validate(): prereg not frozen — no val shot.")
     assert winner_band in BANDS, "winner must be one of the pre-registered bands"
+    # 2026-08-31 audit hardening: (1) the argument must equal the RECORDED
+    # dev winner — validate() cannot be pointed at a different band;
+    # (2) a re-invocation must never double-ledger the one-shot val rows.
+    dev = pd.read_csv(OUT_CSV)
+    ctrl = dev[dev["band"] == 0.0].set_index("tc_bps")
+    qual = []
+    for band in BANDS:
+        sub = dev[dev["band"] == band].set_index("tc_bps")
+        if (all(sub.loc[tc, "geo_monthly"] > ctrl.loc[tc, "geo_monthly"]
+                for tc in TCS)
+                and all(sub.loc[tc, "max_drawdown"] >= ctrl.loc[tc, "max_drawdown"] - 0.02
+                        for tc in TCS)):
+            qual.append((band, float(sub.loc[50.0, "geo_monthly"])))
+    qual.sort(key=lambda t: (-t[1], t[0]))
+    assert qual and qual[0][0] == winner_band, (
+        f"validate({winner_band:g}) does not match the recorded dev winner "
+        f"({qual[0][0] if qual else 'NONE'}) in {OUT_CSV}")
+    done_val: set[str] = set()
+    if LEDGER.exists():
+        led = pd.read_csv(LEDGER)
+        done_val = set(led[led["window"] == "val"]["name"])
     w_frame = build_champion_frame()
     refs = control_refs()
     fidelity_gates(w_frame, refs)
@@ -273,15 +294,17 @@ def validate(winner_band: float) -> None:
                       window="full", final=True, log=False,
                       notes="control comparator re-render, NOT ledgered")
         d_sr = abs(rc["summary"]["sharpe"] - float(fref["sharpe"]))
-        assert d_sr < GATE_TOL_SR, \
+        d_cg = abs(rc["summary"]["cagr"] - float(fref["cagr"]))
+        assert d_sr < GATE_TOL_SR and d_cg < GATE_TOL_CAGR, \
             f"control full re-render mismatch vs tc_recal.csv at tc={tc:g}"
         from metrics import summary as msum
         eqc = rc["equity"].loc["2023-01-01":]
         sc = msum(eqc / eqc.iloc[0] * 100_000.0, name=f"ctrl_val_tc{tc:g}")
 
-        rv = run_cell(wb, name=f"drift_b{winner_band:g}_tc{tc:g}", tc=tc,
+        val_name = f"drift_b{winner_band:g}_tc{tc:g}"
+        rv = run_cell(wb, name=val_name, tc=tc,
                       band=winner_band, window="val", final=True,
-                      log=PREREG_FROZEN)
+                      log=PREREG_FROZEN and val_name not in done_val)
         sv = rv["summary"]
         print(f"[val tc={tc:g}] winner geo={sv['geo_monthly']*100:+.3f}%/mo "
               f"dd={sv['max_drawdown']*100:.1f}% | control "
