@@ -145,16 +145,26 @@ def compute_live_gate_multiplier(config, stock_data, macro_data,
     if getattr(config, "enable_book_dd_gate", False):
         if stock_px is None or stock_px.empty or not held_weights:
             return None
+        # Drop trailing all-NaN rows (a pre-open partial row from the data
+        # feed) BEFORE the drawdown read: on 2026-09-23 such a row made
+        # _book_drawdown return None, and the combination rule below then
+        # treated a missing book gate as spy-only = 1.0 — a data glitch
+        # silently OPENING the gate. Daily-pass-only hygiene; the
+        # validated compute_weights path is untouched.
+        stock_px = stock_px.dropna(how="all")
         book_dd = _book_drawdown(
             stock_px, held_weights,
             lookback=getattr(config, "book_dd_lookback", 60),
         )
-        if book_dd is not None:
-            book_gate = _linear_dd_ramp(
-                book_dd,
-                getattr(config, "book_full_dd", 0.15),
-                getattr(config, "book_cash_dd", 0.30),
-            )
+        if book_dd is None:
+            # Book gate enabled but uncomputable: the pass must SKIP, never
+            # default to an open gate (2026-09-26 live finding).
+            return None
+        book_gate = _linear_dd_ramp(
+            book_dd,
+            getattr(config, "book_full_dd", 0.15),
+            getattr(config, "book_cash_dd", 0.30),
+        )
 
     # Identical combination rule to compute_weights.
     exposure = spy_gate if book_gate is None else min(spy_gate, book_gate)

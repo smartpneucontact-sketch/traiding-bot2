@@ -763,3 +763,30 @@ def test_dashboard_calendar_view_overdue_covers_all_kinds(monkeypatch):
     # past unresolved event, no kind filter.
     assert view["upcoming"] == sorted(view["upcoming"], key=lambda e: e["date"])
     assert len(view["upcoming"]) <= 5
+
+
+# ──────── 2026-09-26 live finding: null book_dd must SKIP, not open ───────
+
+def test_null_book_dd_skips_instead_of_opening_gate():
+    """On 2026-09-23 a trailing all-NaN price row made _book_drawdown
+    return None and the gate read 1.0 (spy-only). With the book gate
+    enabled, an uncomputable book drawdown must yield None (skip)."""
+    cfg = ComboConfig()  # book gate on
+    stock_data = _synthetic_stock_data(crash_last=0.20)
+    # Held names that are NOT in the price panel -> book_dd uncomputable.
+    held = {"ZZZ1": 1.0, "ZZZ2": 1.0}
+    assert gu.compute_live_gate_multiplier(cfg, stock_data, {}, held) is None
+
+
+def test_trailing_nan_row_is_dropped_before_gate_read():
+    """A pre-open partial row (all-NaN closes) must not blank the gate:
+    the pass should read yesterday's close and still see the -20% dip."""
+    cfg = ComboConfig()
+    stock_data = _synthetic_stock_data(crash_last=0.20)
+    for sym, df in stock_data.items():
+        nxt = df.index[-1] + pd.tseries.offsets.BDay(1)
+        df.loc[nxt] = np.nan
+    held = {s: 1.0 for s in list(stock_data)[:30]}
+    gate = gu.compute_live_gate_multiplier(cfg, stock_data, {}, held)
+    assert gate is not None and gate["book_dd"] is not None
+    assert gate["multiplier"] < 1.0

@@ -121,3 +121,41 @@ BEFORE the first live daily gate pass (Tue 09:35):
 Tests: 249 passing (40 in tests/test_improvements_ad.py, rewritten with
 production-shape mocks). Refuted by verification: 3 findings. Remaining
 accepted-risk notes live in the audit result (task w6aw0s0mk).
+
+## 2026-09-26 — September review: gate pass verified live; one glitch class closed
+
+First month of the daily gate cadence (live since 2026-09-01, audit-fixed
+build). Verified from the container's gate_update_history (19 sessions):
+- Primary: 3 scaling events — re-lever 2026-09-10 (0.792→0.899), de-lever
+  2026-09-15 (0.899→0.781), re-lever 2026-09-18 (0.781→0.916); 16 holds
+  within the 0.10 band. Book drawdown healed −15.1% → −9.8%; gate target
+  reached 1.0 on 2026-09-22.
+- Candidate X: 1 re-lever (2026-09-10, 0.809→0.911); target 1.0 from
+  2026-09-22, held within band since.
+- Process: correctly skipped every day (ungated).
+- No tier stops, no portfolio stops, no freeze, no data-guard aborts;
+  universe stable at 499 names (one-day dip to 498 on 09-10); invariants
+  31/31 PASS every run.
+Performance 2026-08-31 → 2026-09-25 (Alpaca equity): primary +13.09%
+(maxDD −6.5%), Candidate X +11.14% (−5.6%), process +11.43% (−4.7%);
+SPY +0.81%. Since forward-test start: primary +13.9% vs SPY +4.2%,
+Candidate X +10.6% vs +3.3%, process +9.4% vs +4.6% (all within their
+1-sigma tracking bands).
+
+FINDING + FIX — gate silently opened on a data glitch: on 2026-09-23 the
+gate trace shows book_dd=null with target=1.0. Cause: a trailing all-NaN
+price row (pre-open partial bar) made _book_drawdown return None, and the
+combination rule treated a missing book gate as spy-only = 1.0. Harmless
+that day (applied 0.916, within band), but with a deeply gated book it
+would have re-levered to 1.0 on bad data. Fixed in core/gate_update.py:
+trailing all-NaN rows are dropped before the drawdown read (daily-pass
+only; compute_weights untouched), and an uncomputable book drawdown now
+SKIPS the pass instead of defaulting to open. Two regression tests.
+
+Also: Candidate X tracking view was blind ("bundle has no
+geo_monthly_return reference") since 2026-07-21 — a display bug, fixed by
+deriving geo from mean and sigma (labeled expected_geo_derived=true) in
+core/tracking.py. Freeze-ablation report #2 written 5 days late (clean
+null; research repo). The session-scoped daily /ready probe expired
+2026-09-07 (7-day cron cap) — an external uptime monitor is still the
+durable answer.

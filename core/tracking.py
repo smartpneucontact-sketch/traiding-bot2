@@ -178,8 +178,24 @@ def compute_tracking(
     ref = ref or {}
     geo_ref = ref.get("geo_monthly_return")
     sigma_m = derive_sigma_monthly(ref)
+    # Fallback (2026-09-26): the Candidate X bundle's backtest_reference
+    # carries mean_monthly_return + sharpe but no geo_monthly_return, which
+    # left its tracking view blind ("insufficient_data") for two months.
+    # Derive the geometric rate from the arithmetic mean and the
+    # back-derived sigma (lognormal drift: geo ~= mean - sigma^2/2) and
+    # label it — never silently equate mean with geo.
+    geo_derived = False
+    if geo_ref is None and sigma_m is not None:
+        try:
+            mean_m = float(ref.get("mean_monthly_return"))
+            if mean_m > 0:
+                geo_ref = mean_m - 0.5 * sigma_m ** 2
+                geo_derived = True
+        except (TypeError, ValueError):
+            pass
 
     base = {
+        "expected_geo_derived": geo_derived,
         "status": "not_started",
         "forward_test_start": start_iso[:10] if start_iso else None,
         "expected_geo_monthly": geo_ref,
