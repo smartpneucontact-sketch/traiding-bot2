@@ -74,6 +74,7 @@ def test_config_passthrough_auction_fields(tmp_path, monkeypatch):
                    "exec_style": "auction", "exec_auction_buffer_bps": 80}]})
     monkeypatch.setattr(cfg, "_ensure_shadow_slots", lambda c: c)
     monkeypatch.setattr(cfg, "_migrate_cutloss_calibration", lambda c: c)
+    monkeypatch.setattr(cfg, "_migrate_exec_style", lambda c: c)      # never write a real config (round 4)
     monkeypatch.setattr(cfg.Path, "exists", lambda self: True)
     models = cfg.get_active_models()
     assert models and models[0].exec_style == "auction"
@@ -82,13 +83,22 @@ def test_config_passthrough_auction_fields(tmp_path, monkeypatch):
 
 # ───────────────────────── stage 1: submission ──────────────────────────
 
-def _broker(posted, *, reject=("REJ",)):
+def _broker(posted, *, reject=("REJ",), sync_reject=()):
+    """Mirrors the real client: a 4xx reject RAISES (core.alpaca.alpaca_request
+    raises on any non-2xx); a 2xx body with status 'rejected' is the rare
+    synchronous form. GET by client_order_id returns nothing by default."""
     def fake_request(method, endpoint, mc, data=None, logger=None, **kw):
         if method == "POST" and endpoint == "v2/orders":
             posted.append(dict(data))
             if data["symbol"] in reject:
+                from core.alpaca import AlpacaHTTPError
+                raise AlpacaHTTPError("Alpaca POST v2/orders: 422 insufficient qty", status_code=422)
+            if data["symbol"] in sync_reject:
                 return {"status": "rejected", "reject_reason": "no_bid"}
             return {"id": f"o{len(posted)}", "status": "accepted"}
+        if method == "GET" and endpoint.startswith("v2/orders:by_client_order_id"):
+            from core.alpaca import AlpacaHTTPError
+            raise AlpacaHTTPError("Alpaca GET: 404 order not found", status_code=404)
         return {}
     return fake_request
 
@@ -129,7 +139,9 @@ def test_auction_uses_official_close_moo_sells_loo_buys(tmp_path, monkeypatch):
     for o in posted:
         assert o["time_in_force"] == "opg" and "notional" not in o and float(o["qty"]).is_integer()
     # Sells are MARKET-on-open (risk-reducing, never left hanging).
-    assert by["AAA"] == {"symbol": "AAA", "side": "sell", "type": "market", "qty": "10", "time_in_force": "opg"}
+    assert by["AAA"]["client_order_id"].startswith("a") and len(by["AAA"]["client_order_id"]) <= 48
+    assert {k: v for k, v in by["AAA"].items() if k != "client_order_id"} == {
+        "symbol": "AAA", "side": "sell", "type": "market", "qty": "10", "time_in_force": "opg"}
     assert by["CCC"]["type"] == "market" and by["CCC"]["qty"] == "25"
     # Buys are LIMIT-on-open at last_close + 100bp (not the snapshot's 1.0).
     assert by["BBB"]["type"] == "limit" and by["BBB"]["qty"] == "100"
@@ -151,7 +163,7 @@ def test_auction_rejected_order_is_skipped_not_fatal(tmp_path, monkeypatch):
         tmp_path, monkeypatch, positions={}, weights={"REJ": 0.05, "BBB": 0.05},
         last_close={"REJ": 10.0, "BBB": 100.0})
     assert rb["auction"]["n_submitted"] == 1
-    assert any(s["symbol"] == "REJ" and s["reason"].startswith("rejected") for s in rb["auction"]["skipped"])
+    assert any(s["symbol"] == "REJ" and s["reason"].startswith("error:") for s in rb["auction"]["skipped"])
 
 
 # ───────────────────────── stage 2: finalization ────────────────────────
@@ -256,7 +268,7 @@ def test_finalize_helper_defers_pre_open_and_finalizes_old_days(tmp_path, monkey
     import core.runner as runner_mod
     mc = make_mc(tmp_path)
     monkeypatch.setattr("core.orders.finalize_auction_orders",
-                        lambda mc_, pending, journal, lg: {"n": len(pending), "n_filled": 1})
+                        lambda mc_, pending, journal, lg, **kw: {"n": len(pending), "n_filled": 1})
     # Today's list before the open: deferred, untouched.
     st = {"auction_stage": {"date": "2026-10-28", "pending": [{"order_id": "o1"}]}}
     monkeypatch.setattr(runner_mod, "_after_open_et", lambda: False)
@@ -357,10 +369,13 @@ def test_dashboard_auction_stage_keeps_main_run_fields(monkeypatch):
 def test_finalize_keeps_unreadable_orders_pending(tmp_path, monkeypatch):
     monkeypatch.setattr(orders_mod.time, "sleep", lambda s: None)
     """A failed read must never cancel or journal an order: it stays pending."""
+    polls = []
+
     def fake_poll(order_id, mc, lg, max_wait=8.0, **kw):
+        polls.append(order_id)
         if order_id == "o1":
             return {"id": "o1", "status": "filled", "filled_qty": "10", "filled_avg_price": "50.0"}
-        raise RuntimeError("api down")
+        return {"status": "unknown", "id": order_id}      # what poll_order_status really returns
     deletes = []
     monkeypatch.setattr(orders_mod, "poll_order_status", fake_poll)
     monkeypatch.setattr(orders_mod, "alpaca_request",
@@ -377,6 +392,7 @@ def test_finalize_keeps_unreadable_orders_pending(tmp_path, monkeypatch):
     assert stats["n"] == 1 and stats["n_filled"] == 1 and stats["n_remaining_unread"] == 1
     assert [p["order_id"] for p in stats["remaining"]] == ["o2"]
     assert not deletes and [r.symbol for r in journal.records] == ["AAA"]
+    assert polls.count("o2") == 3                                   # three polled reads, then kept pending
     assert journal.records[0].trade_id.endswith("_20261028_buy_AAA")
 
 
@@ -391,7 +407,7 @@ def test_stage1_skipped_day_never_inherits_previous_plan(tmp_path, monkeypatch):
     st = {"auction_stage": prev}
     finalized = []
     monkeypatch.setattr("core.orders.finalize_auction_orders",
-                        lambda mc_, pending, journal, lg: (finalized.append(len(pending)) or {"n": len(pending), "n_filled": 1}))
+                        lambda mc_, pending, journal, lg, **kw: (finalized.append(len(pending)) or {"n": len(pending), "n_filled": 1}))
     # Simulate the stage-1 pre-amble: orphan finalize happens regardless of today's outcome.
     runner_mod._finalize_auction_if_any(mc, st, StubJournal(), logger, RunReport(), "2026-10-28")
     assert finalized == [1] and st["auction_stage"]["pending"] == [] and st["auction_stage"]["finalized_late"]
@@ -486,7 +502,7 @@ def test_finalize_helper_drains_orphans_and_keeps_pending_on_error(tmp_path, mon
     mc = make_mc(tmp_path)
     calls = []
 
-    def fake_finalize(mc_, pending, journal, lg):
+    def fake_finalize(mc_, pending, journal, lg, **kw):
         calls.append([p["order_id"] for p in pending])
         if pending and pending[0]["order_id"] == "boom":
             raise RuntimeError("api")
@@ -499,7 +515,7 @@ def test_finalize_helper_drains_orphans_and_keeps_pending_on_error(tmp_path, mon
     assert calls == [["old1"], ["boom"]]
     assert st["auction_stage"]["orphans"] == []                      # drained
     assert st["auction_stage"]["pending"] == [{"order_id": "boom"}]   # kept for retry
-    assert st["auction_stage"]["summary"]["error"] == "api"
+    assert st["auction_stage"]["summary_error"] == "api" and "summary" not in st["auction_stage"]
 
 
 def test_merge_uses_anchor_priced_fills_and_skips_empty(tmp_path):

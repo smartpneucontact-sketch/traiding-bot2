@@ -43,7 +43,8 @@ from core.journal import TradeRecord
 logger = logging.getLogger("test")
 
 EXEC_FIELDS = ["exec_style", "limit_price", "timed_out",
-               "replaced_to_market", "replacement_order_id"]
+               "replaced_to_market", "replacement_order_id",
+               "qty_submitted"]   # auction rows: submitted whole-share qty (round 4)
 
 
 def make_mc(tmp_path, **kw) -> ModelConfig:

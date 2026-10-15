@@ -75,7 +75,7 @@
     },
     {
       "date": "2026-12-28",
-      "label": "AUCTION1 day 3/3 (cadence falls due on Christmas; moves to the Monday)",
+      "label": "AUCTION1 day 3/3 (21st weekday after 2026-11-27; Christmas is weekday 20, so no holiday skip)",
       "kind": "measurement",
       "severity": "info"
     },

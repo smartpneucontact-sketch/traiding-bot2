@@ -105,10 +105,11 @@ def test_fetch_snapshots_parses_and_maps_class_shares(tmp_path, monkeypatch):
     monkeypatch.setattr(requests, "get", fake_get)
     snaps = alpaca_mod.fetch_snapshots(["AAPL", "BRK-B", "GONE"], mc, logger)
 
-    assert snaps["AAPL"] == {"arrival": 201.5, "day_open": 200.0,
-                             "prev_close": 199.0}
-    assert snaps["BRK-B"] == {"arrival": 410.25, "day_open": None,
-                              "prev_close": None}
+    assert {k: v for k, v in snaps["AAPL"].items() if k != "day_bar_date"} == {
+        "arrival": 201.5, "day_open": 200.0, "prev_close": 199.0}
+    assert {k: v for k, v in snaps["BRK-B"].items() if k != "day_bar_date"} == {
+        "arrival": 410.25, "day_open": None, "prev_close": None}
+    assert "day_bar_date" in snaps["AAPL"]          # dailyBar.t[:10] or None (round 4)
     assert "GONE" not in snaps
     assert len(urls) == 1
     assert "feed=iex" in urls[0]

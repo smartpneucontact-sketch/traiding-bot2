@@ -51,13 +51,24 @@ def _make_alpaca_headers(mc: "ModelConfig") -> dict:
     }
 
 
+class AlpacaHTTPError(Exception):
+    """A non-2xx Alpaca response. Carries the status code so callers can
+    tell a terminal 404 (order id unknown to the venue — e.g. after a
+    paper-account reset) from a transient 429/5xx (review round 4)."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def alpaca_request(method: str, endpoint: str, mc: "ModelConfig",
                    data=None, logger=None):
     """Make an Alpaca API request with per-model credentials.
 
-    Returns parsed JSON on 2xx, raises `Exception` on anything else.
-    204 responses (common on `DELETE /v2/positions/{sym}`) come back
-    as `{}` since they have no body.
+    Returns parsed JSON on 2xx, raises `AlpacaHTTPError` (an Exception
+    subclass carrying `.status_code`) on anything else. 204 responses
+    (common on `DELETE /v2/positions/{sym}`) come back as `{}` since they
+    have no body.
     """
     import requests
     url = f"{mc.alpaca_base_url}/{endpoint}"
@@ -79,7 +90,7 @@ def alpaca_request(method: str, endpoint: str, mc: "ModelConfig",
         err_msg = f"Alpaca {method} {endpoint}: {resp.status_code} {resp.text}"
         if logger:
             logger.error(f"    {err_msg}")
-        raise Exception(err_msg)
+        raise AlpacaHTTPError(err_msg, status_code=int(resp.status_code))
 
     if resp.status_code == 204:
         return {}
@@ -95,8 +106,12 @@ def fetch_snapshots(symbols: list[str], mc: "ModelConfig",
     called once per rebalance and the values ride into the trade journal.
 
     Returns `{symbol: {"arrival": latestTrade.p, "day_open": dailyBar.o,
-    "prev_close": prevDailyBar.c}}` keyed by the *input* (yfinance-style)
-    symbols; missing pieces are None. Chunks fail independently: symbols in
+    "day_bar_date": dailyBar.t[:10], "prev_close": prevDailyBar.c}}` keyed
+    by the *input* (yfinance-style) symbols; missing pieces are None.
+    `day_bar_date` lets callers reject a stale dailyBar (pre-open, or a
+    name that has not printed yet, the snapshot still carries the PREVIOUS
+    session's bar — review round 4). The feed is IEX: `day_open` is the
+    first IEX print, not the consolidated opening-auction price. Chunks fail independently: symbols in
     a failed chunk are simply absent from the result (partial capture beats
     none for slippage stats). Every failure only logs a warning — the order
     path must never depend on this data.
@@ -156,6 +171,8 @@ def fetch_snapshots(symbols: list[str], mc: "ModelConfig",
                 result[alpaca_to_ours.get(alp_sym, alp_sym)] = {
                     "arrival": _f(latest_trade.get("p")),
                     "day_open": _f(daily_bar.get("o")),
+                    "day_bar_date": (str(daily_bar.get("t"))[:10]
+                                     if daily_bar.get("t") else None),
                     "prev_close": _f(prev_bar.get("c")),
                 }
         except Exception as e:

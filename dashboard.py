@@ -642,10 +642,18 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
             continue
         logging.getLogger("dashboard").warning(
             f"Pipeline already running ({running_stage}), skipping {stage} run")
-        if stage == "main":
-            with status_lock:
+        with status_lock:
+            if stage == "main":
                 bot_status["skipped_main_run_at"] = _utc_now_iso()
                 bot_status["skipped_main_run_blocker"] = running_stage
+            else:
+                # The pre-open stage yielded to a manual/dry run: on a due
+                # day that silently turns an AUCTION1 measurement rebalance
+                # into a marketable-limit one — leave a trace for /ready
+                # (review round 4).
+                bot_status["auction_last_run_at"] = _utc_now_iso()
+                bot_status["auction_last_run_status"] = "skipped"
+                bot_status["auction_last_error"] = f"skipped: {running_stage} run in progress"
         return
 
     start_time = time.time()
@@ -674,9 +682,12 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
             bot_status["last_run_duration"] = round(elapsed, 1)
             bot_status["last_error"] = None
             bot_status["total_runs"] += 1
-            # A completed main run clears today's skipped-run alarm.
-            bot_status.pop("skipped_main_run_at", None)
-            bot_status.pop("skipped_main_run_blocker", None)
+            # A completed main run clears today's skipped-run alarm — only
+            # when it covered EVERY slot (a single-slot manual run must not
+            # silence the alarm for the slots that never ran; round 4).
+            if model_filter is None:
+                bot_status.pop("skipped_main_run_at", None)
+                bot_status.pop("skipped_main_run_blocker", None)
 
             targets = [model_filter] if model_filter else list(bot_status["models"].keys())
             for mn in targets:
@@ -842,10 +853,16 @@ def api_status():
             "history": state.get("history", [])[-5:],
             # Opening-auction stage (exec_style="auction"): today's outcome
             # and fill summary, never the raw pending order list.
-            "auction": {k: v for k, v in (state.get("auction_stage") or {}).items()
-                        if k in ("date", "outcome", "n_submitted", "n_skipped",
-                                 "submitted_notional_usd", "summary", "finalized_at",
-                                 "finalized_late", "auto_scaled_to_buying_power")},
+            "auction": {
+                **{k: v for k, v in (state.get("auction_stage") or {}).items()
+                   if k in ("date", "outcome", "n_submitted", "n_skipped", "n_stale_close",
+                            "submitted_notional_usd", "summary", "finalized_at",
+                            "finalized_late", "completed_at", "last_retry_at",
+                            "auto_scaled_to_buying_power", "summary_error")},
+                "n_pending": len((state.get("auction_stage") or {}).get("pending") or []),
+                "n_orphans": len((state.get("auction_stage") or {}).get("orphans") or []),
+                "completion_deferred": state.get("auction_completion_deferred"),
+            },
             # Gate-cadence posture (core/gate_update.py): the multiplier
             # the book currently carries + the latest daily check.
             "gate": {
@@ -892,6 +909,58 @@ def _et_today_iso() -> str:
         return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     except Exception:
         return datetime.now().strftime("%Y-%m-%d")
+
+
+def _rebalance_horizon() -> int:
+    """The runner's rebalance cadence (trading days); the dashboard's
+    `pipeline` import is the thin shim, so read it from core.runner."""
+    try:
+        from core.runner import DEFAULT_HORIZON
+        return int(DEFAULT_HORIZON)
+    except Exception:
+        return 21
+
+
+def _stamp_et_date(stamp) -> str:
+    """ISO timestamp (UTC-aware, or naive = UTC) -> its New York date."""
+    try:
+        from zoneinfo import ZoneInfo
+        t = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    except Exception:
+        return str(stamp)[:10]
+
+
+def _auction_window_block_reason(dry: bool) -> str | None:
+    """Refuse a NON-dry manual run inside the 09:00-09:27 ET submission
+    window when an auction slot is due today and the pre-open stage has
+    not submitted yet: the manual run would take the run guard and the
+    stage would yield — turning a pre-registered AUCTION1 rebalance into
+    a marketable-limit one (review round 4)."""
+    if dry:
+        return None
+    try:
+        from core.market import is_auction_window
+        from core.state import should_rebalance
+        if not is_auction_window():
+            return None
+        today = _et_today_iso()
+        for mc in pipeline.get_active_models():
+            if str(getattr(mc, "exec_style", "") or "") != "auction":
+                continue
+            st = _load_model_state(mc.name) or {}
+            stg = st.get("auction_stage") or {}
+            if stg.get("date") == today and stg.get("outcome") == "submitted":
+                continue
+            if should_rebalance(st, horizon_days=_rebalance_horizon()):
+                return (f"{mc.name} is due for an opening-auction rebalance; manual runs are "
+                        f"refused during the 09:00-09:27 ET submission window (use ?dry, or "
+                        f"wait for the 09:35 main run)")
+    except Exception:
+        return None
+    return None
 
 
 def _program_calendar_view() -> dict | None:
@@ -2640,6 +2709,9 @@ def trigger_run():
     with status_lock:
         if bot_status["state"] == "running":
             return jsonify({"error": "Pipeline already running"}), 409
+    block = _auction_window_block_reason(dry)
+    if block:
+        return jsonify({"error": block}), 409
 
     if dry:
         def _dry():
@@ -3101,7 +3173,7 @@ def ready():
                     f"MIN_STOCKS_REQUIRED)")
             # An auction-day completion that was deferred (orders still
             # live at run time) and never completed by a later main run.
-            if _mst.get("auction_completion_deferred") == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+            if _mst.get("auction_completion_deferred") == _et_today_iso():
                 problems.append(f"{mc.name}: auction completion deferred today and not yet completed")
     except Exception:
         pass
@@ -3113,18 +3185,37 @@ def ready():
     # A dropped 09:35 main run (another stage still running) is a readiness
     # problem for the whole day.
     try:
+        # "Today" = the New York SESSION date: a UTC-keyed comparison let a
+        # day's alarm expire at 20:00 ET, exactly when the operator looks
+        # (review round 4).
         skipped = bot_status.get("skipped_main_run_at")
-        if skipped and str(skipped)[:10] == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+        if skipped and _stamp_et_date(skipped) == _et_today_iso():
             problems.append(f"main pipeline run was skipped today at {skipped} "
                             f"(blocker: {bot_status.get('skipped_main_run_blocker')})")
         a_at = bot_status.get("auction_last_run_at")
-        if (bot_status.get("auction_last_run_status") == "error" and a_at
-                and str(a_at)[:10] == datetime.now(timezone.utc).strftime("%Y-%m-%d")):
+        a_status = bot_status.get("auction_last_run_status")
+        if a_status in ("error", "skipped") and a_at and _stamp_et_date(a_at) == _et_today_iso():
             m_at = bot_status.get("last_run_at")
             recovered = (bot_status.get("last_run_status") == "success" and m_at
                          and str(m_at) > str(a_at))
-            msg = f"auction stage errored today: {bot_status.get('auction_last_error')}"
-            if recovered:
+            msg = f"auction stage {'errored' if a_status == 'error' else 'skipped'} today: " \
+                  f"{bot_status.get('auction_last_error')}"
+            if a_status == "skipped":
+                # Only a problem when an auction slot was actually due.
+                due = False
+                try:
+                    from core.state import should_rebalance
+                    for mc in pipeline.get_active_models():
+                        if str(getattr(mc, "exec_style", "") or "") != "auction":
+                            continue
+                        if should_rebalance(_load_model_state(mc.name) or {},
+                                            horizon_days=_rebalance_horizon()):
+                            due = True
+                except Exception:
+                    due = True
+                (problems if (due and not recovered) else inv_warnings_extra).append(
+                    msg + ("" if due else " (no auction slot was due)"))
+            elif recovered:
                 inv_warnings_extra.append(msg + " (main run succeeded afterwards)")
             else:
                 problems.append(msg)

@@ -338,3 +338,51 @@ frozen in the research repo (results/v7/execution/AUCTION1_PREREG.md,
 amended 2026-10-15 before any auction order; sha b1d91cbe…). Verification
 prompts scheduled for Oct 16 09:53 ET (first stage fire) and Oct 28 09:52
 ET (day 1/3). 292 tests.
+
+## 2026-10-15 (night) — Auction execution: review round 4 (19 agents, 32 confirmed / 3 refuted) fixed
+
+Live impact before Oct 28: none beyond the 09:06 stage no longer creating
+a log file on no-op mornings. Fixed, all with regression tests (322 total):
+- MAJOR (critic): a shared data-phase failure at 09:35 on an auction day
+  skipped the completion and would have submitted a SECOND auction plan
+  the next morning. Now the main run finishes TODAY's stored plan with no
+  panel at all (plan short-circuits the data/macro guards and the whole
+  prediction block; run_pipeline's data-phase exits run plan-bearing
+  slots on the stored plan), and a failed completion flags /ready.
+- finalize: a cancel whose final read fails keeps the entry pending (a
+  partial fill may exist); HTTP 404 is terminal ("not_found", typed
+  AlpacaHTTPError); journal-append failure keeps the entry pending and
+  counts nothing; rows already journaled (restart between appends and the
+  state save) are counted, never re-appended; per-order isolation now
+  really exercised (a malformed fill price keeps the entry pending and
+  OUT of the submitted notional); no sleep after the last retry; 90 s
+  wall-clock budget; orphans retried for 7 days then dropped loudly; a
+  retry pass ACCUMULATES into the day's summary (used to replace it).
+- reference open: today's official open from the bot's own panel when
+  its last bar is dated today, else the IEX snapshot bar only when dated
+  today (stale pre-open bars rejected), none for earlier sessions; the
+  source mix is recorded per day. Rows carry qty_submitted and the
+  anchor-priced submitted notional, so a share-based fill rate can be
+  rebuilt from rows after a partial fill.
+- submission: deterministic client_order_id per (day, symbol, run) and
+  recovery by GET v2/orders:by_client_order_id when a POST's response is
+  lost; names whose last bar is not the prior session's close are left to
+  the completion ("stale_close"); a stale panel skips the stage.
+- runner: a live stored plan is always "due" (a forced stage on a non-due
+  day no longer strands the plan); the stage never drains orphans before
+  the 09:27 cutoff (the main run does); the completion's regime exposure
+  / diagnostics describe the executed 09:06 plan; the data-guard abort
+  counter resets only when the panel really passed; the auction path is
+  keyed on the New York session date (an evening manual run no longer
+  mislabels same-session fills as late); per-slot failures now raise at
+  the end of run_pipeline so the dashboard and /ready see them.
+- dashboard: a single-slot manual run no longer clears the dropped-cron
+  alarm; an auction stage that yielded to a manual/dry run leaves a
+  "skipped" trace (a /ready problem when a slot was due); manual non-dry
+  runs are refused inside 09:00-09:27 ET when an auction slot is due and
+  not yet submitted; /ready's "today" alarms use the ET session date.
+- tests: a session conftest forces DATA_DIR to a temp dir (one test used
+  to run the real exec-style migration and could overwrite a live config);
+  mocks now mirror the client (rejected POST raises; poll never raises).
+Calendar label for Dec 28 corrected (21st weekday after Nov 27; no
+holiday skip involved).

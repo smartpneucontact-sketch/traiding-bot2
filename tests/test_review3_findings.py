@@ -250,7 +250,9 @@ def test_runner_publishes_freeze_diag_into_diagnostics_and_state():
     assert '"freeze_multiplier": 0.0 if is_frozen else 1.0' in RUNNER_SRC
     assert 'new_freeze["freeze_multiplier"]' in RUNNER_SRC
     # Two merge sites: report/strategy_diagnostics and history entry.
-    assert RUNNER_SRC.count("{**diagnostics, **freeze_diag}") == 2
+    # compute_weights path, the plan-completion path (round 4) and the
+    # history entry all merge the freeze posture.
+    assert RUNNER_SRC.count("{**diagnostics, **freeze_diag}") == 3
 
 
 def test_runner_persists_freeze_state_before_liquidation():
