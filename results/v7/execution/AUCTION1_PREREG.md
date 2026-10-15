@@ -104,3 +104,30 @@ agree. The pre-declared metrics and the adopt/revert rule are unchanged.
    the Monday). The decision report is due the session after the third
    day. Enablement is by versioned config migration on combo_v2_process
    only, recorded in OPS_LOG.md with the enabling commit.
+
+## Amendment 2026-10-15 (second, appended after enablement, before any auction order)
+
+Measurement mechanics clarified after the fourth implementation review;
+metrics and the decision rule are unchanged.
+
+4. Reference open for metric 1: per row, today's official open from the
+   bot's own daily panel when the panel's last bar is dated today; else
+   the Alpaca IEX snapshot's daily-bar open only when that bar is dated
+   today (a stale pre-open bar is rejected); none for an earlier
+   session's order. The source mix is recorded per day in the slot state
+   (`reference_sources`). The IEX first print can differ from the
+   consolidated opening-auction print; the decision report therefore
+   re-prices every row against the official open from the next day's
+   daily panel (by symbol and date) and reports both figures. The control
+   slots' marketable-limit rows are re-priced the same way.
+5. Rows carry the submitted whole-share quantity (`qty_submitted`) and
+   the anchor-priced submitted notional (`target_weight_usd`), so metric 2
+   is rebuilt from rows as shares executed / shares submitted at the
+   previous official close even after partial fills; the slot state's
+   daily summary accumulates across finalize passes.
+6. Operational guards that can turn a measurement day into a non-auction
+   day are recorded in the slot state and the dashboard: a stale panel at
+   09:06 (`skipped:stale_panel`), a manual run holding the pipeline at
+   09:06 (`auction_last_run_status = skipped`), or a stage error. Such a
+   day does not count toward the three measurement days; the next
+   scheduled rebalance takes its place.
