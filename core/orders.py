@@ -503,7 +503,8 @@ def submit_auction_orders(orders: list[dict], mc: "ModelConfig",
     submitted_notional = 0.0
     for order in orders:
         sym = order["symbol"]
-        prev_close = (last_close or {}).get(sym)
+        lc = last_close or {}
+        prev_close = lc.get(sym) or lc.get(sym.replace(".", "-")) or lc.get(_to_alpaca_symbol(sym))
         if not prev_close or float(prev_close) <= 0:
             skipped.append({"symbol": sym, "reason": "no_prev_close"})
             continue
@@ -582,84 +583,109 @@ def finalize_auction_orders(mc: "ModelConfig", pending: list[dict],
         logger.warning(f"  auction finalize: snapshot capture failed: {e}")
         snapshots = {}
     n_filled = n_unfilled = n_cancelled = 0
-    filled_notional = est_notional = 0.0
+    filled_notional = est_notional = filled_anchor = 0.0
     cost_num = cost_den = 0.0
     remaining: list[dict] = []
+    try:
+        from zoneinfo import ZoneInfo
+        session_today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    except Exception:
+        session_today = datetime.now().strftime("%Y-%m-%d")
     for p in pending:
-        ts = datetime.now(timezone.utc)
-        sub_day = str(p.get("submitted_at") or ts.isoformat())[:10].replace("-", "")
-        trade = ExecTradeRecord(
-            trade_id=f"{mc.name}_auction_{sub_day}_{p['side']}_{p['symbol']}",
-            run_id=p.get("run_id") or f"{mc.name}_auction_{ts.strftime('%Y%m%d')}",
-            model=mc.name, timestamp=p.get("submitted_at") or ts.isoformat(),
-            symbol=p["symbol"], side=p["side"],
-            action=p.get("trade_action") or ("exit_position" if p["side"] == "sell" else "new_position"),
-            order_type=p.get("order_type") or "limit", time_in_force="opg",
-            notional_usd=float(p.get("notional_est") or 0),
-            order_id=p.get("order_id"), order_status=str(p.get("order_status") or "unknown"),
-            current_price=float(p.get("prev_close") or 0),
-            rank=p.get("rank"), predicted_return_pct=p.get("predicted_return"),
-            entry_price=p.get("entry_price"),
-            position_value_before=p.get("position_value_before"),
-            # No arrival price exists pre-open: decision_price stays None so
-            # the vs-arrival statistic never mistakes the overnight gap for
-            # an execution cost (review 2026-10-15). prev_close is kept in
-            # its own field.
-            decision_price=None,
-            reference_open=(snapshots.get(p["symbol"]) or {}).get("day_open"),
-            prev_close=float(p.get("prev_close") or 0) or None,
-            exec_style="auction_loo", limit_price=p.get("limit_price"),
-        )
-        # Polled read (retries + final fetch) — a single failed GET must
-        # never cancel a possibly filled order or journal it as unfilled.
-        state = {}
         try:
-            state = poll_order_status(p["order_id"], mc, logger, max_wait=5.0) or {}
-        except Exception as e:
-            logger.warning(f"  auction finalize: poll {p['order_id']} failed: {e}")
-        status = str(state.get("status") or "unknown")
-        if status == "unknown":
-            # Unreadable is NOT 'open': never cancel or journal on a failed
-            # read — keep the entry pending so the next run retries
-            # (review 2026-10-15).
-            remaining.append(p)
-            logger.warning(f"  auction finalize: {p['symbol']} ({p['order_id']}) "
-                           f"unreadable — kept pending for retry")
-            continue
-        est_notional += float(p.get("notional_est") or 0)
-        if status in ("new", "accepted", "partially_filled", "pending_new", "accepted_for_bidding"):
-            # Still open: cancel and re-read the FINAL state.
+            ts = datetime.now(timezone.utc)
+            sub_day = str(p.get("submitted_at") or ts.isoformat())[:10].replace("-", "")
+            # A late finalize (an earlier session's orders) must not be scored
+            # against TODAY's open: leave the reference empty so the row is
+            # excluded from the vs-open cost (review round 3).
+            late = str(p.get("submitted_at") or "")[:10] not in ("", session_today)
+            trade = ExecTradeRecord(
+                trade_id=f"{mc.name}_auction_{sub_day}_{p['side']}_{p['symbol']}",
+                run_id=p.get("run_id") or f"{mc.name}_auction_{ts.strftime('%Y%m%d')}",
+                model=mc.name, timestamp=p.get("submitted_at") or ts.isoformat(),
+                symbol=p["symbol"], side=p["side"],
+                action=p.get("trade_action") or ("exit_position" if p["side"] == "sell" else "new_position"),
+                order_type=p.get("order_type") or "limit", time_in_force="opg",
+                notional_usd=float(p.get("notional_est") or 0),
+                order_id=p.get("order_id"), order_status=str(p.get("order_status") or "unknown"),
+                current_price=float(p.get("prev_close") or 0),
+                rank=p.get("rank"), predicted_return_pct=p.get("predicted_return"),
+                entry_price=p.get("entry_price"),
+                position_value_before=p.get("position_value_before"),
+                # No arrival price exists pre-open: decision_price stays None so
+                # the vs-arrival statistic never mistakes the overnight gap for
+                # an execution cost (review 2026-10-15). prev_close is kept in
+                # its own field.
+                decision_price=None,
+                reference_open=(None if late else (snapshots.get(p["symbol"]) or {}).get("day_open")),
+                prev_close=float(p.get("prev_close") or 0) or None,
+                exec_style="auction_loo", limit_price=p.get("limit_price"),
+            )
+            # Polled read with retries — a failed read must never cancel a
+            # possibly filled order or journal it as unfilled (round 3: three
+            # attempts with backoff before an entry is classed unreadable).
+            state = {}
+            for attempt in range(3):
+                try:
+                    state = poll_order_status(p["order_id"], mc, logger, max_wait=5.0) or {}
+                except Exception as e:
+                    logger.warning(f"  auction finalize: poll {p['order_id']} failed: {e}")
+                    state = {}
+                if str(state.get("status") or "unknown") != "unknown":
+                    break
+                time.sleep(1.5 * (attempt + 1))
+            status = str(state.get("status") or "unknown")
+            if status == "unknown":
+                # Unreadable is NOT 'open': never cancel or journal on a failed
+                # read — keep the entry pending so the next run retries
+                # (review 2026-10-15).
+                remaining.append(p)
+                logger.warning(f"  auction finalize: {p['symbol']} ({p['order_id']}) "
+                               f"unreadable — kept pending for retry")
+                continue
+            est_notional += float(p.get("notional_est") or 0)
+            if status in ("new", "accepted", "partially_filled", "pending_new", "accepted_for_bidding"):
+                # Still open: cancel and re-read the FINAL state.
+                trade.order_status = status
+                state = _cancel_order_and_get_final(trade, mc, logger) or state
+                status = str(state.get("status") or trade.order_status or "unknown")
+                n_cancelled += 1
+            _apply_order_fill(trade, state)
             trade.order_status = status
-            state = _cancel_order_and_get_final(trade, mc, logger) or state
-            status = str(state.get("status") or trade.order_status or "unknown")
-            n_cancelled += 1
-        _apply_order_fill(trade, state)
-        trade.order_status = status
-        if status == "filled" and not trade.fill_price and state.get("filled_avg_price"):
-            trade.fill_price = float(state["filled_avg_price"])
-        _compute_slippage(trade)
-        fq_raw = state.get("filled_qty")
-        if status == "filled" or (fq_raw not in (None, "0", 0) and trade.fill_price):
-            n_filled += 1
-            fq = float(fq_raw or p.get("qty") or 0)
-            fn = fq * float(trade.fill_price)
-            filled_notional += fn
-            trade.notional_usd = round(fn, 2)
-            if trade.slippage_bps is not None:
-                cost_num += trade.slippage_bps * fn
-                cost_den += fn
-        else:
-            n_unfilled += 1
-        try:
-            journal.log_trade(trade)
+            if status == "filled" and not trade.fill_price and state.get("filled_avg_price"):
+                trade.fill_price = float(state["filled_avg_price"])
+            _compute_slippage(trade)
+            fq_raw = state.get("filled_qty")
+            if status == "filled" or (fq_raw not in (None, "0", 0) and trade.fill_price):
+                n_filled += 1
+                fq = float(fq_raw or p.get("qty") or 0)
+                fp = float(trade.fill_price or p.get("prev_close") or 0)
+                fn = fq * fp
+                filled_notional += fn
+                # Fill rate is measured at the ANCHOR price (shares executed),
+                # so a gap-down morning does not read as an unfilled residue.
+                filled_anchor += fq * float(p.get("prev_close") or 0)
+                trade.notional_usd = round(fn, 2)
+                if trade.slippage_bps is not None:
+                    cost_num += trade.slippage_bps * fn
+                    cost_den += fn
+            else:
+                n_unfilled += 1
+            try:
+                journal.log_trade(trade)
+            except Exception as e:
+                logger.warning(f"  auction finalize: journal append failed for {p['symbol']}: {e}")
         except Exception as e:
-            logger.warning(f"  auction finalize: journal append failed for {p['symbol']}: {e}")
+            # One bad order must never drop the rest: keep it pending.
+            logger.error(f"  auction finalize: {p.get('symbol')} failed ({e}) — kept pending")
+            remaining.append(p)
     stats = {
         "n": len(pending) - len(remaining), "n_filled": n_filled, "n_unfilled": n_unfilled,
         "n_cancelled_open": n_cancelled, "n_remaining_unread": len(remaining),
         "remaining": remaining,
-        "fill_rate_notional": round(filled_notional / est_notional, 4) if est_notional else None,
+        "fill_rate_notional": round(filled_anchor / est_notional, 4) if est_notional else None,
         "submitted_notional_usd": round(est_notional, 2),
+        "filled_notional_anchor_usd": round(filled_anchor, 2),
         "filled_notional_usd": round(filled_notional, 2),
         "vw_cost_vs_open_bps": round(cost_num / cost_den, 2) if cost_den else None,
     }
@@ -705,6 +731,10 @@ def rebalance_portfolio(
     # same second (e.g. cron + manual trigger).
     # One run_id per rebalance DAY: an auction day's completion reuses the
     # 09:06 stage's id so execution stats group both legs as one rebalance.
+    # A caller-supplied id means THIS call completes a stored auction plan;
+    # a rebalance of an "auction" slot without one (stage skipped, forced
+    # re-run) is an ordinary marketable-limit rebalance and is tagged so.
+    completing_plan = bool(run_id)
     run_id = run_id or f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
 
     acct = get_account(mc, logger, report)
@@ -973,7 +1003,8 @@ def rebalance_portfolio(
     # the legacy market path) and tags those rows so the two legs stay
     # separable in the journal (review 2026-10-15).
     limit_mode = exec_style in ("marketable_limit", "auction")
-    limit_tag = "auction_completion" if exec_style == "auction" else "marketable_limit"
+    limit_tag = ("auction_completion" if (exec_style == "auction" and completing_plan)
+                 else "marketable_limit")
     limit_buffer = float(getattr(mc, "exec_limit_buffer_bps", 10.0) or 0.0)
     limit_timeout = float(getattr(mc, "exec_fill_timeout_s", 120) or 0)
     timeout_action = str(getattr(mc, "exec_timeout_action", "market") or "market")

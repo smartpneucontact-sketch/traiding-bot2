@@ -275,3 +275,30 @@ earlier day's plan; no completion while auction orders are live;
 data-guard reset main-only; unreadable orders stay pending; atomic run
 guard; skip flag cleared on success; auction-stage errors visible in
 /ready). 283 tests. Still DARK: no slot on exec_style="auction".
+
+Review round 3 (adversarial, 10 confirmed + 4 nits, 2 refuted), fixed before
+enablement: one unreadable order no longer defers the whole completion
+(three polled reads with backoff; after 09:31 ET the completion runs
+regardless — every opg order is terminal by then and the completion is
+delta-based against live positions; unreadable leftovers stay pending for
+journaling retries only); per-order isolation in finalize (one malformed
+payload never drops the rest, and an exception keeps the pending list for
+the next attempt); earlier sessions' unread remainders travel as `orphans`
+and are drained by every later finalize; a completed plan is stamped
+`completed_at` so a forced same-day re-run re-plans on fresh signals and
+never re-merges the auction leg; the data guard and the empty-target abort
+are bypassed when today's stored plan exists (the completion needs no
+fresh universe); the auction fill rate is measured at the anchor price
+(shares executed × previous close) so a gap-down morning never reads as an
+unfilled residue; a late finalize carries no reference open (excluded from
+the vs-open cost); the 09:35 main run waits for a running stage until
+15:30 ET instead of 900 s; /ready demotes a stage error to a warning once
+a main run has succeeded and flags a deferred completion; completion rows
+are tagged `auction_completion` only when a stored plan is being completed
+(a rebalance of an auction slot with no plan is an ordinary
+marketable-limit row); the auction stage skips the whole yfinance data
+phase on the 20 of 21 sessions when no auction slot is due. 290 tests.
+Still DARK — enablement (migration + manifest pin) follows once this
+deploy is verified. The AUCTION1 pre-registration received a dated
+appended amendment (sells market-on-open, anchor-priced fill rate,
+holiday-corrected measurement days 2026-10-28 / 11-27 / 12-28).

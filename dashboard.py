@@ -614,6 +614,7 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
             running = bot_status["state"] == "running"
             running_stage = bot_status.get("running_stage") or ("manual/dry" if running else None)
             if not running:
+                prev_top_state = bot_status["state"]
                 bot_status["state"] = "running"
                 bot_status["running_stage"] = stage
                 bot_status["current_step"] = "starting"
@@ -627,7 +628,16 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
                         for model_name in bot_status["models"]:
                             bot_status["models"][model_name]["state"] = "running"
                 break
-        if stage == "main" and running_stage == "auction" and waited < 900:
+        # Wait for a running auction stage until a wall-clock cutoff
+        # (15:30 ET): the stage cannot hang (every HTTP call has a
+        # timeout) and a late main run can still rebalance in-hours.
+        try:
+            from zoneinfo import ZoneInfo
+            _now_et = datetime.now(ZoneInfo("America/New_York"))
+            _before_cutoff = (_now_et.hour, _now_et.minute) < (15, 30)
+        except Exception:
+            _before_cutoff = waited < 900
+        if stage == "main" and running_stage == "auction" and _before_cutoff:
             time.sleep(15); waited += 15
             continue
         logging.getLogger("dashboard").warning(
@@ -652,12 +662,12 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
             if stage != "main":
                 # The pre-open stage keeps its own bookkeeping so a no-op
                 # auction run never satisfies /ready's staleness check or
-                # the LAST RUN tile (review 2026-10-15).
+                # the LAST RUN tile, and never clears a main run's error
+                # pill or model badges (review rounds 1-3).
                 bot_status["auction_last_run_at"] = _utc_now_iso()
                 bot_status["auction_last_run_status"] = "success"
                 bot_status["auction_last_run_duration"] = round(elapsed, 1)
-                for mn in list(bot_status["models"].keys()):
-                    bot_status["models"][mn]["state"] = "idle"
+                bot_status["state"] = prev_top_state if prev_top_state in ("idle", "error") else "idle"
                 return
             bot_status["last_run_at"] = _utc_now_iso()
             bot_status["last_run_status"] = "success"
@@ -696,9 +706,7 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
                 bot_status["auction_last_run_status"] = "error"
                 bot_status["auction_last_error"] = safe_error
                 bot_status["current_step"] = None
-                bot_status["state"] = "idle"
-                for mn in list(bot_status["models"].keys()):
-                    bot_status["models"][mn]["state"] = "idle"
+                bot_status["state"] = prev_top_state if prev_top_state in ("idle", "error") else "idle"
                 return
             bot_status["last_run_at"] = _utc_now_iso()
             bot_status["last_run_status"] = "error"
@@ -3084,18 +3092,24 @@ def ready():
     # mode. The runner counts consecutive aborts per slot; >=2 is a problem.
     try:
         for mc in pipeline.get_active_models():
-            n = int((_load_model_state(mc.name) or {}).get("data_guard_aborts", 0) or 0)
+            _mst = _load_model_state(mc.name) or {}
+            n = int(_mst.get("data_guard_aborts", 0) or 0)
             if n >= 2:
                 problems.append(
                     f"{mc.name}: {n} consecutive data-guard aborts — runs are "
                     f"completing without trading (check stock count vs "
                     f"MIN_STOCKS_REQUIRED)")
+            # An auction-day completion that was deferred (orders still
+            # live at run time) and never completed by a later main run.
+            if _mst.get("auction_completion_deferred") == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+                problems.append(f"{mc.name}: auction completion deferred today and not yet completed")
     except Exception:
         pass
     # Spec-manifest invariants: a divergence between the running config and
     # the committed spec (spec_manifest.json) is exactly the fault class
     # that has bitten five times — surface it here so external alerting
     # (and the deploy healthcheck) sees it.
+    inv_warnings_extra: list[str] = []
     # A dropped 09:35 main run (another stage still running) is a readiness
     # problem for the whole day.
     try:
@@ -3106,7 +3120,14 @@ def ready():
         a_at = bot_status.get("auction_last_run_at")
         if (bot_status.get("auction_last_run_status") == "error" and a_at
                 and str(a_at)[:10] == datetime.now(timezone.utc).strftime("%Y-%m-%d")):
-            problems.append(f"auction stage errored today: {bot_status.get('auction_last_error')}")
+            m_at = bot_status.get("last_run_at")
+            recovered = (bot_status.get("last_run_status") == "success" and m_at
+                         and str(m_at) > str(a_at))
+            msg = f"auction stage errored today: {bot_status.get('auction_last_error')}"
+            if recovered:
+                inv_warnings_extra.append(msg + " (main run succeeded afterwards)")
+            else:
+                problems.append(msg)
     except Exception:
         pass
     # Cut-loss scanner heartbeat (2026-10-15): during market hours every
@@ -3152,7 +3173,7 @@ def ready():
                         f"during market hours")
     except Exception:
         pass
-    inv_warnings: list[str] = []
+    inv_warnings: list[str] = list(inv_warnings_extra)
     try:
         from core.invariants import load_last_status
         inv = load_last_status()
@@ -3162,9 +3183,10 @@ def ready():
         # Warnings and degraded checks ride along (200, non-blocking) so
         # external monitors can see them without a 503.
         if inv:
-            inv_warnings = (inv.get("warnings", [])
+            inv_warnings = (list(inv_warnings_extra)
+                            + inv.get("warnings", [])
                             + [f"degraded: {e}" for e in
-                               inv.get("checker_errors", [])])[:5]
+                               inv.get("checker_errors", [])])[:8]
     except Exception:
         pass
     # Ephemeral-storage guard: an empty state dir means trailing-stop peaks and

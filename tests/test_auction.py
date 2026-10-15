@@ -179,7 +179,10 @@ def test_finalize_polls_fills_cancels_leftovers_and_shares_run_id(tmp_path, monk
         "BBB": {"day_open": 100.0, "arrival": 100.9, "prev_close": 99.0},
         "CCC": {"day_open": 50.0}, "DDD": {"day_open": 20.0}})
     mc = make_mc(tmp_path)
-    base = {"submitted_at": "2026-10-28T13:06:00+00:00", "run_id": "RID", "order_status": "accepted"}
+    # Same-session finalize: the submission date is TODAY (an earlier date
+    # is a late finalize and carries no reference open — see below).
+    today = datetime.now(NY).strftime("%Y-%m-%d")
+    base = {"submitted_at": f"{today}T13:06:00+00:00", "run_id": "RID", "order_status": "accepted"}
     pending = [
         {**base, "symbol": "BBB", "side": "buy", "trade_action": "new_position", "order_type": "limit",
          "qty": 100, "limit_price": 100.0, "prev_close": 99.0, "notional_est": 9_900.0, "order_id": "o1"},
@@ -202,7 +205,9 @@ def test_finalize_polls_fills_cancels_leftovers_and_shares_run_id(tmp_path, monk
     assert rows["BBB"].decision_price is None and rows["BBB"].slippage_vs_arrival_bps is None
     assert rows["BBB"].notional_usd == pytest.approx(10_040.0)
     assert rows["DDD"].order_status == "canceled"          # final state after the cancel, not 'new'
-    assert stats["fill_rate_notional"] == pytest.approx(10_040.0 / 11_350.0, abs=1e-3)
+    # Anchor-priced: 100 sh x 99.0 prev close over 11,350 planned.
+    assert stats["fill_rate_notional"] == pytest.approx(9_900.0 / 11_350.0, abs=1e-3)
+    assert stats["filled_notional_usd"] == pytest.approx(10_040.0)
     assert stats["vw_cost_vs_open_bps"] == pytest.approx(40.0)
 
 
@@ -350,6 +355,7 @@ def test_dashboard_auction_stage_keeps_main_run_fields(monkeypatch):
 # ───────────── review round 2 regressions ───────────────────────────────
 
 def test_finalize_keeps_unreadable_orders_pending(tmp_path, monkeypatch):
+    monkeypatch.setattr(orders_mod.time, "sleep", lambda s: None)
     """A failed read must never cancel or journal an order: it stays pending."""
     def fake_poll(order_id, mc, lg, max_wait=8.0, **kw):
         if order_id == "o1":
@@ -406,3 +412,169 @@ def test_dashboard_guard_is_atomic_and_clears_skip_flag(monkeypatch):
     with dashboard.status_lock:
         assert "skipped_main_run_at" not in dashboard.bot_status
         assert dashboard.bot_status["state"] == "idle" and dashboard.bot_status["running_stage"] is None
+
+
+# ───────────── review round 3 regressions ───────────────────────────────
+
+def test_unreadable_after_open_does_not_block_completion(tmp_path, monkeypatch):
+    """Round 3: after 09:31 every opg order is terminal and the completion
+    is delta-based — an unreadable leftover must not defer the day."""
+    import core.runner as runner_mod
+    st = {"auction_stage": {"date": "2026-10-28", "outcome": "submitted", "n_submitted": 3,
+                            "run_id": "RID", "plan": {"target_symbols": ["A"], "rankings": [["A", 1.0]],
+                                                      "target_weights": {"A": 1.0}},
+                            "pending": [{"order_id": "o7"}]}}
+    assert runner_mod._todays_auction_plan(st, "2026-10-28") is not None
+    # completed_at spends the plan.
+    st["auction_stage"]["completed_at"] = "x"
+    assert runner_mod._todays_auction_plan(st, "2026-10-28") is None
+
+
+def test_finalize_per_order_isolation_and_anchor_fill_rate(tmp_path, monkeypatch):
+    """A malformed order payload (filled, no price) must not drop the
+    others; the fill rate is measured at the anchor price."""
+    def fake_poll(order_id, mc, lg, max_wait=8.0, **kw):
+        return {"o1": {"id": "o1", "status": "filled", "filled_qty": "10", "filled_avg_price": "49.0"},
+                "o2": {"id": "o2", "status": "filled", "filled_qty": "7", "filled_avg_price": None},
+                "o3": {"id": "o3", "status": "canceled", "filled_qty": "0"}}[order_id]
+    monkeypatch.setattr(orders_mod, "poll_order_status", fake_poll)
+    monkeypatch.setattr(orders_mod, "alpaca_request", lambda *a, **kw: {})
+    monkeypatch.setattr(orders_mod, "fetch_snapshots", lambda syms, mc_, lg: {s: {"day_open": 49.0} for s in syms})
+    monkeypatch.setattr(orders_mod.time, "sleep", lambda s: None)
+    mc = make_mc(tmp_path)
+    today = datetime.now(NY).strftime("%Y-%m-%d")
+    base = {"submitted_at": f"{today}T13:06:00+00:00", "run_id": "RID", "order_status": "accepted"}
+    pending = [{**base, "symbol": "AAA", "side": "buy", "order_type": "limit", "qty": 10, "limit_price": 50.5,
+                "prev_close": 50.0, "notional_est": 500.0, "order_id": "o1"},
+               {**base, "symbol": "BBB", "side": "buy", "order_type": "limit", "qty": 7, "limit_price": 50.5,
+                "prev_close": 50.0, "notional_est": 350.0, "order_id": "o2"},
+               {**base, "symbol": "CCC", "side": "buy", "order_type": "limit", "qty": 4, "limit_price": 50.5,
+                "prev_close": 50.0, "notional_est": 200.0, "order_id": "o3"}]
+    journal = StubJournal()
+    stats = orders_mod.finalize_auction_orders(mc, pending, journal, logger)
+    # o2: status filled, no price -> fill priced at prev_close fallback, still counted.
+    assert stats["n_filled"] == 2 and stats["n_unfilled"] == 1 and stats["n_remaining_unread"] == 0
+    # Anchor-priced fill rate: (10 + 7) * 50 / 1050 = 0.8095 even though AAA filled at 49 (gap down).
+    assert stats["fill_rate_notional"] == pytest.approx(850.0 / 1050.0, abs=1e-3)
+    assert stats["filled_notional_usd"] == pytest.approx(10 * 49.0 + 7 * 50.0)
+    assert {r.symbol for r in journal.records} == {"AAA", "BBB", "CCC"}
+
+
+def test_late_finalize_has_no_reference_open(tmp_path, monkeypatch):
+    """An earlier session's orders finalized today must not be scored
+    against TODAY's open (round 3): reference_open None, excluded from
+    the vw cost, but the fill itself is still journaled and counted."""
+    monkeypatch.setattr(orders_mod, "poll_order_status", lambda oid, mc, lg, max_wait=8.0, **kw:
+                        {"id": oid, "status": "filled", "filled_qty": "10", "filled_avg_price": "101.0"})
+    monkeypatch.setattr(orders_mod, "alpaca_request", lambda *a, **kw: {})
+    monkeypatch.setattr(orders_mod, "fetch_snapshots", lambda syms, mc_, lg: {"AAA": {"day_open": 95.0}})
+    mc = make_mc(tmp_path)
+    pending = [{"submitted_at": "2026-10-28T13:06:00+00:00", "run_id": "RID", "order_status": "accepted",
+                "symbol": "AAA", "side": "buy", "order_type": "limit", "qty": 10, "limit_price": 101.0,
+                "prev_close": 100.0, "notional_est": 1000.0, "order_id": "o1"}]
+    journal = StubJournal()
+    stats = orders_mod.finalize_auction_orders(mc, pending, journal, logger)
+    row = journal.records[0]
+    assert row.reference_open is None and row.slippage_bps is None
+    assert row.fill_price == pytest.approx(101.0) and row.trade_id.endswith("_auction_20261028_buy_AAA")
+    assert stats["n_filled"] == 1 and stats["vw_cost_vs_open_bps"] is None
+    assert stats["fill_rate_notional"] == pytest.approx(1.0)
+
+
+def test_finalize_helper_drains_orphans_and_keeps_pending_on_error(tmp_path, monkeypatch):
+    import core.runner as runner_mod
+    mc = make_mc(tmp_path)
+    calls = []
+
+    def fake_finalize(mc_, pending, journal, lg):
+        calls.append([p["order_id"] for p in pending])
+        if pending and pending[0]["order_id"] == "boom":
+            raise RuntimeError("api")
+        return {"n": len(pending), "n_filled": len(pending), "remaining": []}
+    monkeypatch.setattr("core.orders.finalize_auction_orders", fake_finalize)
+    monkeypatch.setattr(runner_mod, "_after_open_et", lambda: True)
+    st = {"auction_stage": {"date": "2026-10-28", "pending": [{"order_id": "boom"}],
+                            "orphans": [{"order_id": "old1"}]}}
+    runner_mod._finalize_auction_if_any(mc, st, StubJournal(), logger, RunReport(), "2026-10-28")
+    assert calls == [["old1"], ["boom"]]
+    assert st["auction_stage"]["orphans"] == []                      # drained
+    assert st["auction_stage"]["pending"] == [{"order_id": "boom"}]   # kept for retry
+    assert st["auction_stage"]["summary"]["error"] == "api"
+
+
+def test_merge_uses_anchor_priced_fills_and_skips_empty(tmp_path):
+    import core.runner as runner_mod
+    st = {"date": "2026-10-28", "summary": {"n": 2, "n_filled": 2, "submitted_notional_usd": 1000.0,
+                                            "filled_notional_anchor_usd": 1000.0,
+                                            "filled_notional_usd": 950.0}}     # gap-down fills
+    result = {"reconciliation": {"flow": {"n_orders": 0, "n_filled": 0, "fill_rate_notional": None,
+                                          "orders_notional_usd": 0.0, "filled_notional_usd": 0.0}, "book": None}}
+    runner_mod._merge_auction_into_result(result, st, "2026-10-28")
+    assert result["reconciliation"]["flow"]["fill_rate_notional"] == pytest.approx(1.0)
+    empty = {"date": "2026-10-28", "summary": {"n": 0}}
+    r2 = {"reconciliation": {"flow": {"fill_rate_notional": 0.9}, "book": None}}
+    runner_mod._merge_auction_into_result(r2, empty, "2026-10-28")
+    assert r2["reconciliation"]["flow"]["fill_rate_notional"] == 0.9 and "auction" not in r2["reconciliation"]
+
+
+def test_rebalance_rows_tagged_completion_only_when_completing_a_plan(tmp_path, monkeypatch):
+    """An 'auction' slot rebalancing WITHOUT a stored plan (stage skipped,
+    forced re-run) is an ordinary marketable-limit rebalance (round 3)."""
+    posted = []
+    polled = {}
+
+    def fake_request(method, endpoint, mc, data=None, logger=None, **kw):
+        if method == "POST" and endpoint == "v2/orders":
+            posted.append(dict(data))
+            oid = f"o{len(posted)}"
+            polled[oid] = {"id": oid, "status": "filled", "filled_qty": "1", "filled_avg_price": "100.0"}
+            return {"id": oid, "status": "accepted"}
+        if method == "GET" and endpoint.startswith("v2/orders/"):
+            return polled.get(endpoint.rsplit("/", 1)[-1], {})
+        return {}
+    monkeypatch.setattr(orders_mod, "alpaca_request", fake_request)
+    monkeypatch.setattr(orders_mod, "get_account", lambda mc, lg, rp: {"portfolio_value": "100000",
+                                                                       "cash": "100000", "buying_power": "200000",
+                                                                       "equity": "100000"})
+    monkeypatch.setattr(orders_mod, "get_positions", lambda mc, lg: {})
+    monkeypatch.setattr(orders_mod, "fetch_snapshots", lambda syms, mc_, lg: {s: {"day_open": 100.0, "arrival": 100.0,
+                                                                                 "prev_close": 100.0, "ask": 100.05,
+                                                                                 "bid": 99.95} for s in syms})
+    monkeypatch.setattr(orders_mod, "poll_order_status",
+                        lambda oid, *a, **kw: polled.get(oid, {"status": "filled", "filled_qty": "1",
+                                                               "filled_avg_price": "100.0"}))
+    monkeypatch.setattr(orders_mod.time, "sleep", lambda s: None)
+    mc = make_mc(tmp_path, exec_style="auction")
+    journal = StubJournal()
+    rb = orders_mod.rebalance_portfolio(["AAA"], [("AAA", 1.0)], mc, journal, logger, RunReport(),
+                                        target_weights={"AAA": 0.05})
+    assert rb["exec_style"] == "marketable_limit"
+    assert journal.records and all(r.exec_style == "marketable_limit" for r in journal.records)
+
+
+def test_auction_stage_skips_data_phase_when_no_slot_is_due(tmp_path, monkeypatch):
+    import core.runner as runner_mod
+    a = make_mc(tmp_path, name="combo_v2_process", exec_style="auction")
+    save_state({"last_rebalance": datetime.now().isoformat()}, a)      # rebalanced today -> not due
+    monkeypatch.setattr(runner_mod, "get_active_models", lambda: [a])
+    monkeypatch.setattr("core.invariants.run_invariant_checks", lambda lg: None)
+    monkeypatch.setattr("core.market.is_auction_window", lambda now=None: True)
+
+    def boom(*a, **kw):
+        raise AssertionError("data phase must not run when no auction slot is due")
+    monkeypatch.setattr(runner_mod, "get_tradeable_symbols", boom)
+    monkeypatch.setattr(runner_mod, "download_bars", boom)
+    runner_mod.run_pipeline(stage="auction")
+    assert load_state(a).get("auction_last_run")                         # stamped as a no-op stage run
+    # A forced run still goes through (the due-check is bypassed); the
+    # start-window check needs a 09:08 ET clock.
+    class FakeDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            base = datetime(2026, 10, 28, 9, 8, tzinfo=NY)
+            return base.astimezone(tz) if tz else base.replace(tzinfo=None)
+    monkeypatch.setattr(runner_mod, "datetime", FakeDT)
+    called = []
+    monkeypatch.setattr(runner_mod, "get_tradeable_symbols", lambda lg, rp: called.append(1) or [])
+    runner_mod.run_pipeline(stage="auction", force=True)
+    assert called == [1]

@@ -394,7 +394,7 @@ def run_single_model(
     )
     report.set("stocks_downloaded", len(stock_data))
 
-    if len(stock_data) < MIN_STOCKS_REQUIRED:
+    if len(stock_data) < MIN_STOCKS_REQUIRED and _todays_auction_plan(state, today_iso) is None:
         msg = (
             f"Insufficient stock data: {len(stock_data)} < {MIN_STOCKS_REQUIRED} required. "
             f"Download was likely rate-limited. Aborting to avoid bad trades."
@@ -569,7 +569,7 @@ def run_single_model(
                     report.set("inactive_assets_filtered", sorted(inactive))
             except Exception as e:
                 logger.warning(f"  inactive-asset filter failed: {e}")
-        if not target_symbols:
+        if not target_symbols and _todays_auction_plan(state, today_iso) is None:
             logger.error("All combo positions filtered out — staying in cash")
             report.add_error("Combo target_symbols empty after filters")
             logger.info(report.format_summary())
@@ -719,9 +719,14 @@ def run_single_model(
         # An orphaned EARLIER day's pending set (terminal orders) is
         # recorded before anything else — regardless of today's outcome
         # (review round 2: it used to be dropped on a skipped day).
-        if prev_stage.get("pending") and prev_stage.get("date") != today_iso:
+        if (prev_stage.get("pending") or prev_stage.get("orphans")) and prev_stage.get("date") != today_iso:
             _finalize_auction_if_any(mc, state, journal, logger, report, today_iso)
             prev_stage = state.get("auction_stage") or {}
+        # Whatever is STILL unreadable from earlier sessions travels into
+        # today's record as orphans, retried by every later finalize.
+        carry_orphans = list(prev_stage.get("orphans") or [])
+        if prev_stage.get("date") != today_iso:
+            carry_orphans += list(prev_stage.get("pending") or [])
         outcome = None
         if dry_run:
             logger.info("  AUCTION stage DRY RUN — nothing submitted")
@@ -781,13 +786,15 @@ def run_single_model(
                         "diagnostics": (getattr(model, "last_diagnostics", None) or None),
                     },
                     "pending": summ.get("pending", []),
+                    "orphans": carry_orphans,
                 }
         if outcome and outcome != "submitted" and outcome != "skipped:already_submitted":
             # A fresh, minimal record for today — NEVER inherit an earlier
             # day's plan / n_submitted / run_id (review round 2).
             state["auction_stage"] = {"date": today_iso, "outcome": outcome,
                                       "n_submitted": 0, "n_skipped": 0,
-                                      "pending": [], "plan": None}
+                                      "pending": [], "plan": None,
+                                      "orphans": carry_orphans}
         _stamp_last_run(state, stage)
         _save_state_merged(state, mc)
         logger.info(report.format_summary())
@@ -798,12 +805,15 @@ def run_single_model(
     auction_pending_live = False
     if stage == "main" and not dry_run:
         st_auction = state.get("auction_stage") or {}
-        if st_auction.get("date") == today_iso and st_auction.get("pending"):
-            # Finalize was deferred (pre-09:31) or some orders were
-            # unreadable: the auction orders may still be live — never
-            # complete on top of them (review round 2).
+        if (st_auction.get("date") == today_iso and st_auction.get("pending")
+                and not _after_open_et()):
+            # Pre-09:31 only: the auction orders are genuinely live. After
+            # the open every opg order is terminal and the completion is
+            # delta-based against live positions, so unreadable leftovers
+            # (kept pending for journaling retries) never block the
+            # completion (review round 3).
             auction_pending_live = True
-            logger.warning("  Auction orders still pending — completion deferred to the next run")
+            logger.warning("  Auction orders still live (pre-open) — completion deferred")
         plan = _todays_auction_plan(state, today_iso)
         if plan and not auction_pending_live:
             target_symbols = list(plan.get("target_symbols") or target_symbols)
@@ -834,6 +844,9 @@ def run_single_model(
     elif auction_pending_live:
         report.add_warning("Rebalance deferred: opening-auction orders still pending")
         result = {"dry_run": False, "skipped_auction_pending": True}
+        # Surfaced by /ready until a later main run completes the day
+        # (review round 3).
+        state["auction_completion_deferred"] = today_iso
     else:
         # The scanner may have tripped the portfolio stop while this run
         # was computing (data download + weights can take minutes). The
@@ -861,7 +874,7 @@ def run_single_model(
                 dry_run=dry_run, target_weights=target_weights,
                 run_id=auction_run_id,
             )
-            if isinstance(result, dict):
+            if isinstance(result, dict) and auction_run_id:
                 _merge_auction_into_result(result, state.get("auction_stage") or {}, today_iso)
 
     # -- Save state ---------------------------------------------------------
@@ -878,6 +891,11 @@ def run_single_model(
     )
     if rebalanced:
         state["last_rebalance"] = datetime.now().isoformat()
+        state.pop("auction_completion_deferred", None)
+        if auction_run_id and isinstance(state.get("auction_stage"), dict):
+            # The stored plan is spent: a forced same-day re-run re-plans
+            # on fresh signals and never re-merges the auction leg.
+            state["auction_stage"]["completed_at"] = datetime.now(timezone.utc).isoformat()
         # Re-anchor the cutloss tier scaler's day-start book to what this
         # rebalance actually achieved. The 60s scanner anchored it at
         # ~09:30 on the PRE-rebalance overnight book, but the validated
@@ -1015,7 +1033,8 @@ def _todays_auction_plan(state: dict, today_iso: str) -> dict | None:
     st = state.get("auction_stage") or {}
     if (st.get("date") == today_iso and st.get("outcome") == "submitted"
             and int(st.get("n_submitted", 0) or 0) > 0
-            and isinstance(st.get("plan"), dict)):
+            and isinstance(st.get("plan"), dict)
+            and not st.get("completed_at")):
         return st["plan"]
     return None
 
@@ -1042,9 +1061,13 @@ def _merge_auction_into_result(result: dict, st: dict, today_iso: str) -> None:
             result["reconciliation"] = recon
         flow = recon.get("flow") or {}
         a_n = int(a.get("n", 0) or 0)
+        if a_n <= 0:
+            return
         a_filled = int(a.get("n_filled", 0) or 0)
         a_sub = float(a.get("submitted_notional_usd", 0) or 0)
-        a_fill = float(a.get("filled_notional_usd", 0) or 0)
+        # Anchor-priced fills (shares executed x prev close) so a gap
+        # morning never reads as an unfilled residue.
+        a_fill = float(a.get("filled_notional_anchor_usd", a.get("filled_notional_usd", 0)) or 0)
         c_sub = float(flow.get("orders_notional_usd", 0) or 0)
         c_fill = float(flow.get("filled_notional_usd", 0) or 0)
         # Unfilled auction notional is RE-SUBMITTED by the completion; it
@@ -1074,26 +1097,46 @@ def _finalize_auction_if_any(mc: ModelConfig, state: dict, journal, logger,
     blocks the run."""
     st = state.get("auction_stage") or {}
     pending = st.get("pending") or []
-    if not pending:
-        return
-    if st.get("date") == today_iso and not _after_open_et():
-        logger.info("  auction orders pending; finalize deferred until after the open")
+    orphans = st.get("orphans") or []
+    if not pending and not orphans:
         return
     try:
         from core.orders import finalize_auction_orders
-        stats = finalize_auction_orders(mc, pending, journal, logger)
-    except Exception as e:
-        logger.error(f"  auction finalize failed: {e}")
-        stats = {"error": str(e)}
-    st["summary"] = {k: v for k, v in stats.items() if k != "remaining"}
-    st["pending"] = list(stats.get("remaining") or []) if isinstance(stats, dict) else []
-    st["finalized_at"] = datetime.now(timezone.utc).isoformat()
-    if st.get("date") != today_iso:
-        st["finalized_late"] = True
-        logger.warning(f"  auction fills from {st.get('date')} finalized late (journal rows carry the original date)")
-    state["auction_stage"] = st
-    report.set("auction_fills", stats)
-    _save_state_merged(state, mc)
+    except Exception as e:  # pragma: no cover
+        logger.error(f"  auction finalize unavailable: {e}")
+        return
+    changed = False
+    # Earlier sessions' leftovers (terminal orders): any time.
+    if orphans:
+        try:
+            o_stats = finalize_auction_orders(mc, orphans, journal, logger)
+            st["orphans"] = list(o_stats.get("remaining") or [])
+            st["orphans_summary"] = {k: v for k, v in o_stats.items() if k != "remaining"}
+        except Exception as e:
+            logger.error(f"  auction orphan finalize failed: {e} — orphans kept")
+        changed = True
+    if pending:
+        if st.get("date") == today_iso and not _after_open_et():
+            logger.info("  auction orders pending; finalize deferred until after the open")
+        else:
+            try:
+                stats = finalize_auction_orders(mc, pending, journal, logger)
+                st["summary"] = {k: v for k, v in stats.items() if k != "remaining"}
+                st["pending"] = list(stats.get("remaining") or [])
+                st["finalized_at"] = datetime.now(timezone.utc).isoformat()
+                if st.get("date") != today_iso:
+                    st["finalized_late"] = True
+                    logger.warning(f"  auction fills from {st.get('date')} finalized late "
+                                   f"(journal rows carry the original date)")
+                report.set("auction_fills", st["summary"])
+            except Exception as e:
+                # Keep the list intact for the next attempt (round 3).
+                logger.error(f"  auction finalize failed: {e} — pending kept for retry")
+                st["summary"] = {"error": str(e)}
+            changed = True
+    if changed:
+        state["auction_stage"] = st
+        _save_state_merged(state, mc)
 
 
 def run_pipeline(dry_run: bool = False, force: bool = False,
@@ -1128,6 +1171,29 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
         if not models:
             logger.info("Auction stage: no slot uses exec_style='auction' — nothing to do")
             return
+        # 20 of every 21 sessions no auction slot is due: skip the whole
+        # (yfinance) data phase instead of downloading a panel to discover
+        # that — halves the daily download load and keeps the 09:35 main
+        # run from ever waiting on a pointless stage (round 3 follow-up).
+        if not force:
+            due = []
+            for m in models:
+                try:
+                    with state_lock:
+                        st = load_state(m)
+                    if should_rebalance(st, horizon_days=horizon, force=False):
+                        due.append(m.name)
+                    else:
+                        _stamp_last_run(st, "auction")
+                        _save_state_merged(st, m)
+                except Exception as e:
+                    logger.warning(f"Auction stage: due-check failed for {m.name} ({e}) — treated as due")
+                    due.append(m.name)
+            if not due:
+                logger.info(f"Auction stage: no auction slot is due to rebalance today "
+                            f"({[m.name for m in models]}) — data phase skipped")
+                return
+            models = [m for m in models if m.name in due]
         # Time-box: the data phase takes minutes; starting it after 09:20
         # ET could not finish inside the 09:27 submission window and could
         # still be running when the 09:35 main job fires.
