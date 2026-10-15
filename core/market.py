@@ -32,6 +32,24 @@ US_MARKET_HOLIDAYS: frozenset[str] = frozenset({
 _NY = ZoneInfo("America/New_York")
 
 
+def is_auction_window(now: Optional[datetime] = None) -> bool:
+    """True on a trading day between 09:00 and 09:27 ET — the window in
+    which opening-auction orders (time_in_force "opg") can still be
+    submitted to Alpaca (its cutoff is 09:28 ET). Same calendar as
+    is_market_open."""
+    if now is None:
+        now = datetime.now(_NY)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_NY)
+    if now.weekday() >= 5:
+        return False
+    if now.strftime("%Y-%m-%d") in US_MARKET_HOLIDAYS:
+        return False
+    start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    cutoff = now.replace(hour=9, minute=27, second=0, microsecond=0)
+    return start <= now < cutoff
+
+
 def is_market_open(now: Optional[datetime] = None) -> bool:
     """Return True if US equities are open at `now` (defaults to now in ET).
 

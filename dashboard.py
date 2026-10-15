@@ -600,36 +600,73 @@ def _load_cutloss_events(model_name: str, limit: int = 100) -> list:
 # PIPELINE RUNNER
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_trading_pipeline(force=False, model_filter=None):
+def run_trading_pipeline(force=False, model_filter=None, stage="main"):
     global bot_status
 
-    with status_lock:
-        if bot_status["state"] == "running":
-            logging.getLogger("dashboard").warning("Pipeline already running, skipping")
-            return
-        bot_status["state"] = "running"
-        bot_status["current_step"] = "starting"
-        if model_filter:
-            if model_filter in bot_status["models"]:
-                bot_status["models"][model_filter]["state"] = "running"
-        else:
-            for model_name in bot_status["models"]:
-                bot_status["models"][model_name]["state"] = "running"
+    # The 09:35 MAIN run must never be silently dropped because the 09:06
+    # auction stage is still downloading (review 2026-10-15): wait for it,
+    # bounded; the auction stage itself yields to anything running.
+    waited = 0.0
+    while True:
+        # Check-and-set in ONE critical section (review round 2: the old
+        # split let two observers both start a run).
+        with status_lock:
+            running = bot_status["state"] == "running"
+            running_stage = bot_status.get("running_stage") or ("manual/dry" if running else None)
+            if not running:
+                bot_status["state"] = "running"
+                bot_status["running_stage"] = stage
+                bot_status["current_step"] = "starting"
+                if waited:
+                    bot_status["main_run_waited_s"] = waited
+                if stage == "main":
+                    if model_filter:
+                        if model_filter in bot_status["models"]:
+                            bot_status["models"][model_filter]["state"] = "running"
+                    else:
+                        for model_name in bot_status["models"]:
+                            bot_status["models"][model_name]["state"] = "running"
+                break
+        if stage == "main" and running_stage == "auction" and waited < 900:
+            time.sleep(15); waited += 15
+            continue
+        logging.getLogger("dashboard").warning(
+            f"Pipeline already running ({running_stage}), skipping {stage} run")
+        if stage == "main":
+            with status_lock:
+                bot_status["skipped_main_run_at"] = _utc_now_iso()
+                bot_status["skipped_main_run_blocker"] = running_stage
+        return
 
     start_time = time.time()
 
     try:
-        pipeline.run_pipeline(dry_run=False, force=force, model_filter=model_filter)
+        pipeline.run_pipeline(dry_run=False, force=force,
+                              model_filter=model_filter, stage=stage)
         elapsed = time.time() - start_time
 
         with status_lock:
             bot_status["state"] = "idle"
+            bot_status["running_stage"] = None
+            bot_status["current_step"] = None
+            if stage != "main":
+                # The pre-open stage keeps its own bookkeeping so a no-op
+                # auction run never satisfies /ready's staleness check or
+                # the LAST RUN tile (review 2026-10-15).
+                bot_status["auction_last_run_at"] = _utc_now_iso()
+                bot_status["auction_last_run_status"] = "success"
+                bot_status["auction_last_run_duration"] = round(elapsed, 1)
+                for mn in list(bot_status["models"].keys()):
+                    bot_status["models"][mn]["state"] = "idle"
+                return
             bot_status["last_run_at"] = _utc_now_iso()
             bot_status["last_run_status"] = "success"
             bot_status["last_run_duration"] = round(elapsed, 1)
             bot_status["last_error"] = None
-            bot_status["current_step"] = None
             bot_status["total_runs"] += 1
+            # A completed main run clears today's skipped-run alarm.
+            bot_status.pop("skipped_main_run_at", None)
+            bot_status.pop("skipped_main_run_blocker", None)
 
             targets = [model_filter] if model_filter else list(bot_status["models"].keys())
             for mn in targets:
@@ -650,8 +687,19 @@ def run_trading_pipeline(force=False, model_filter=None):
         # log full traceback to server logs only
         safe_error = str(e).split("\n")[0][:500]
 
+        logging.getLogger("dashboard").error(f"Pipeline failed ({stage}): {full_error}")
         with status_lock:
             bot_status["state"] = "error"
+            bot_status["running_stage"] = None
+            if stage != "main":
+                bot_status["auction_last_run_at"] = _utc_now_iso()
+                bot_status["auction_last_run_status"] = "error"
+                bot_status["auction_last_error"] = safe_error
+                bot_status["current_step"] = None
+                bot_status["state"] = "idle"
+                for mn in list(bot_status["models"].keys()):
+                    bot_status["models"][mn]["state"] = "idle"
+                return
             bot_status["last_run_at"] = _utc_now_iso()
             bot_status["last_run_status"] = "error"
             bot_status["last_run_duration"] = round(elapsed, 1)
@@ -784,6 +832,12 @@ def api_status():
             "run_count": state.get("run_count", 0),
             "data_guard_aborts": int(state.get("data_guard_aborts", 0) or 0),
             "history": state.get("history", [])[-5:],
+            # Opening-auction stage (exec_style="auction"): today's outcome
+            # and fill summary, never the raw pending order list.
+            "auction": {k: v for k, v in (state.get("auction_stage") or {}).items()
+                        if k in ("date", "outcome", "n_submitted", "n_skipped",
+                                 "submitted_notional_usd", "summary", "finalized_at",
+                                 "finalized_late", "auto_scaled_to_buying_power")},
             # Gate-cadence posture (core/gate_update.py): the multiplier
             # the book currently carries + the latest daily check.
             "gate": {
@@ -3042,6 +3096,19 @@ def ready():
     # the committed spec (spec_manifest.json) is exactly the fault class
     # that has bitten five times — surface it here so external alerting
     # (and the deploy healthcheck) sees it.
+    # A dropped 09:35 main run (another stage still running) is a readiness
+    # problem for the whole day.
+    try:
+        skipped = bot_status.get("skipped_main_run_at")
+        if skipped and str(skipped)[:10] == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+            problems.append(f"main pipeline run was skipped today at {skipped} "
+                            f"(blocker: {bot_status.get('skipped_main_run_blocker')})")
+        a_at = bot_status.get("auction_last_run_at")
+        if (bot_status.get("auction_last_run_status") == "error" and a_at
+                and str(a_at)[:10] == datetime.now(timezone.utc).strftime("%Y-%m-%d")):
+            problems.append(f"auction stage errored today: {bot_status.get('auction_last_error')}")
+    except Exception:
+        pass
     # Cut-loss scanner heartbeat (2026-10-15): during market hours every
     # enable_cutloss slot must have ticked within the last 5 minutes. A
     # scanner that silently stopped is a readiness problem, not a quiet log.
@@ -5477,6 +5544,20 @@ if __name__ == "__main__":
         # Survive a container that was asleep/redeploying at 09:35 ET: still
         # fire if we come up within the hour, and collapse missed runs into one.
         misfire_grace_time=3600,
+        coalesce=True,
+    )
+    # Pre-open auction stage (2026-10-15): submits limit-on-open orders for
+    # slots with exec_style="auction" before Alpaca's 09:28 ET cutoff; a
+    # no-op for every other slot. Misfire grace is short on purpose — a
+    # late fire is skipped by the window check and the 09:35 run rebalances
+    # normally.
+    scheduler.add_job(
+        run_trading_pipeline,
+        CronTrigger(hour=9, minute=6, day_of_week="mon-fri", timezone=TZ),
+        id="auction_pipeline",
+        name="Pre-open auction stage",
+        kwargs={"stage": "auction"},
+        misfire_grace_time=600,
         coalesce=True,
     )
     # Cut-loss scanner: runs every 60 seconds during market hours for V7+

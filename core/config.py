@@ -90,6 +90,13 @@ class ModelConfig:
     # rebalance, which is the first clean vs-open market-order baseline
     # read. Flipping any slot to "marketable_limit" is a deliberate
     # post-Monday decision, taken after that baseline is journaled.
+    # 2026-10-15: "auction" = submit the rebalance PRE-OPEN as limit-on-open
+    # orders (time_in_force "opg", whole shares, limit = prev close ±
+    # exec_auction_buffer_bps) from a ~09:06 ET stage, then let the normal
+    # 09:35 run record the auction fills and complete any shortfall with
+    # marketable-limit orders. The backtest prices every fill AT the open;
+    # the measured live drift from 09:30 to a 09:36+ fill was 37-119 bp/side
+    # on 2026-09-29 — the largest remaining execution cost.
     exec_style: str = "market"          # "market" (default, byte-identical
                                         # legacy path) | "marketable_limit"
     # Marketable-limit price buffer in bps past arrival (buys above /
@@ -101,6 +108,12 @@ class ModelConfig:
     # cancel-and-market-replace the unfilled remainder; "cancel" = cancel
     # and leave unfilled (reconciliation reports the shortfall).
     exec_timeout_action: str = "market"
+    # Limit-on-open price buffer in bps past the previous close (buys
+    # above / sells below): wide enough that the auction print is inside
+    # the limit on an ordinary morning, so the order participates; a gap
+    # beyond it leaves the order unfilled (cancelled at the open) and the
+    # 09:35 completion handles it at marketable-limit.
+    exec_auction_buffer_bps: float = 100.0
 
     def __post_init__(self):
         if self.state_path is None:
@@ -773,6 +786,8 @@ def get_active_models() -> list[ModelConfig]:
                     slot.get("exec_limit_buffer_bps", 10.0) or 10.0),
                 exec_fill_timeout_s=int(
                     slot.get("exec_fill_timeout_s", 120) or 120),
+                exec_auction_buffer_bps=float(
+                    slot.get("exec_auction_buffer_bps", 100.0) or 100.0),
                 exec_timeout_action=str(
                     slot.get("exec_timeout_action", "market") or "market"),
             ))

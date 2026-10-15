@@ -233,3 +233,45 @@ protocol has no tier clause — tiers are an operational-safety decision,
 PK1 stays pre-registered without them). From the live Sep 29 record
 (achieved $140,970 on equity $88,248, auto-scale fired) the primary's
 reconciliation lands at applied ≈ 0.685, floor ≈ 0.80. Tests: 270.
+
+## 2026-10-15 (later) — Opening-auction execution built, shipped DARK
+
+Owner asked for the "best setup" and to implement it. Decisions:
+- The three live tests stay at their pre-registered 2x (a leverage change
+  mid-test would flag MODIFIED_AFTER_START). The evidence-based setup for
+  real money / the next cycle is 1.75x with the full validated stack
+  (LEV1 table: each leverage step buys less return and more drawdown;
+  Calmar falls monotonically from 0.91 at 1x to 0.80 at 2x).
+- Opening-auction execution is the largest free gain (~0.4 pp/mo of drift
+  the backtest never paid: 2026-09-29 vs-open cost +72/+119/+9 bp/side).
+
+Built: exec_style="auction" (core/orders.py submit_auction_orders /
+finalize_auction_orders; core/runner.py stage="auction"; dashboard cron
+"auction_pipeline" 09:06 ET; core/market.is_auction_window 09:00-09:27).
+Stage 1 submits the rebalance as whole-share limit-on-open orders at
+prev_close ± 100 bp and records them as pending; the normal 09:35 run
+journals the fills with slippage vs the official open (exec_style
+"auction_loo"), cancels leftovers, and completes shortfalls at
+marketable-limit. No slot is on "auction" yet — ships dark; measurement
+pre-registered in the research repo (results/v7/execution/
+AUCTION1_PREREG.md, sha 56cf9965…) on combo_v2_process for its next three
+rebalances with a frozen adopt/revert rule. Enablement follows as a
+versioned config migration once the dark deploy is verified. 278 tests.
+Honest answer recorded for the owner: lower leverage and auction fills
+shrink weeks like Oct 7-15 (≈ −12% at 1.75x vs −17% at 2x) — they do not
+prevent momentum crashes; no validated layer does.
+
+Auction build — adversarial review rounds (2026-10-15): round 1 confirmed 25
+findings (stale pre-open snapshot anchor -> now yesterday's official close
+from the bot's own panel; completion leg fell to plain market -> now
+marketable-limit tagged auction_completion; split run_ids -> one per
+rebalance day; fills orphaned by early returns -> finalize runs first and
+for any date after 09:31 ET; sells now market-on-open; the 09:35 run
+completes the STORED 09:06 plan; main run waits for a running stage; stage
+bookkeeping separated from the main run's). Round 2 confirmed 16 more
+(plan-based fill rate so re-bought residues never double-count — the naive
+rate would have fired a false K3a; a skipped stage-1 day never inherits an
+earlier day's plan; no completion while auction orders are live;
+data-guard reset main-only; unreadable orders stay pending; atomic run
+guard; skip flag cleared on success; auction-stage errors visible in
+/ready). 283 tests. Still DARK: no slot on exec_style="auction".

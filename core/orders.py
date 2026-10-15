@@ -459,6 +459,217 @@ def liquidate_all_positions(
     return result
 
 
+def _auction_qty(order: dict, prev_close: float) -> float:
+    """Whole-share quantity for an opening-auction order (opg orders cannot
+    be fractional/notional). Full exits sell the whole-share part of the
+    position; trims and buys floor notional / prev_close; sells never
+    exceed the held quantity."""
+    import math
+    if prev_close <= 0:
+        return 0.0
+    if order["action"] == "sell":
+        return float(math.floor(float(order["qty"])))
+    qty = math.floor(float(order["notional"]) / prev_close)
+    if order["side"] == "sell" and order.get("held_qty") is not None:
+        qty = min(qty, math.floor(float(order["held_qty"])))
+    return float(max(qty, 0))
+
+
+def submit_auction_orders(orders: list[dict], mc: "ModelConfig",
+                          last_close: dict, logger, rb_data: dict,
+                          run_id: str | None = None) -> dict:
+    """Stage 1 of exec_style="auction": submit every planned order for the
+    opening auction (time_in_force "opg", whole shares).
+
+    - BUYS are LIMIT-on-open at last_close x (1 + exec_auction_buffer_bps):
+      the backtest's assumed fill is the open, the limit only guards a
+      gap-up beyond the buffer (unfilled -> cancelled -> the 09:35
+      completion handles it).
+    - SELLS (exits and trims) are MARKET-on-open: risk-reducing, exactly
+      the backtest's fill, and never left hanging on a gap-down morning
+      (a limit-protected sell leg would have filled every buy and no exit —
+      transient over-leverage; review 2026-10-15).
+
+    `last_close` is yesterday's OFFICIAL close per symbol from the bot's
+    own daily panel (the signal price). Alpaca's pre-open snapshot must
+    NOT be used for this: before ~09:31 its prevDailyBar is two sessions
+    back (review 2026-10-15). Nothing is journalled here — fills are only
+    known after 09:30; the pending records are returned for the 09:35 run
+    to finalize (finalize_auction_orders)."""
+    buffer = float(getattr(mc, "exec_auction_buffer_bps", 100.0) or 100.0)
+    run_id = run_id or f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
+    pending: list[dict] = []
+    skipped: list[dict] = []
+    submitted_notional = 0.0
+    for order in orders:
+        sym = order["symbol"]
+        prev_close = (last_close or {}).get(sym)
+        if not prev_close or float(prev_close) <= 0:
+            skipped.append({"symbol": sym, "reason": "no_prev_close"})
+            continue
+        qty = _auction_qty(order, float(prev_close))
+        if qty <= 0:
+            skipped.append({"symbol": sym, "reason": "sub_share",
+                            "notional": round(float(order.get("notional", 0) or 0), 2)})
+            continue
+        if order["side"] == "sell":
+            lp = None
+            payload = {
+                "symbol": _to_alpaca_symbol(sym), "side": "sell",
+                "type": "market", "qty": str(int(qty)), "time_in_force": "opg",
+            }
+        else:
+            lp = _limit_price_for("buy", float(prev_close), buffer)
+            payload = {
+                "symbol": _to_alpaca_symbol(sym), "side": "buy",
+                "type": "limit", "limit_price": lp, "qty": str(int(qty)),
+                "time_in_force": "opg",
+            }
+        try:
+            resp = alpaca_request("POST", "v2/orders", mc, payload, logger=logger) or {}
+            status = resp.get("status", "submitted")
+            if status in ("rejected", "canceled", "expired") or not resp.get("id"):
+                skipped.append({"symbol": sym, "reason": f"rejected:{resp.get('reject_reason', status)}"})
+                continue
+            est = qty * float(prev_close)
+            submitted_notional += est
+            pending.append({
+                "symbol": sym, "side": order["side"],
+                "trade_action": order.get("trade_action"),
+                "order_type": payload["type"],
+                "qty": qty, "limit_price": lp, "prev_close": float(prev_close),
+                "notional_est": round(est, 2),
+                "order_id": resp.get("id"), "order_status": status,
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+                "run_id": run_id,
+                "rank": order.get("rank"), "predicted_return": order.get("predicted_return"),
+                "entry_price": order.get("entry_price"),
+                "position_value_before": order.get("position_value_before"),
+            })
+            logger.info(f"    AUCTION {order['side'].upper():4s} {sym:6s} qty {int(qty)} "
+                        f"{'MOO' if lp is None else 'LOO @' + str(lp)} "
+                        f"(prev close {float(prev_close):.2f}) "
+                        f"[{order.get('trade_action')}] id={resp.get('id')}")
+        except Exception as e:
+            skipped.append({"symbol": sym, "reason": f"error:{e}"})
+            logger.error(f"    AUCTION {sym}: submit failed: {e}")
+    summary = {
+        "n_planned": len(orders), "n_submitted": len(pending),
+        "n_skipped": len(skipped), "skipped": skipped[:40],
+        "submitted_notional_usd": round(submitted_notional, 2),
+        "run_id": run_id, "pending": pending,
+    }
+    rb_data["exec_style"] = "auction_loo"
+    rb_data["auction"] = summary
+    logger.info(f"  AUCTION stage: {len(pending)} LOO orders submitted "
+                f"(${submitted_notional:,.0f}), {len(skipped)} skipped")
+    return summary
+
+
+def finalize_auction_orders(mc: "ModelConfig", pending: list[dict],
+                            journal: "TradeJournal", logger) -> dict:
+    """Stage 2 of exec_style="auction" (run at 09:35): read each opg
+    order's final state, journal one row per order with exec_style
+    "auction_loo" and slippage vs the official open, and cancel anything
+    still open (defensive — the venue cancels unfilled opg at the open).
+    Returns fill statistics for the report/state."""
+    if not pending:
+        return {"n": 0}
+    syms = sorted({p["symbol"] for p in pending})
+    try:
+        snapshots = fetch_snapshots(syms, mc, logger) or {}
+    except Exception as e:
+        logger.warning(f"  auction finalize: snapshot capture failed: {e}")
+        snapshots = {}
+    n_filled = n_unfilled = n_cancelled = 0
+    filled_notional = est_notional = 0.0
+    cost_num = cost_den = 0.0
+    remaining: list[dict] = []
+    for p in pending:
+        ts = datetime.now(timezone.utc)
+        sub_day = str(p.get("submitted_at") or ts.isoformat())[:10].replace("-", "")
+        trade = ExecTradeRecord(
+            trade_id=f"{mc.name}_auction_{sub_day}_{p['side']}_{p['symbol']}",
+            run_id=p.get("run_id") or f"{mc.name}_auction_{ts.strftime('%Y%m%d')}",
+            model=mc.name, timestamp=p.get("submitted_at") or ts.isoformat(),
+            symbol=p["symbol"], side=p["side"],
+            action=p.get("trade_action") or ("exit_position" if p["side"] == "sell" else "new_position"),
+            order_type=p.get("order_type") or "limit", time_in_force="opg",
+            notional_usd=float(p.get("notional_est") or 0),
+            order_id=p.get("order_id"), order_status=str(p.get("order_status") or "unknown"),
+            current_price=float(p.get("prev_close") or 0),
+            rank=p.get("rank"), predicted_return_pct=p.get("predicted_return"),
+            entry_price=p.get("entry_price"),
+            position_value_before=p.get("position_value_before"),
+            # No arrival price exists pre-open: decision_price stays None so
+            # the vs-arrival statistic never mistakes the overnight gap for
+            # an execution cost (review 2026-10-15). prev_close is kept in
+            # its own field.
+            decision_price=None,
+            reference_open=(snapshots.get(p["symbol"]) or {}).get("day_open"),
+            prev_close=float(p.get("prev_close") or 0) or None,
+            exec_style="auction_loo", limit_price=p.get("limit_price"),
+        )
+        # Polled read (retries + final fetch) — a single failed GET must
+        # never cancel a possibly filled order or journal it as unfilled.
+        state = {}
+        try:
+            state = poll_order_status(p["order_id"], mc, logger, max_wait=5.0) or {}
+        except Exception as e:
+            logger.warning(f"  auction finalize: poll {p['order_id']} failed: {e}")
+        status = str(state.get("status") or "unknown")
+        if status == "unknown":
+            # Unreadable is NOT 'open': never cancel or journal on a failed
+            # read — keep the entry pending so the next run retries
+            # (review 2026-10-15).
+            remaining.append(p)
+            logger.warning(f"  auction finalize: {p['symbol']} ({p['order_id']}) "
+                           f"unreadable — kept pending for retry")
+            continue
+        est_notional += float(p.get("notional_est") or 0)
+        if status in ("new", "accepted", "partially_filled", "pending_new", "accepted_for_bidding"):
+            # Still open: cancel and re-read the FINAL state.
+            trade.order_status = status
+            state = _cancel_order_and_get_final(trade, mc, logger) or state
+            status = str(state.get("status") or trade.order_status or "unknown")
+            n_cancelled += 1
+        _apply_order_fill(trade, state)
+        trade.order_status = status
+        if status == "filled" and not trade.fill_price and state.get("filled_avg_price"):
+            trade.fill_price = float(state["filled_avg_price"])
+        _compute_slippage(trade)
+        fq_raw = state.get("filled_qty")
+        if status == "filled" or (fq_raw not in (None, "0", 0) and trade.fill_price):
+            n_filled += 1
+            fq = float(fq_raw or p.get("qty") or 0)
+            fn = fq * float(trade.fill_price)
+            filled_notional += fn
+            trade.notional_usd = round(fn, 2)
+            if trade.slippage_bps is not None:
+                cost_num += trade.slippage_bps * fn
+                cost_den += fn
+        else:
+            n_unfilled += 1
+        try:
+            journal.log_trade(trade)
+        except Exception as e:
+            logger.warning(f"  auction finalize: journal append failed for {p['symbol']}: {e}")
+    stats = {
+        "n": len(pending) - len(remaining), "n_filled": n_filled, "n_unfilled": n_unfilled,
+        "n_cancelled_open": n_cancelled, "n_remaining_unread": len(remaining),
+        "remaining": remaining,
+        "fill_rate_notional": round(filled_notional / est_notional, 4) if est_notional else None,
+        "submitted_notional_usd": round(est_notional, 2),
+        "filled_notional_usd": round(filled_notional, 2),
+        "vw_cost_vs_open_bps": round(cost_num / cost_den, 2) if cost_den else None,
+    }
+    logger.info(f"  AUCTION fills: {n_filled}/{len(pending)} filled "
+                f"(notional fill rate {stats['fill_rate_notional']}), "
+                f"vw cost vs open {stats['vw_cost_vs_open_bps']} bp/side, "
+                f"{n_cancelled} still-open cancelled")
+    return stats
+
+
 def rebalance_portfolio(
     target_symbols: list[str],
     rankings: list[tuple[str, float]],
@@ -468,6 +679,9 @@ def rebalance_portfolio(
     report: "RunReport",
     dry_run: bool = False,
     target_weights: dict[str, float] | None = None,
+    auction: bool = False,
+    last_close: dict | None = None,
+    run_id: str | None = None,
 ):
     """Rebalance the live portfolio to match `target_symbols` (+ optional
     conviction weights), placing Alpaca orders and logging each trade.
@@ -489,7 +703,9 @@ def rebalance_portfolio(
 
     # Microsecond run_id avoids collisions when two clicks land in the
     # same second (e.g. cron + manual trigger).
-    run_id = f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
+    # One run_id per rebalance DAY: an auction day's completion reuses the
+    # 09:06 stage's id so execution stats group both legs as one rebalance.
+    run_id = run_id or f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
 
     acct = get_account(mc, logger, report)
     portfolio_value = float(acct["portfolio_value"])
@@ -503,6 +719,11 @@ def rebalance_portfolio(
         report.end_step("rebalance")
         return rb_data
 
+    # Alpaca keys positions in dot form (BRK.B); the universe uses dash
+    # form (BRK-B). Normalize so a held class share is recognized as held
+    # instead of being sold AND bought in the same plan (review 2026-10-15).
+    ours_by_alpaca = {_to_alpaca_symbol(s): s for s in target_symbols}
+    current_positions = {ours_by_alpaca.get(k, k): v for k, v in current_positions.items()}
     target_set = set(target_symbols)
     current_set = set(current_positions.keys())
 
@@ -672,6 +893,7 @@ def rebalance_portfolio(
                 orders.append({
                     "action": f"{side}_notional", "symbol": sym,
                     "notional": abs(diff), "side": side,
+                    "held_qty": pos.get("qty"),
                     "trade_action": trade_action,
                     "entry_price": pos["avg_entry"],
                     "current_price": pos["current_price"],
@@ -726,18 +948,32 @@ def rebalance_portfolio(
     snapshots: dict[str, dict] = {}
     try:
         order_syms = sorted({o["symbol"] for o in orders})
-        if order_syms:
+        if order_syms and not auction:   # pre-open snapshots are not used
             snapshots = fetch_snapshots(order_syms, mc, logger) or {}
     except Exception as e:
         logger.warning(f"  Decision-price snapshot capture failed: {e}")
         snapshots = {}
+
+    # -- Auction stage (exec_style="auction", pre-open): submit LOO orders
+    # and return; the 09:35 run finalizes fills and completes shortfalls.
+    if auction:
+        submit_auction_orders(orders, mc, last_close or {}, logger, rb_data,
+                              run_id=run_id)
+        rb_data["n_orders_planned"] = len(orders)
+        rb_data["run_id"] = run_id
+        report.end_step("rebalance")
+        return rb_data
 
     # -- Execute orders + log each trade ----------------------------------
     # Marketable-limit execution (opt-in per slot, default "market" keeps
     # the legacy path byte-identical). Applies ONLY to this rebalance flow
     # — cutloss/scanner sells and liquidate_all_positions stay MARKET.
     exec_style = str(getattr(mc, "exec_style", "market") or "market")
-    limit_mode = exec_style == "marketable_limit"
+    # An "auction" slot completes its residues at marketable-limit (never
+    # the legacy market path) and tags those rows so the two legs stay
+    # separable in the journal (review 2026-10-15).
+    limit_mode = exec_style in ("marketable_limit", "auction")
+    limit_tag = "auction_completion" if exec_style == "auction" else "marketable_limit"
     limit_buffer = float(getattr(mc, "exec_limit_buffer_bps", 10.0) or 0.0)
     limit_timeout = float(getattr(mc, "exec_fill_timeout_s", 120) or 0)
     timeout_action = str(getattr(mc, "exec_timeout_action", "market") or "market")
@@ -745,7 +981,7 @@ def rebalance_portfolio(
     # carries the final outcome (fill/timeout/replacement).
     limit_pending: list[tuple[TradeRecord, dict]] = []
     if limit_mode:
-        rb_data["exec_style"] = exec_style
+        rb_data["exec_style"] = limit_tag
         logger.info(
             f"  Execution: MARKETABLE-LIMIT (buffer {limit_buffer:.0f}bp, "
             f"timeout {limit_timeout:.0f}s, on-timeout={timeout_action})")
@@ -848,7 +1084,7 @@ def rebalance_portfolio(
                             trade.order_id = resp.get("id")
                             trade.order_status = status
                             trade.order_type = "limit"
-                            trade.exec_style = "marketable_limit"
+                            trade.exec_style = limit_tag
                             trade.limit_price = lp
                             limit_pending.append((trade, order))
                             logger.info(
@@ -1040,6 +1276,8 @@ def rebalance_portfolio(
                     round(filled_notional / orders_notional, 4)
                     if orders_notional > 0 else None
                 ),
+                "orders_notional_usd": round(orders_notional, 2),
+                "filled_notional_usd": round(filled_notional, 2),
                 "rejected_symbols": rejected_syms,
                 "unconfirmed_symbols": unconfirmed_syms,
             },
