@@ -76,3 +76,31 @@ Measured over the auction slot's next THREE scheduled rebalances
   2026-07-25 marketable-limit flip (disclosed in OPS_LOG.md, not a
   protocol amendment). The process slot's PK2 slippage criterion is
   measured on rebalance rows, which include auction rows.
+
+## Amendment 2026-10-15 (appended before any auction order; no metric or decision-rule change)
+
+The implementation reviews that followed the freeze (three adversarial
+rounds, same day, before enablement) changed two mechanics described in
+the Design section. Recorded here so the frozen text and the shipped code
+agree. The pre-declared metrics and the adopt/revert rule are unchanged.
+
+1. Sell side: market-on-open, not limit-on-open at −100 bp. A sell that
+   misses the open leaves the exit to the completion leg at a later,
+   typically worse, price; a market-on-open order executes at the official
+   open the backtest assumes. Buys stay limit-on-open at prev_close
+   +100 bp (an unprotected market buy could pay any overnight gap).
+   Consequence for metric 2: the auction fill rate is effectively a
+   buy-side statistic; sells fill at the open in full.
+2. Fill-rate price basis: "filled notional / submitted notional" is
+   measured at the anchor price (shares executed × previous official
+   close over shares submitted × previous official close), so a gap-down
+   morning is never read as an unfilled residue. The completion leg's
+   plan-based rate (both legs, re-bought residues counted once) is the
+   number the slot's protocol fill criterion sees.
+3. Expected measurement days, corrected for the bot's weekday-count
+   cadence and market holidays: 2026-10-28, 2026-11-27 (the cadence
+   falls due on Thanksgiving; the market-closed skip moves it to the
+   Friday half-session), 2026-12-28 (falls due on Christmas; moves to
+   the Monday). The decision report is due the session after the third
+   day. Enablement is by versioned config migration on combo_v2_process
+   only, recorded in OPS_LOG.md with the enabling commit.
