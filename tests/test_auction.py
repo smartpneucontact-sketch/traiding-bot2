@@ -578,3 +578,44 @@ def test_auction_stage_skips_data_phase_when_no_slot_is_due(tmp_path, monkeypatc
     monkeypatch.setattr(runner_mod, "get_tradeable_symbols", lambda lg, rp: called.append(1) or [])
     runner_mod.run_pipeline(stage="auction", force=True)
     assert called == [1]
+
+
+# ───────────── enablement: migration + manifest pin ─────────────────────
+
+def test_exec_style_migration_flips_only_the_enabled_process_slot(monkeypatch):
+    import core.config as config_mod
+    saved = []
+    monkeypatch.setattr(config_mod, "save_model_config", lambda cfg: saved.append(dict(cfg)))
+    cfg = {"slots": [
+        {"slot_id": 1, "model": "combo_v2", "enabled": True, "exec_style": "marketable_limit"},
+        {"slot_id": 2, "model": "combo_v2_exp", "enabled": True, "exec_style": "marketable_limit"},
+        {"slot_id": 3, "model": "combo_v2_process", "enabled": True, "exec_style": "marketable_limit",
+         "exec_limit_buffer_bps": 10.0},
+        {"slot_id": 4, "model": "combo_v2_process", "enabled": False, "exec_style": "marketable_limit"},
+    ]}
+    out = config_mod._migrate_exec_style(cfg)
+    by_id = {s["slot_id"]: s for s in out["slots"]}
+    assert by_id[3]["exec_style"] == "auction"
+    assert by_id[3]["exec_auction_buffer_bps"] == 100.0 and by_id[3]["exec_limit_buffer_bps"] == 10.0
+    assert by_id[1]["exec_style"] == "marketable_limit" and by_id[2]["exec_style"] == "marketable_limit"
+    assert by_id[4]["exec_style"] == "marketable_limit"          # disabled slot untouched
+    assert out["exec_style_migration"] == config_mod.EXEC_STYLE_VERSION and len(saved) == 1
+    # Idempotent: a second call neither rewrites nor re-saves.
+    config_mod._migrate_exec_style(out)
+    assert len(saved) == 1
+    # One-shot: an operator REVERT after the stamp is never re-applied.
+    out["slots"][2]["exec_style"] = "marketable_limit"
+    config_mod._migrate_exec_style(out)
+    assert out["slots"][2]["exec_style"] == "marketable_limit" and len(saved) == 1
+
+
+def test_manifest_pins_auction_on_the_process_slot_only():
+    import json
+    from pathlib import Path
+    import core.invariants as inv
+    m = json.loads((Path(inv.MANIFEST_PATH)).read_text())
+    assert m["slots"]["combo_v2_process"]["exec_style"] == "auction"
+    assert m["slots"]["combo_v2_process"]["exec_auction_buffer_bps"] == 100.0
+    assert m["slots"]["combo_v2"]["exec_style"] == "marketable_limit"
+    assert m["slots"]["combo_v2_exp"]["exec_style"] == "marketable_limit"
+    assert "exec_auction_buffer_bps" in inv._SLOT_FIELDS

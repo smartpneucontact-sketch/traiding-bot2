@@ -43,6 +43,7 @@ _SLOT_FIELDS = (
     "target_leverage",
     "exec_style",
     "exec_limit_buffer_bps",
+    "exec_auction_buffer_bps",
     "exec_fill_timeout_s",
     "exec_timeout_action",
     "enable_cutloss",

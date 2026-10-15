@@ -32,6 +32,12 @@
       "resolution": "2026-09-26: report #2 written (clean null; SPY worst 21d DD -2.58%). Written 5 days late."
     },
     {
+      "date": "2026-10-16",
+      "label": "First 09:06 ET auction-stage cron fire (combo_v2_process on exec_style auction; no rebalance due -> data phase skipped): verify auction_last_run stamped, 09:35 main run unaffected",
+      "kind": "measurement",
+      "severity": "info"
+    },
+    {
       "date": "2026-10-20",
       "label": "Primary slot 3-month operational checkpoint (fts 2026-07-20) \u2014 include Aug 18-28 outage disclosure",
       "kind": "checkpoint",
@@ -53,6 +59,30 @@
       "date": "2026-10-27",
       "label": "Process slot 3-month operational checkpoint (fts 2026-07-27)",
       "kind": "checkpoint",
+      "severity": "high"
+    },
+    {
+      "date": "2026-10-28",
+      "label": "AUCTION1 day 1/3 \u2014 first opening-auction rebalance (combo_v2_process): verify 09:06 opg submission (whole shares, MOO sells / LOO buys +100bp), 09:35 fills vs official open + completion rows; primary/exp = same-day controls",
+      "kind": "measurement",
+      "severity": "high"
+    },
+    {
+      "date": "2026-11-27",
+      "label": "AUCTION1 day 2/3 (cadence falls due on Thanksgiving; market-closed skip moves it to the Friday half-session)",
+      "kind": "measurement",
+      "severity": "info"
+    },
+    {
+      "date": "2026-12-28",
+      "label": "AUCTION1 day 3/3 (cadence falls due on Christmas; moves to the Monday)",
+      "kind": "measurement",
+      "severity": "info"
+    },
+    {
+      "date": "2026-12-29",
+      "label": "AUCTION1 decision report due: ADOPT on all slots / REVERT the process slot / EXTEND, per the frozen rule in results/v7/execution/AUCTION1_PREREG.md",
+      "kind": "decision",
       "severity": "high"
     },
     {

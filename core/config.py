@@ -475,6 +475,21 @@ CUTLOSS_CALIBRATION_VERSION = "2026-10-riskfix-v2"
 # itself changes (a bump re-appends any template model still missing).
 SHADOW_SLOTS_VERSION = "2026-07-a3-shadow-v1"
 
+# Stamp written into model_config.json once the opening-auction execution
+# style has been applied to the slot under AUCTION1 measurement.
+# 2026-10-auction-v1 (2026-10-15): enabled combo_v2_process slots move from
+# marketable-limit to exec_style="auction" — the 09:06 ET stage submits the
+# rebalance as whole-share opening-auction orders (market-on-open sells,
+# limit-on-open buys at prev close + exec_auction_buffer_bps) and the
+# normal 09:35 run journals the fills vs the official open and completes
+# residues at marketable-limit. Pre-registered in the research repo
+# (results/v7/execution/AUCTION1_PREREG.md) for the slot's next three
+# rebalances with a frozen adopt/revert rule. An operational execution
+# change of the 2026-07-25 marketable-limit class, recorded in OPS_LOG.md,
+# not a protocol amendment. One-shot: a later operator flip back (the
+# REVERT rule) is never re-applied because the stamp is already present.
+EXEC_STYLE_VERSION = "2026-10-auction-v1"
+
 
 def _shadow_slot_templates() -> list[dict]:
     """DISABLED template slots for the two shadow models (Roadmap v2 A3).
@@ -593,6 +608,39 @@ def _migrate_cutloss_calibration(config: dict) -> dict:
     if changed:
         print(f"[CONFIG MIGRATE] model_config.json stamped "
               f"{CUTLOSS_CALIBRATION_VERSION}", flush=True)
+    return config
+
+
+def _migrate_exec_style(config: dict) -> dict:
+    """One-time migration moving the enabled combo_v2_process slot to the
+    opening-auction execution style (see EXEC_STYLE_VERSION). The volume's
+    model_config.json survives deploys, so a code default alone would
+    never reach the live slot; the spec manifest pins the result so a
+    silent divergence turns /ready red. Never raises."""
+    if config.get("exec_style_migration") == EXEC_STYLE_VERSION:
+        return config
+    try:
+        changed = False
+        for slot in config.get("slots", []):
+            if (slot.get("model") == "combo_v2_process" and slot.get("enabled")
+                    and str(slot.get("exec_style") or "market") != "auction"):
+                prev = slot.get("exec_style") or "market"
+                slot["exec_style"] = "auction"
+                slot.setdefault("exec_auction_buffer_bps", 100.0)
+                slot.setdefault("exec_limit_buffer_bps", 10.0)
+                print(f"[CONFIG MIGRATE] slot {slot.get('slot_id')} "
+                      f"(combo_v2_process): exec_style {prev!r} -> 'auction' "
+                      f"(AUCTION1 measurement; {EXEC_STYLE_VERSION}; see "
+                      f"OPS_LOG.md)", flush=True)
+                changed = True
+        config["exec_style_migration"] = EXEC_STYLE_VERSION
+        save_model_config(config)
+        if changed:
+            print(f"[CONFIG MIGRATE] model_config.json stamped "
+                  f"{EXEC_STYLE_VERSION}", flush=True)
+    except Exception as e:
+        print(f"[CONFIG MIGRATE] WARNING: exec_style migration failed ({e}); "
+              f"slots left as they were", flush=True)
     return config
 
 
@@ -734,7 +782,8 @@ def get_active_models() -> list[ModelConfig]:
     anything.
     """
     global _last_model_detect_block
-    config = _ensure_shadow_slots(_migrate_cutloss_calibration(load_model_config()))
+    config = _ensure_shadow_slots(
+        _migrate_exec_style(_migrate_cutloss_calibration(load_model_config())))
     models: list[ModelConfig] = []
     activated_via_config = False
     detect_lines: list[str] = []  # buffered [MODEL DETECT] block, see above

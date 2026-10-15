@@ -7,7 +7,8 @@
     "operator deliberately changes the live setup \u2014 the whole point is",
     "that silent divergence between intention and runtime becomes loud.",
     "History that motivated it: tier scale base, slot target_leverage,",
-    "exec_* passthrough, missing protocol COPY, MIN_STOCKS_REQUIRED=500."
+    "exec_* passthrough, missing protocol COPY, MIN_STOCKS_REQUIRED=500.",
+    "2026-10-15: combo_v2_process pinned to exec_style \"auction\" (AUCTION1 measurement, migration 2026-10-auction-v1); the primary and exp slots stay on marketable_limit as same-day controls."
   ],
   "frozen": "2026-10-15",
   "slots": {
@@ -34,8 +35,9 @@
     "combo_v2_process": {
       "enabled": true,
       "target_leverage": 2.0,
-      "exec_style": "marketable_limit",
+      "exec_style": "auction",
       "exec_limit_buffer_bps": 10.0,
+      "exec_auction_buffer_bps": 100.0,
       "gated": false,
       "enable_cutloss": true,
       "cutloss_portfolio_stop": -4.0,

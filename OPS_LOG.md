@@ -302,3 +302,39 @@ Still DARK — enablement (migration + manifest pin) follows once this
 deploy is verified. The AUCTION1 pre-registration received a dated
 appended amendment (sells market-on-open, anchor-priced fill rate,
 holiday-corrected measurement days 2026-10-28 / 11-27 / 12-28).
+
+## 2026-10-15 (evening) — Opening-auction execution ENABLED on combo_v2_process (AUCTION1)
+
+Dark build with the round-3 fixes verified live first (deploy 7df7b2fd,
+commit 831739b; the first build attempt 17d37d63 failed on Railway's
+builder disk — "no space left on device" — and was rebuilt from source):
+all three slots still on marketable_limit, invariants 34/34, state intact.
+
+Enablement = versioned config migration `2026-10-auction-v1`
+(core/config.py `_migrate_exec_style`): the ENABLED combo_v2_process slot
+moves to exec_style "auction" with exec_auction_buffer_bps 100 (its
+completion leg keeps exec_limit_buffer_bps 10); disabled slots and the
+primary / Candidate X slots are untouched; one-shot — a later REVERT per
+the frozen rule is never re-applied. spec_manifest.json pins exec_style
+"auction" + exec_auction_buffer_bps 100.0 on the process slot (35 checks;
+a silent flip back turns /ready red). program_calendar.json carries Oct 16
+(first stage fire, expected no-op), Oct 28 / Nov 27 / Dec 28 (AUCTION1
+days 1-3) and Dec 29 (decision report due).
+
+What changes live from tomorrow: the 09:06 ET auction stage fires every
+weekday; on the 20 of 21 sessions when no auction slot is due it stamps
+auction_last_run and skips the data phase. On Oct 28 (the process slot's
+next rebalance under the weekday-count cadence from Sep 29) it submits
+whole-share opg orders — market-on-open sells, limit-on-open buys at the
+previous official close +100 bp — before 09:27 ET and stores the plan;
+the 09:35 run finalizes the fills (journal rows exec_style "auction_loo",
+slippage vs the official open), completes residues at marketable-limit
+under the same run_id, and merges both legs into the reconciliation
+(plan-based fill rate). The primary and Candidate X stay on
+marketable-limit as same-day controls. Operational execution change of
+the 2026-07-25 class, not a protocol amendment: protocol_process.json is
+untouched and its bound sha unchanged. Measurement and adopt/revert rule
+frozen in the research repo (results/v7/execution/AUCTION1_PREREG.md,
+amended 2026-10-15 before any auction order; sha b1d91cbe…). Verification
+prompts scheduled for Oct 16 09:53 ET (first stage fire) and Oct 28 09:52
+ET (day 1/3). 292 tests.
