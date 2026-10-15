@@ -715,6 +715,13 @@ def test_repo_manifest_matches_code_constants():
     for slot, gated in (("combo_v2", True), ("combo_v2_exp", True),
                         ("combo_v2_process", False)):
         assert manifest["slots"][slot]["gated"] is gated
+    # 2026-10-15: every live slot pins its tier layer (the process slot
+    # ran with none for 11 weeks while its template said otherwise).
+    for slot in ("combo_v2", "combo_v2_exp", "combo_v2_process"):
+        assert manifest["slots"][slot]["enable_cutloss"] is True
+        assert manifest["slots"][slot]["cutloss_portfolio_stop"] == -4.0
+    from core.gate_update import GATE_UPDATE_BAND_REL
+    assert 0 < GATE_UPDATE_BAND_REL <= manifest["runtime"]["gate_update_band_rel_max"]
 
 
 # ─────────────── execution stats: risk-layer exclusion (audit) ──────────

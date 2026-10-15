@@ -446,7 +446,16 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
 
 # Stamp written into model_config.json once the 2026-06 stop recalibration
 # has been applied to the stored slots. Bump when thresholds are re-tuned.
-CUTLOSS_CALIBRATION_VERSION = "2026-06-riskfix-v1"
+# 2026-10-riskfix-v2 (2026-10-15): enabled combo_v2_process slots get the
+# portfolio tier layer their own slot template prescribes (see
+# _shadow_slot_templates: "the process slot keeps the same tiers for
+# comparability"). The live slot 3 had enable_cutloss=false since its
+# 2026-07-21 activation — it fell -7.9% intraday on 2026-10-15 with
+# nothing armed. NOTE: protocol_process.json has no tier clause; PK1 was
+# pre-registered without tiers, and enabling them is an operational-safety
+# decision recorded in OPS_LOG.md, not a protocol amendment. Operator
+# overrides on other fields are untouched; v1 rules remain idempotent.
+CUTLOSS_CALIBRATION_VERSION = "2026-10-riskfix-v2"
 
 # Stamp written into model_config.json once the A3 shadow-slot templates
 # (slots 2/3, disabled) have been appended. Bump only if the template set
@@ -551,6 +560,19 @@ def _migrate_cutloss_calibration(config: dict) -> dict:
             changed = True
         if "cutloss_reentry_delay_days" not in slot:
             slot["cutloss_reentry_delay_days"] = 2
+            changed = True
+        # v2: the process slot's tiers (see CUTLOSS_CALIBRATION_VERSION).
+        if (slot.get("model") == "combo_v2_process" and slot.get("enabled")
+                and not slot.get("enable_cutloss")):
+            slot["enable_cutloss"] = True
+            slot.setdefault("cutloss_portfolio_stop", -4.0)
+            slot.setdefault("cutloss_scale_by_leverage", True)
+            slot.setdefault("cutloss_hard_stop", None)
+            slot.setdefault("cutloss_trailing_stop", None)
+            print(f"[CONFIG MIGRATE] slot {slot.get('slot_id')} "
+                  f"(combo_v2_process): portfolio tier layer ENABLED per the "
+                  f"slot template (was off since activation; "
+                  f"2026-10-riskfix-v2; see OPS_LOG.md)", flush=True)
             changed = True
 
     config["cutloss_calibration"] = CUTLOSS_CALIBRATION_VERSION

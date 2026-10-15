@@ -225,10 +225,10 @@ def run_invariant_checks(logger=None) -> dict:
 
     n_checks += 1
     try:
-        from core.gate_update import GATE_DAILY_UPDATE, GATE_UPDATE_BAND
-        band_max = float(runtime.get("gate_update_band_max", 0.5))
-        if not (0.0 < GATE_UPDATE_BAND <= band_max):
-            fail(f"GATE_UPDATE_BAND={GATE_UPDATE_BAND} outside "
+        from core.gate_update import GATE_DAILY_UPDATE, GATE_UPDATE_BAND_REL
+        band_max = float(runtime.get("gate_update_band_rel_max", 0.2))
+        if not (0.0 < GATE_UPDATE_BAND_REL <= band_max):
+            fail(f"GATE_UPDATE_BAND_REL={GATE_UPDATE_BAND_REL} outside "
                  f"(0, {band_max}]")
         if runtime.get("gate_daily_update", True) and not GATE_DAILY_UPDATE:
             warn("daily gate updates DISABLED by env (spec expects on)")

@@ -762,7 +762,25 @@ def api_status():
         if state.get("last_run"):
             persisted_last_runs.append(str(state["last_run"]))
         gate_trace = state.get("gate_update_history") or []
+        try:
+            from core.risk import _effective_portfolio_stop
+            tier1 = _effective_portfolio_stop(mc) if getattr(mc, "enable_cutloss", False) else None
+        except Exception:
+            tier1 = None
         s["models"][mc.name] = {
+            # Cut-loss scanner evidence (2026-10-15): heartbeat + the
+            # session's minimum drawdown vs the Tier-1 level.
+            "cutloss": {
+                "enabled": bool(getattr(mc, "enable_cutloss", False)),
+                "last_tick_ts": state.get("cutloss_last_tick_ts"),
+                "daily_min_dd_pct": state.get("cutloss_daily_min_dd_pct"),
+                "daily_min_dd_date": state.get("cutloss_daily_min_dd_date"),
+                "daily_min_is_today": (
+                    state.get("cutloss_daily_min_dd_date") == _et_today_iso()),
+                "daily_min_dd_ts": state.get("cutloss_daily_min_dd_ts"),
+                "tier1_pct": tier1,
+                "anchor": state.get("daily_portfolio_start"),
+            },
             "run_count": state.get("run_count", 0),
             "data_guard_aborts": int(state.get("data_guard_aborts", 0) or 0),
             "history": state.get("history", [])[-5:],
@@ -804,6 +822,14 @@ def api_status():
     except Exception:
         s["calendar"] = None
     return jsonify(s)
+
+
+def _et_today_iso() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
 
 
 def _program_calendar_view() -> dict | None:
@@ -3016,6 +3042,49 @@ def ready():
     # the committed spec (spec_manifest.json) is exactly the fault class
     # that has bitten five times — surface it here so external alerting
     # (and the deploy healthcheck) sees it.
+    # Cut-loss scanner heartbeat (2026-10-15): during market hours every
+    # enable_cutloss slot must have ticked within the last 5 minutes. A
+    # scanner that silently stopped is a readiness problem, not a quiet log.
+    try:
+        from core.market import is_market_open
+        if is_market_open():
+            # Grace: 5 minutes after boot AND 5 minutes after today's 09:30
+            # ET open — the last heartbeat is legitimately ~17.5h old at
+            # 09:30:00 because the scanner no-ops outside market hours.
+            grace_ok = True
+            try:
+                from zoneinfo import ZoneInfo
+                now_et = datetime.now(ZoneInfo("America/New_York"))
+                open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                since_open = (now_et - open_et).total_seconds()
+                started = datetime.fromisoformat(str(bot_status.get("started_at")))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                since_boot = (datetime.now(timezone.utc) - started).total_seconds()
+                grace_ok = min(since_open, since_boot) > 300
+            except Exception:
+                pass
+            for mc in pipeline.get_active_models():
+                if not getattr(mc, "enable_cutloss", False):
+                    continue
+                st = _load_model_state(mc.name) or {}
+                ts = st.get("cutloss_last_tick_ts")
+                age = None
+                if ts:
+                    try:
+                        t = datetime.fromisoformat(str(ts))
+                        if t.tzinfo is None:
+                            t = t.replace(tzinfo=timezone.utc)
+                        age = (datetime.now(timezone.utc) - t).total_seconds()
+                    except Exception:
+                        age = None
+                if grace_ok and (age is None or age > 300):
+                    problems.append(
+                        f"{mc.name}: cut-loss scanner heartbeat "
+                        f"{'missing' if age is None else f'{int(age)}s old'} "
+                        f"during market hours")
+    except Exception:
+        pass
     inv_warnings: list[str] = []
     try:
         from core.invariants import load_last_status
@@ -4154,17 +4223,23 @@ def index():
             const invText = invOk === null ? '—' : invOk ? (invWarn ? `PASS · ${{invWarn}}⚠` : 'PASS') : `${{inv.failures.length}} VIOLATION(S)`;
             const uniText = uni ? `${{uni.count}} names${{uni.warn ? ' ⚠ decaying' : ''}}` : '—';
             let gateBits = [];
+            let stopBits = [];
             for (const [mName, mData] of Object.entries(status.models || {{}})) {{
                 const g = mData.gate || {{}};
                 if (g.applied_exposure_multiplier != null) {{
                     gateBits.push(`${{mName.replace('combo_v2', 'cv2')}}: ${{(g.applied_exposure_multiplier * 100).toFixed(0)}}%`);
                 }}
+                const c = mData.cutloss || {{}};
+                if (c.enabled && c.daily_min_dd_pct != null && c.daily_min_is_today) {{
+                    stopBits.push(`${{mName.replace('combo_v2', 'cv2')}} ${{c.daily_min_dd_pct.toFixed(2)}}%${{c.tier1_pct != null ? ' (T1 ' + c.tier1_pct.toFixed(1) + '%)' : ''}}`);
+                }}
             }}
+            const stopLine = stopBits.length ? ` · stops min today ${{stopBits.join(' / ')}}` : '';
             html += `
             <div class="metric">
                 <div class="label">Program Health</div>
                 <div class="val ${{invColor}}" style="font-size:16px">${{invText}}</div>
-                <div class="sub">universe: ${{uniText}}${{gateBits.length ? ' · gate ' + gateBits.join(' · ') : ''}}</div>
+                <div class="sub">universe: ${{uniText}}${{gateBits.length ? ' · gate ' + gateBits.join(' · ') : ''}}${{stopLine}}</div>
             </div>`;
 
             // Deadline calendar: overdue decisions scream; next deadline shows.

@@ -63,6 +63,14 @@ SCANNER_OWNED_KEYS = (
     "gate_ref",
     "gate_data_skips",
     "gate_update_history",
+    # Scanner heartbeat + session minimum drawdown (2026-10-15): written
+    # every tick so 'did the stop look, and how close did it come?' is
+    # auditable from state instead of from Alpaca's intraday history.
+    "cutloss_last_tick_ts",
+    "cutloss_daily_min_dd_pct",
+    "cutloss_daily_min_dd_date",
+    "cutloss_daily_min_dd_ts",
+    "cutloss_near_miss_warned_date",
 )
 
 

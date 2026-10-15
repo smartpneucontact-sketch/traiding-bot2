@@ -538,36 +538,61 @@ def rebalance_portfolio(
 
     rb_data["target_leverage"] = leverage
 
-    # Pre-flight: if total target notional exceeds Alpaca buying_power,
-    # auto-scale every allocation by the same factor so the rebalance fits.
-    # Without this, Alpaca rejects overage orders one-by-one — the partial
-    # fills leave the book in a state where the *next* rebalance sees stale
-    # positions and over/under-corrects. Auto-scaling produces a clean,
-    # consistent book at the available leverage.
-    total_target_notional = sum(sym_allocations.values())
+    # Pre-flight (rewritten 2026-10-15): compare the INCREMENTAL buying this
+    # rebalance needs — new positions plus up-sizes of held names — against
+    # Alpaca buying_power. The previous check compared the ENTIRE target
+    # book (held positions included) to buying_power, so any rebalance that
+    # started from a fully invested 2x book was auto-scaled to ~0.75x of
+    # design even though only ~30-45% of the book actually trades: the
+    # 2026-09-29 rebalance silently landed both gated slots at ~1.6x. Sells
+    # are NOT credited: Alpaca's buying_power is the day-trading figure,
+    # which intraday sales do not replenish, and the buys are submitted
+    # seconds after the sells anyway. If the buys alone exceed
+    # buying_power, ONLY the buy side is scaled — exits and trims always
+    # execute in full.
     bp = float(acct.get("buying_power", 0))
-    if total_target_notional > bp and bp > 0:
-        scale = bp / total_target_notional
-        sym_allocations = {sym: alloc * scale
-                           for sym, alloc in sym_allocations.items()}
-        realized_leverage = (bp / portfolio_value) if portfolio_value else 0.0
+    forced_upsizes: set = set()
+    buy_need = 0.0
+    for sym in to_buy:
+        buy_need += float(sym_allocations.get(sym, avg_weight))
+    for sym in to_hold:
+        mv = float(current_positions[sym]["market_value"])
+        tgt = float(sym_allocations.get(sym, avg_weight))
+        diff = tgt - mv
+        if diff > 0 and abs(diff) > tgt * 0.1:   # same drift rule as the loop
+            buy_need += diff
+    total_target_notional = sum(sym_allocations.values())
+    rb_data["buy_need_usd"] = round(buy_need, 2)
+    rb_data["buying_power_usd"] = round(bp, 2)
+    if buy_need > bp and bp > 0:
+        scale = bp / buy_need
+        for sym in to_buy:
+            sym_allocations[sym] = float(sym_allocations.get(sym, avg_weight)) * scale
+        for sym in to_hold:
+            mv = float(current_positions[sym]["market_value"])
+            tgt = float(sym_allocations.get(sym, avg_weight))
+            diff = tgt - mv
+            if diff > 0 and abs(diff) > tgt * 0.1:
+                sym_allocations[sym] = mv + diff * scale
+                # The scaled increment may now sit under the 10% band; the
+                # hold loop must still place it (its budget was reserved).
+                forced_upsizes.add(sym)
+        total_target_notional = sum(sym_allocations.values())
+        realized_leverage = (total_target_notional / portfolio_value) if portfolio_value else 0.0
         logger.warning(
-            f"  [REBALANCE] AUTO-SCALED allocations: requested notional "
-            f"${total_target_notional:,.2f} > buying_power ${bp:,.2f} "
+            f"  [REBALANCE] AUTO-SCALED BUYS: incremental buys "
+            f"${buy_need:,.2f} > buying_power ${bp:,.2f} "
             f"(requested leverage={leverage:.2f}x, equity=${portfolio_value:,.2f}). "
-            f"Scaling all positions by {scale:.4f} → "
-            f"realized leverage ~{realized_leverage:.2f}x. "
-            f"Update target_leverage to {realized_leverage:.2f}x or lower "
-            f"to silence this warning."
+            f"Buy side scaled by {scale:.4f}; exits/trims unchanged → "
+            f"targeted gross ${total_target_notional:,.2f} (~{realized_leverage:.2f}x)."
         )
         report.add_warning(
-            f"auto-scaled to buying_power: ${total_target_notional:,.0f}→"
-            f"${bp:,.0f} (realized leverage {realized_leverage:.2f}x)"
+            f"buys auto-scaled to buying_power: ${buy_need:,.0f}→${bp:,.0f} "
+            f"(targeted leverage {realized_leverage:.2f}x)"
         )
         rb_data["auto_scaled_to_buying_power"] = True
         rb_data["requested_leverage"] = leverage
-        # Refresh the total for downstream code that reads it
-        total_target_notional = sum(sym_allocations.values())
+        rb_data["buy_scale"] = round(scale, 4)
     else:
         rb_data["auto_scaled_to_buying_power"] = False
     # Measured gross actually targeted by this rebalance, not an echo of
@@ -628,7 +653,7 @@ def rebalance_portfolio(
         pred_ret, rank = pred_lookup.get(sym, (None, None))
         pred_str = f", pred={pred_ret:+.2f}% rank=#{rank}" if pred_ret is not None else ""
 
-        if abs(diff) > sym_target * 0.1:
+        if abs(diff) > sym_target * 0.1 or (sym in forced_upsizes and diff > 0):
             if diff > 0:
                 direction = "BUY more"
                 trade_action = "rebalance_up"

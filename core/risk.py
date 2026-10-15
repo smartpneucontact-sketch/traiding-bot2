@@ -248,6 +248,10 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
         # would otherwise sit unprotected all session with every stop
         # layer disabled. Retry until flat.
         if state.get("portfolio_stop_tripped_date") == today_iso:
+            # Heartbeat on the trip-flag path too (review 2026-10-15):
+            # /ready must not false-alarm for the rest of a liquidation day.
+            state["cutloss_last_tick_ts"] = datetime.now(timezone.utc).isoformat()
+            save_state(state, mc)
             try:
                 leftovers = alpaca_request("GET", "v2/positions", mc,
                                            logger=tick_logger)
@@ -269,6 +273,10 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
             return
 
         if not positions:
+            # Heartbeat even on an empty book (2026-10-15): the scanner
+            # looked, there was nothing to protect.
+            state["cutloss_last_tick_ts"] = datetime.now(timezone.utc).isoformat()
+            save_state(state, mc)
             return
 
         n_positions = len(positions)
@@ -291,7 +299,23 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
                 state["daily_portfolio_start"] = anchor
                 state["daily_portfolio_start_date"] = today_iso
                 state_dirty = True
+                # One INFO line per session (2026-10-15): the anchor and
+                # the tier levels, so a day's stop behaviour is auditable
+                # from the log instead of only from Alpaca history.
+                _p = _effective_portfolio_stop(mc)
+                if _p is not None:
+                    logger.info(
+                        f"[CUTLOSS] {mc.name}: session anchor "
+                        f"${anchor:,.2f} (prev close); Tier 1 at "
+                        f"${anchor * (1 + _p / 100):,.0f} ({_p:+.2f}%), "
+                        f"Tier 2 at ${anchor * (1 + _p * 5 / 3 / 100):,.0f}, "
+                        f"Tier 3 at ${anchor * (1 + _p * 7 / 3 / 100):,.0f}"
+                    )
         start_equity = state.get("daily_portfolio_start", last_equity)
+        # Heartbeat (2026-10-15): proves the scanner ticked, not just that
+        # it anchored once at the open.
+        state["cutloss_last_tick_ts"] = datetime.now(timezone.utc).isoformat()
+        state_dirty = True
 
         # Day-anchored gross book (sum of position market values): the
         # base the validated tier rule scales against — stop_grid.py's
@@ -321,6 +345,27 @@ def _cutloss_scan_model(mc: "ModelConfig", logger, top_n: int = 20) -> None:
         pstop = _effective_portfolio_stop(mc)
         if pstop is not None and start_equity > 0 and current_equity > 0:
             daily_drawdown_pct = (current_equity / start_equity - 1) * 100
+
+            # Session minimum drawdown (2026-10-15): persisted so a near
+            # miss is visible on the dashboard and in the 3-month
+            # checkpoint evidence without replaying intraday history.
+            if state.get("cutloss_daily_min_dd_date") != today_iso:
+                state["cutloss_daily_min_dd_pct"] = min(0.0, daily_drawdown_pct)
+                state["cutloss_daily_min_dd_date"] = today_iso
+                state["cutloss_daily_min_dd_ts"] = state["cutloss_last_tick_ts"]
+            elif daily_drawdown_pct < float(state.get("cutloss_daily_min_dd_pct", 0.0) or 0.0):
+                state["cutloss_daily_min_dd_pct"] = daily_drawdown_pct
+                state["cutloss_daily_min_dd_ts"] = state["cutloss_last_tick_ts"]
+            # Near-miss warning: within 2pp of Tier 1, once per session.
+            if (daily_drawdown_pct <= pstop + 2.0
+                    and state.get("cutloss_near_miss_warned_date") != today_iso):
+                state["cutloss_near_miss_warned_date"] = today_iso
+                logger.warning(
+                    f"[CUTLOSS] {mc.name}: NEAR MISS — daily DD "
+                    f"{daily_drawdown_pct:+.2f}% is within 2pp of Tier 1 "
+                    f"({pstop:+.2f}%); equity ${current_equity:,.2f} vs "
+                    f"anchor ${start_equity:,.2f}"
+                )
 
             if daily_drawdown_pct <= pstop * (7.0 / 3.0):
                 # Tier 3 — hard liquidation, preserves original behavior.

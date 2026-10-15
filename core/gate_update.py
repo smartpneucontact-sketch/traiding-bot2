@@ -16,7 +16,7 @@ uses — the same module-level functions, the same config fields and
 getattr back-compat defaults — keyed to the HELD book (book_gate.py
 computes book drawdown from the held weights, and _book_drawdown
 normalizes by gross, so position market values give the same figure). If
-the effective target moved by at least GATE_UPDATE_BAND, the live book is
+the effective target moved by at least GATE_UPDATE_BAND_REL x applied, the live book is
 scaled pro-rata toward it, both directions.
 
 2026-08-31 audit corrections baked into this version:
@@ -63,14 +63,18 @@ Gate trades are EXCLUDED from the protocol-facing slippage calibration
 (core/execution_stats.py filters non-rebalance actions).
 
 Env knobs:
-  GATE_DAILY_UPDATE  "1" (default) enables the daily pass; "0" disables.
-  GATE_UPDATE_BAND   minimum |target − applied| move that triggers
-                     trading (default 0.10).
+  GATE_DAILY_UPDATE      "1" (default) enables the daily pass; "0" disables.
+  GATE_UPDATE_BAND_REL   minimum |target − applied| / applied move that
+                         triggers trading, either direction (default
+                         0.035). The absolute GATE_UPDATE_BAND knob was
+                         retired 2026-10-15.
 """
 
 import os
 import traceback
 from datetime import datetime, timezone
+
+import pandas as pd
 
 from core.alpaca import _to_alpaca_symbol, alpaca_request, get_positions
 from core.market import is_market_open
@@ -83,8 +87,20 @@ from core.combo_strategy import (
 from core.journal import TradeRecord
 from core.state import load_state, save_state, state_lock
 
-GATE_UPDATE_BAND = float(os.environ.get("GATE_UPDATE_BAND", "0.10"))
+# Relative, SYMMETRIC band (2026-10-15 audit): trade when the target moves
+# by at least this fraction of the applied multiplier, in EITHER direction.
+# The validated gate has no band at all (book_gate.py applies g_t daily);
+# the previous ABSOLUTE 0.10 band let the live book carry 12-33% more gross
+# than validated deep in a drawdown and delayed recoveries by the same
+# amount. ~3.5% of the book per step keeps dust out (the $50/$5 filters do
+# the rest) without a material fidelity gap.
+GATE_UPDATE_BAND_REL = float(os.environ.get("GATE_UPDATE_BAND_REL", "0.035"))
 GATE_DAILY_UPDATE = os.environ.get("GATE_DAILY_UPDATE", "1") != "0"
+if os.environ.get("GATE_UPDATE_BAND"):
+    import logging as _logging
+    _logging.getLogger("gate_update").warning(
+        "GATE_UPDATE_BAND (absolute) is no longer read — the band is "
+        "GATE_UPDATE_BAND_REL (relative, symmetric) since 2026-10-15")
 
 # Skip trading when the whole book delta is below this (noise / dust).
 _MIN_TOTAL_DELTA_USD = 50.0
@@ -98,6 +114,72 @@ _MIN_APPLIED_MULT = 0.05
 _FULL_DELEVER_EPS = 0.02
 # Consecutive thin-data skips before the stall warning fires.
 _DATA_STALL_THRESHOLD = 3
+
+
+def _drop_rows_dated_today(px: pd.DataFrame) -> pd.DataFrame:
+    """Drop any price row dated today or later in market time (ET)."""
+    try:
+        from zoneinfo import ZoneInfo
+        today_et = pd.Timestamp(datetime.now(ZoneInfo("America/New_York")).date())
+        idx = pd.DatetimeIndex(px.index)
+        if idx.tz is not None:
+            idx = idx.tz_convert("America/New_York").tz_localize(None)
+        keep = idx.normalize() < today_et
+        if keep.all():
+            return px
+        return px.loc[keep]
+    except Exception:
+        return px
+
+
+def _shortfall_from_result(result: dict, gross_pre, applied_design: float,
+                           leverage) -> tuple[float | None, float | None, bool]:
+    """(m_real, shortfall, funding_issue) from a rebalance result dict.
+
+    m_real = achieved gross (reconciliation, else targeted gross) over
+    equity x leverage x gross_pre_gate — the TRUE level the book landed
+    at. shortfall = m_real / design. funding_issue is True only on broker
+    evidence that the design book could not be bought: the buying-power
+    auto-scale fired, orders were rejected or cancelled unfilled, or the
+    notional fill rate was below 97%. Untraded drift inside the 10% hold
+    rule is NOT a funding issue (review 2026-10-15) — it moves applied,
+    never the floor. (None, None, False) when inputs are missing."""
+    try:
+        res = result or {}
+        recon = res.get("reconciliation") or {}
+        achieved = ((recon.get("book") or {}).get("achieved_gross_usd")
+                    or res.get("target_gross_usd"))
+        equity = res.get("portfolio_value")
+        if not (achieved and equity and leverage and gross_pre
+                and float(gross_pre) > 0 and float(equity) > 0
+                and applied_design > 0):
+            return None, None, False
+        m_real = float(achieved) / (float(equity) * float(leverage) * float(gross_pre))
+        flow = recon.get("flow") or {}
+        fill_rate = flow.get("fill_rate_notional")
+        funding_issue = bool(
+            res.get("auto_scaled_to_buying_power")
+            or int(flow.get("n_rejected", 0) or 0) > 0
+            or int(flow.get("n_unfilled_cancelled", 0) or 0) > 0
+            or (fill_rate is not None and float(fill_rate) < 0.97))
+        return m_real, round(m_real / applied_design, 4), funding_issue
+    except Exception:
+        return None, None, False
+
+
+def _last_funded_rebalance(history: list) -> dict:
+    """The most recent history entry that actually traded (carries a
+    target_gross_usd / reconciliation and is not a dry or market-closed
+    run). A manual --force outside market hours appends a non-funded
+    entry with fresh weights; keying off it would defeat both the
+    reconciliation and the target-weight book drawdown (review 2026-10-15)."""
+    for h in reversed(history or []):
+        res = h.get("result") or {}
+        if res.get("dry_run") or res.get("skipped_market_closed") or res.get("skipped_portfolio_stop"):
+            continue
+        if res.get("target_gross_usd") or res.get("reconciliation"):
+            return h
+    return {}
 
 
 def config_has_gates(config) -> bool:
@@ -131,6 +213,7 @@ def compute_live_gate_multiplier(config, stock_data, macro_data,
     if getattr(config, "enable_spy_dd_gate", True):
         if macro_px is None or macro_px.empty:
             return None
+        macro_px = _drop_rows_dated_today(macro_px.dropna(how="all"))
         spy_gate = _spy_drawdown_gate(
             macro_px,
             lookback=getattr(config, "spy_dd_lookback", 60),
@@ -152,6 +235,10 @@ def compute_live_gate_multiplier(config, stock_data, macro_data,
         # silently OPENING the gate. Daily-pass-only hygiene; the
         # validated compute_weights path is untouched.
         stock_px = stock_px.dropna(how="all")
+        # Never read a row dated today (ET): the pass must see prior closes
+        # only — a non-NaN partial bar would silently make the read intraday
+        # (2026-10-15 review of the 09-23 incident).
+        stock_px = _drop_rows_dated_today(stock_px)
         book_dd = _book_drawdown(
             stock_px, held_weights,
             lookback=getattr(config, "book_dd_lookback", 60),
@@ -193,7 +280,8 @@ def set_applied_multiplier(mc, value: float | None, logger=None) -> None:
 
 
 def set_gate_state_at_rebalance(mc, diagnostics: dict, config,
-                                logger=None) -> None:
+                                logger=None, result: dict | None = None,
+                                leverage=None) -> None:
     """Record the gate reference state after a funded rebalance.
 
     applied = the REALIZED book scaling gross_final/gross_pre_gate
@@ -201,8 +289,16 @@ def set_gate_state_at_rebalance(mc, diagnostics: dict, config,
     exposure_multiplier diagnostic overstates the applied scaling
     whenever the cap binds, 2026-08-31 audit). Falls back to the raw
     exposure_multiplier for old diagnostics without the gross fields.
-    Also resets the tier floor (a rebalance rebuilds the book, ending the
-    prior cycle's tier cuts) and the thin-data stall counter.
+
+    2026-10-15: when the broker could not fund the design book (the
+    buying-power auto-scale, or unfilled orders), the ACHIEVED gross is
+    the truth: applied is set from achieved_gross / (equity x leverage x
+    gross_pre_gate) and the shortfall becomes the tier floor — sticky
+    until the next rebalance, exactly like a tier cut — so the daily pass
+    never tries to re-lever into a book the broker already refused. (The
+    2026-09-29 rebalance recorded 0.857 while the book was at ~0.67 of
+    design; the pass would have mis-scaled every trade.)
+    Also resets the thin-data stall counter.
     """
     try:
         exposure = diagnostics.get("exposure_multiplier")
@@ -210,24 +306,38 @@ def set_gate_state_at_rebalance(mc, diagnostics: dict, config,
             return
         gross_pre = diagnostics.get("gross_pre_gate")
         gross_final = diagnostics.get("gross_final")
-        applied = float(exposure)
+        applied_design = float(exposure)
         if gross_pre and gross_final and float(gross_pre) > 0:
-            applied = float(gross_final) / float(gross_pre)
+            applied_design = float(gross_final) / float(gross_pre)
+        applied, floor = applied_design, 1.0
+        m_real, shortfall, funding_issue = _shortfall_from_result(
+            result or {}, gross_pre, applied_design, leverage)
+        if shortfall is not None and abs(shortfall - 1.0) > 0.03:
+            applied = m_real                      # the truthful level
+            if funding_issue and shortfall < 0.97:
+                floor = min(1.0, shortfall)       # sticky: broker refused
         with state_lock:
             disk = load_state(mc)
             disk["applied_exposure_multiplier"] = round(applied, 4)
-            disk["tier_floor_multiplier"] = 1.0
+            disk["tier_floor_multiplier"] = round(floor, 4)
             disk["gate_ref"] = {
                 "gross_pre_gate": float(gross_pre) if gross_pre else None,
                 "max_gross_exposure": float(
                     getattr(config, "max_gross_exposure", 1.0) or 1.0),
+                "rebalance_shortfall": shortfall,
             }
             disk.pop("gate_data_skips", None)
             save_state(disk, mc)
         if logger:
             logger.info(f"[GATE] {mc.name}: rebalance gate state — applied "
-                        f"{applied:.4f} (raw gate {float(exposure):.4f}), "
-                        f"tier floor reset")
+                        f"{applied:.4f} (design {applied_design:.4f}, raw "
+                        f"gate {float(exposure):.4f}), tier floor {floor:.4f}")
+            if floor < 1.0:
+                logger.warning(
+                    f"[GATE] {mc.name}: rebalance achieved only "
+                    f"{shortfall:.1%} of the design book — recorded as a "
+                    f"sticky floor until the next rebalance (no daily "
+                    f"re-lever into an unfunded book)")
     except Exception as e:
         if logger:
             logger.error(f"[GATE] {mc.name}: rebalance gate-state write "
@@ -430,6 +540,55 @@ def maybe_daily_gate_update(mc, model_bundle: dict, strategy_type: str,
         tier_floor = float(disk.get("tier_floor_multiplier", 1.0) or 1.0)
         gate_ref = disk.get("gate_ref") or {}
 
+        # One-time reconciliation (2026-10-15): a gate_ref written by the
+        # pre-fix rebalance code carries no 'rebalance_shortfall'. Re-derive
+        # it from the last rebalance's own record (achieved gross, equity)
+        # and, if the broker funded less than 97% of the design book,
+        # adopt the realized multiplier + sticky floor — never trading, only
+        # correcting the bookkeeping the daily pass scales against.
+        if gate_ref and "rebalance_shortfall" not in gate_ref and not dry_run:
+            try:
+                last = _last_funded_rebalance(disk.get("history") or [])
+                diag = last.get("strategy_diagnostics") or {}
+                g0 = gate_ref.get("gross_pre_gate")
+                gf = diag.get("gross_final")
+                design = (float(gf) / float(g0)) if (g0 and gf and float(g0) > 0) else applied
+                m_real, shortfall, funding_issue = _shortfall_from_result(
+                    last.get("result") or {}, g0, design,
+                    getattr(mc, "target_leverage", 1.0))
+                with state_lock:
+                    d2 = load_state(mc)
+                    ref2 = d2.get("gate_ref") or {}
+                    ref2["rebalance_shortfall"] = shortfall
+                    ref2["reconciled_at"] = today_iso
+                    ref2["funding_issue"] = funding_issue
+                    if shortfall is not None and abs(shortfall - 1.0) > 0.03:
+                        # COMPOSE onto the current values (review 2026-10-15):
+                        # a tier cut or gate sell made since the rebalance
+                        # already lives in BOTH applied and the floor;
+                        # overwriting applied with the rebalance-time level
+                        # would drop it from one side only and sell it twice.
+                        cur = float(d2.get("applied_exposure_multiplier") or applied)
+                        d2["applied_exposure_multiplier"] = round(cur * shortfall, 4)
+                        if funding_issue and shortfall < 0.97:
+                            d2["tier_floor_multiplier"] = round(
+                                min(1.0, shortfall) * float(d2.get("tier_floor_multiplier", 1.0) or 1.0), 4)
+                        logger.warning(
+                            f"[GATE] {mc.name}: RECONCILED bookkeeping — the "
+                            f"last rebalance funded only {shortfall:.1%} of the "
+                            f"design book (realized {m_real:.4f} at rebalance); "
+                            f"applied {cur:.4f} → {d2['applied_exposure_multiplier']:.4f}, "
+                            f"tier floor → {d2['tier_floor_multiplier']:.4f} "
+                            f"(sticky until the next rebalance)")
+                        applied = float(d2["applied_exposure_multiplier"])
+                        tier_floor = float(d2["tier_floor_multiplier"])
+                    d2["gate_ref"] = ref2
+                    save_state(d2, mc)
+                    gate_ref = ref2
+                info["reconciled_shortfall"] = shortfall
+            except Exception as e:
+                logger.warning(f"[GATE] {mc.name}: bookkeeping reconciliation skipped: {e}")
+
         if applied < _MIN_APPLIED_MULT:
             # Book is essentially cash — pro-rata scaling cannot rebuild
             # it. The validated gate re-levers from g~0 the moment dd
@@ -474,6 +633,24 @@ def maybe_daily_gate_update(mc, model_bundle: dict, strategy_type: str,
             if mv > 0:
                 held_weights[to_ours.get(p["symbol"], p["symbol"])] = mv
 
+        # The validated signal keys the book drawdown to the decision-date
+        # TARGET weights of the held book (book_gate.py), not to drifted
+        # market values: in a drawdown MV weights under-weight the deepest
+        # losers and bias book_dd less negative (the gate engages later).
+        # Use the last rebalance's weights when they cover the held names.
+        info["book_dd_weights"] = "market_value"
+        try:
+            last_funded = _last_funded_rebalance(disk.get("history") or [])
+            tw = last_funded.get("weights") or last_funded.get("conviction_weights")
+            if isinstance(tw, dict) and tw and held_weights:
+                tw_abs = {str(k): abs(float(v)) for k, v in tw.items() if float(v) != 0}
+                covered = [sym for sym in held_weights if sym in tw_abs]
+                if len(covered) / len(held_weights) >= 0.8:
+                    held_weights = {sym: tw_abs[sym] for sym in covered}
+                    info["book_dd_weights"] = "target"
+        except Exception:
+            pass
+
         gate = compute_live_gate_multiplier(config, stock_data, macro_data,
                                             held_weights)
         if gate is None:
@@ -501,11 +678,13 @@ def maybe_daily_gate_update(mc, model_bundle: dict, strategy_type: str,
         logger.info(
             f"[GATE] {mc.name}: applied={applied:.4f} raw_gate={raw_gate:.4f} "
             f"target={target:.4f} (tier_floor={tier_floor:.4f}, "
-            f"book_dd={gate['book_dd']}) band={GATE_UPDATE_BAND}"
+            f"book_dd={gate['book_dd']}) band_rel={GATE_UPDATE_BAND_REL}"
         )
 
         full_delever = raw_gate <= _FULL_DELEVER_EPS
-        if not full_delever and abs(target - applied) < GATE_UPDATE_BAND:
+        band_abs = max(GATE_UPDATE_BAND_REL * applied, 0.005)
+        info["band_abs"] = round(band_abs, 4)
+        if not full_delever and abs(target - applied) < band_abs:
             info["action"] = "hold"
             return info
 

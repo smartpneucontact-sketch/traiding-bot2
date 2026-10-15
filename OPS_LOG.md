@@ -159,3 +159,77 @@ core/tracking.py. Freeze-ablation report #2 written 5 days late (clean
 null; research repo). The session-scoped daily /ready probe expired
 2026-09-07 (7-day cron cap) — an external uptime monitor is still the
 durable answer.
+
+## 2026-10-15 — Oct 7-15 drawdown review: why no stop fired, and four fixes
+
+Drawdown: primary −11.1% close-to-close / −17.7% intraday from the Oct 6
+close peak to the Oct 15 09:55 ET low; Candidate X ≈ −16%; process −19.4%
+intraday. SPY −1%, IWM −3.5% — a mid-cap momentum crash, not plumbing.
+
+Why the tiers did not fire (verified by 3 adversarial reviewers against
+code, state and Alpaca 5-min history): the tier stop measures ONE session
+vs the previous close (anchor = last_equity) with Tier 1 at −8.0%
+(−4.0 × 2.0 leverage), as the validated stop grid prescribes. Worst
+sessions vs anchor: Oct 14 −5.85/−5.87/−6.58%, Oct 15 (09:55 low)
+−6.95/−6.87/−7.85% (primary/X/process). The process slot had NO scanner
+at all. The book-DD gate reached −12.95% at 09:35 on Oct 15; with
+gross_pre_gate 1.167 under the 1.0 cap it cannot cut until −14.6% (same
+in the validated construction), and the live absolute 0.10 band would
+have waited until −16.4%. Proof nothing fired: applied/tier_floor
+unchanged, empty October journal, stale trip flag.
+
+Findings beyond the question:
+1. Rebalance pre-flight compared the ENTIRE target book to buying_power,
+   so the Sep 29 rebalance from a full book auto-scaled to ~0.75 of
+   design: both gated slots have run ~1.6x (primary 0.671 of design,
+   X 0.694) since Sep 29, while the gate state recorded 0.857 — the
+   daily pass would have mis-scaled every trade. (Cushioned this week;
+   at 2x the primary would have printed −7.9% on Oct 15.)
+2. Process slot enable_cutloss=false since its 2026-07-21 activation,
+   contradicting its template and protocol_process.json; manifest did not
+   pin it, so invariants could not see it.
+3. No scanner heartbeat / session-minimum drawdown anywhere.
+4. Gate band absolute (12-33% slack deep in a drawdown); book_dd keyed to
+   drifted MV weights (validated: decision-date target weights).
+
+Fixes shipped (tests 264 passing, adversarially reviewed before deploy):
+- core/orders.py: pre-flight sizes on INCREMENTAL buys (new + up-sizes);
+  only the buy side is ever scaled; exits/trims execute in full.
+- core/gate_update.py: rebalance records the REALIZED multiplier and a
+  sticky tier floor when the broker funds <97% of design; one-time
+  reconciliation of pre-fix bookkeeping from the last rebalance record
+  (expected 2026-10-16 09:35: primary applied 0.857→~0.671 floor ~0.783,
+  X →~0.694 floor ~0.810, both HOLD, no trades); relative symmetric band
+  3.5% of applied (was absolute 0.10); today-row guard; book_dd keyed to
+  the last rebalance's target weights.
+- core/risk.py: heartbeat every tick, session minimum DD persisted,
+  NEAR-MISS warning within 2pp of Tier 1, one anchor INFO line per
+  session. dashboard: /ready 503 on a stale heartbeat in market hours;
+  /api/status cutloss block; tile shows today's min DD.
+- core/config.py: CUTLOSS_CALIBRATION_VERSION 2026-10-riskfix-v2 enables
+  the process slot's tiers via the standard volume-config migration;
+  spec_manifest pins cutloss for all three slots.
+
+Decision recorded: design leverage (2x) returns at the next scheduled
+rebalance (~2026-10-28) through the fixed pre-flight — NOT via a daily
+re-lever into the drawdown (the shortfall is treated as a sticky floor,
+like a tier cut). The validated path would be at 2x now; this is a
+deliberate, disclosed, conservative deviation for ~9 sessions. What no
+layer covers, by validated design: a multi-day drawdown from peak. The
+research's P=−8 choice accepted a −14.5% worst day and −49.6% MaxDD;
+whether that profile is the one the owner wants is the open question for
+the 3-month checkpoints (Oct 20/21/27).
+
+Review round 2 (adversarial, 10 agents, 7 confirmed / 0 refuted) before
+deploy: the one-time reconciliation now COMPOSES onto the current applied
+multiplier (overwriting it would have dropped a same-cycle tier cut from
+applied but kept it in the floor and sold the cut twice); the sticky floor
+is set only on broker FUNDING evidence (auto-scale fired, rejections,
+unfilled, fill rate <97%) — untraded drift inside the 10% hold rule moves
+applied, never the floor; scaled up-sizes keep their reserved budget;
+heartbeat also on the Tier-3 trip-flag path; /ready grace covers the
+session open; migration wording cites the slot template only (the process
+protocol has no tier clause — tiers are an operational-safety decision,
+PK1 stays pre-registered without them). From the live Sep 29 record
+(achieved $140,970 on equity $88,248, auto-scale fired) the primary's
+reconciliation lands at applied ≈ 0.685, floor ≈ 0.80. Tests: 270.

@@ -776,7 +776,10 @@ def run_single_model(
                 cfg_obj = model_bundle.get("combo_config")
                 if config_has_gates(cfg_obj):
                     diag_now = getattr(model, "last_diagnostics", None) or {}
-                    set_gate_state_at_rebalance(mc, diag_now, cfg_obj, logger)
+                    set_gate_state_at_rebalance(
+                        mc, diag_now, cfg_obj, logger,
+                        result=result if isinstance(result, dict) else {},
+                        leverage=getattr(mc, "target_leverage", 1.0))
             except Exception as e:
                 logger.warning(f"  gate-state write failed (non-fatal): {e}")
         # Forward-test clock: the first FUNDED rebalance starts the
