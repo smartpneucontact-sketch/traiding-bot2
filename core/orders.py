@@ -505,8 +505,12 @@ def cancel_open_orders(mc: "ModelConfig", logger, exclude_tif: tuple = ("opg",),
     except Exception as e:
         logger.warning(f"  open-order list failed: {e}")
         return out
+    # Only LIMIT orders: a dead rebalance leaves resting DAY limit orders,
+    # while the cut-loss scanner's in-flight orders are MARKET orders that
+    # fill within seconds and must never be cancelled from under it.
     targets = [o for o in (open_orders if isinstance(open_orders, list) else [])
-               if str(o.get("time_in_force") or "") not in exclude_tif and o.get("id")]
+               if str(o.get("time_in_force") or "") not in exclude_tif and o.get("id")
+               and str(o.get("type") or "") in ("limit", "stop_limit")]
     out["n_open"] = len(targets)
     if not targets:
         return out

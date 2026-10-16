@@ -72,7 +72,8 @@ def _no_sleep(monkeypatch):
 def test_rebalance_sweeps_resting_non_opg_orders_before_sizing(tmp_path, monkeypatch):
     calls = []
     open_orders = [{"id": "rest1", "symbol": "AAA", "time_in_force": "day", "type": "limit"},
-                   {"id": "opg1", "symbol": "BBB", "time_in_force": "opg", "type": "limit"}]
+                   {"id": "opg1", "symbol": "BBB", "time_in_force": "opg", "type": "limit"},
+                   {"id": "scan1", "symbol": "CCC", "time_in_force": "day", "type": "market"}]   # scanner in flight
     listings = [list(open_orders), []]
 
     def fake_request(method, endpoint, mc, data=None, logger=None, **kw):
@@ -97,6 +98,7 @@ def test_rebalance_sweeps_resting_non_opg_orders_before_sizing(tmp_path, monkeyp
                                         target_weights={"AAA": 0.05})
     assert rb["open_orders_cancelled"]["n_open"] == 1 and rb["open_orders_cancelled"]["n_cancelled"] == 1
     assert ("DELETE", "v2/orders/rest1") in calls and ("DELETE", "v2/orders/opg1") not in calls
+    assert ("DELETE", "v2/orders/scan1") not in calls                     # market orders are never swept
     # The sweep precedes the sizing reads and the first POST.
     assert calls.index(("DELETE", "v2/orders/rest1")) < min(i for i, c in enumerate(calls) if c[0] == "POST")
 
