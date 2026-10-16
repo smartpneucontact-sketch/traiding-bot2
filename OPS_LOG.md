@@ -431,3 +431,40 @@ refused in the 09:00-09:27 window while an auction slot is due and the
 stage has not run; the stale-name count reports target names only.
 Tests: 346 (session conftest makes the suite runnable under bare pytest
 and cleans its temp dir).
+
+## 2026-10-16 (pre-open) — Auction execution: review round 6 (19 agents, 36 confirmed / 2 refuted + 5 gaps) fixed
+
+Two majors were in my own round-5 catch-up logic:
+- The boot catch-up would have RE-RUN a rebalance that a redeploy/OOM
+  interrupted mid-submission while the dead run's DAY limit orders were
+  still resting at the venue (second buy on top of a resting buy). Every
+  non-auction rebalance now sweeps and cancels resting non-opg orders and
+  waits for them to settle BEFORE sizing deltas (core/orders.py
+  cancel_open_orders), which also covers manual re-runs.
+- A same-day dry run stamped last_run, so a restart straddling 09:35 after
+  a morning dry run would still have lost the day: dry runs now stamp
+  last_dry_run only; the catch-up keys on live runs.
+Also: catch-up one-shots carry a real misfire grace (900 s / 300 s) and a
+missed/failed catch-up is a /ready problem; a boot after 09:19 on a due
+day records the lost auction stage (auction_skipped_due) instead of
+silently rebalancing via marketable-limit; the catch-up never collides with
+a cron about to fire; NYSE early closes (13:00) are modelled
+(core/market.py EARLY_CLOSE_DATES / session_close) and bound the catch-up
+window and the main run's wait cutoff; a dead 'submitting' record is
+preserved (never overwritten by a repeat stage) and the stage resubmits
+only when the venue is provably empty; the 09:35 run reconciles EVERY
+submitted/submitting record with the venue once (lost-response orders
+whose by-id lookup also failed are adopted), a failed listing keeps the
+record open for retry, adopted records get a synthesized run_id (so the
+completion closes the plan and merges the leg), recovered orders get their
+anchor from the panel/snapshot; the merge reads NA when nothing anchor-
+priced was measured and keeps the completion leg's own rate across a
+repair; the repair works the next day; recovered buys use the slot's
+buffer; a cancel is counted only when it took effect; the equity used by
+the shortfall derivation is read at the same moment as the achieved book
+(portfolio_value_after); the one-time gate reconciliation retries up to 3
+passes instead of stamping None forever; yfinance single-ticker frames
+and dot-form symbols are handled; a SlotFailures run whose failed slot is
+the auction slot never reads as a full run. Tests: 370; two tests that
+depended on the wall clock (one hung the suite before 09:20 ET) are
+pinned.

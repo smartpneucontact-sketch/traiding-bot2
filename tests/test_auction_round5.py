@@ -246,6 +246,7 @@ def _wire_runner(monkeypatch, weights, rebalance_result=None, calls=None, persis
     monkeypatch.setattr("core.market.is_auction_window", lambda now=None: True)
     monkeypatch.setattr("core.risk.refresh_daily_book_anchor_after_rebalance", lambda *a, **kw: None)
     monkeypatch.setattr("core.protocol.bind_forward_test_start", lambda *a, **kw: False)
+    monkeypatch.setattr("core.orders.recover_unpersisted_auction_orders", lambda *a, **kw: None)   # venue unknown by default
 
     def fake_rebalance(target_symbols, rankings, mc, journal, lg, report, **kw):
         calls.append({"target_symbols": list(target_symbols), **kw})
@@ -309,13 +310,25 @@ def test_stage_persists_each_order_before_the_loop_returns(tmp_path, monkeypatch
 
 
 def test_stage_never_resubmits_after_a_run_died_while_submitting(tmp_path, monkeypatch):
+    """Venue unknown (listing failed) -> no resubmission AND the provisional
+    record (plan) is preserved for the 09:35 adoption (round 6)."""
     mc = make_mc(tmp_path)
     today = _today_ny()
     prev = runner_mod._previous_session_iso(today)
     calls = _wire_runner(monkeypatch, {"AAA": 0.5, "BBB": 0.5})
     save_state(_plan_state(today, outcome="submitting", last_rebalance=None), mc)
     runner_mod.run_single_model(mc, _panel([prev]), pd.DataFrame(), macro_data={}, stage="auction")
-    assert calls == [] and load_state(mc)["auction_stage"]["outcome"] == "skipped:prior_submitting"
+    st = load_state(mc)["auction_stage"]
+    assert calls == [] and st["outcome"] == "submitting" and st["plan"]["target_weights"] == {"AAA": 0.6, "BBB": 0.4}
+    # Venue holds an order of today's book -> still no resubmission.
+    monkeypatch.setattr("core.orders.recover_unpersisted_auction_orders",
+                        lambda *a, **kw: [{"order_id": "v1", "symbol": "AAA"}])
+    runner_mod.run_single_model(mc, _panel([prev]), pd.DataFrame(), macro_data={}, stage="auction")
+    assert calls == [] and load_state(mc)["auction_stage"]["outcome"] == "submitting"
+    # Venue provably empty (the run died before any POST) -> the book is submitted after all.
+    monkeypatch.setattr("core.orders.recover_unpersisted_auction_orders", lambda *a, **kw: [])
+    runner_mod.run_single_model(mc, _panel([prev]), pd.DataFrame(), macro_data={}, stage="auction")
+    assert len(calls) == 1 and load_state(mc)["auction_stage"]["outcome"] == "submitted"
 
 
 def test_main_adopts_a_dead_submitting_record_and_completes_it(tmp_path, monkeypatch):
@@ -589,7 +602,7 @@ def test_boot_catchup_plan():
     yday = "2026-10-27T13:35:00"
     # Saturday: nothing.
     assert dashboard._boot_catchup_plan(datetime(2026, 10, 31, 10, 0, tzinfo=NY), {"a": {}}, set()) == \
-        {"main": False, "auction": False, "reasons": []}
+        {"main": False, "auction": False, "lost_auction": [], "reasons": []}
     # 10:00 ET, a slot has not run today -> main.
     p = dashboard._boot_catchup_plan(today, {"a": {"last_run": yday}}, set())
     assert p["main"] is True and not p["auction"]

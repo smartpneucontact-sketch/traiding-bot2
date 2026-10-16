@@ -132,6 +132,10 @@ def _drop_rows_dated_today(px: pd.DataFrame) -> pd.DataFrame:
         return px
 
 
+class _ReconcileSkip(Exception):
+    """Internal: the one-time reconciliation could not derive a multiplier."""
+
+
 def _shortfall_from_result(result: dict, gross_pre, applied_design: float,
                            leverage) -> tuple[float | None, float | None, bool]:
     """(m_real, shortfall, funding_issue) from a rebalance result dict.
@@ -149,7 +153,10 @@ def _shortfall_from_result(result: dict, gross_pre, applied_design: float,
         recon = res.get("reconciliation") or {}
         book = recon.get("book") or {}
         achieved = (book.get("achieved_gross_usd") or res.get("target_gross_usd"))
-        equity = res.get("portfolio_value")
+        # Prefer the equity read at the same moment as the achieved book
+        # (review round 6), then the pre-trade read, then the book's own
+        # leverage ratio (results written before 2026-10-16).
+        equity = res.get("portfolio_value_after") or res.get("portfolio_value")
         if not equity:
             # Results written before 2026-10-16 never carried the equity
             # (review round 5): recover it from the book's own leverage
@@ -557,7 +564,8 @@ def maybe_daily_gate_update(mc, model_bundle: dict, strategy_type: str,
         # and, if the broker funded less than 97% of the design book,
         # adopt the realized multiplier + sticky floor — never trading, only
         # correcting the bookkeeping the daily pass scales against.
-        if gate_ref and "rebalance_shortfall" not in gate_ref and not dry_run:
+        if (gate_ref and "rebalance_shortfall" not in gate_ref and not dry_run
+                and not gate_ref.get("reconcile_gave_up")):
             try:
                 last = _last_funded_rebalance(disk.get("history") or [])
                 diag = last.get("strategy_diagnostics") or {}
@@ -570,6 +578,24 @@ def maybe_daily_gate_update(mc, model_bundle: dict, strategy_type: str,
                 with state_lock:
                     d2 = load_state(mc)
                     ref2 = d2.get("gate_ref") or {}
+                    if shortfall is None:
+                        # The derivation could not run (no equity in the
+                        # record): never stamp None as "reconciled" — retry
+                        # on the next pass, give up loudly after 3 attempts
+                        # (review round 6).
+                        n_try = int(ref2.get("reconcile_attempts", 0) or 0) + 1
+                        ref2["reconcile_attempts"] = n_try
+                        ref2["reconcile_failed_at"] = today_iso
+                        if n_try >= 3:
+                            ref2["rebalance_shortfall"] = None
+                            ref2["reconcile_gave_up"] = True
+                        logger.warning(f"[GATE] {mc.name}: bookkeeping reconciliation could not "
+                                       f"derive the realized multiplier (attempt {n_try}/3)")
+                        d2["gate_ref"] = ref2
+                        save_state(d2, mc)
+                        gate_ref = ref2
+                        info["reconciled_shortfall"] = None
+                        raise _ReconcileSkip()
                     ref2["rebalance_shortfall"] = shortfall
                     ref2["reconciled_at"] = today_iso
                     ref2["funding_issue"] = funding_issue
@@ -597,6 +623,8 @@ def maybe_daily_gate_update(mc, model_bundle: dict, strategy_type: str,
                     save_state(d2, mc)
                     gate_ref = ref2
                 info["reconciled_shortfall"] = shortfall
+            except _ReconcileSkip:
+                pass
             except Exception as e:
                 logger.warning(f"[GATE] {mc.name}: bookkeeping reconciliation skipped: {e}")
 

@@ -343,14 +343,26 @@ def test_ready_flags_stale_scanner_heartbeat_in_market_hours(tmp_path, monkeypat
     monkeypatch.setitem(dashboard.bot_status, "last_run_at", datetime.now(timezone.utc).isoformat())
     monkeypatch.setattr(dashboard, "_load_model_state", lambda name: load_state(mc))
     monkeypatch.setattr(dashboard, "DASHBOARD_AUTH_TOKEN", None)
+    # Pin the dashboard clock at 11:00 ET (the open-grace window is clock
+    # based — review round 6: this test used to fail before 09:35 ET).
+    from zoneinfo import ZoneInfo
+    base = datetime.now(ZoneInfo("America/New_York")).replace(hour=11, minute=0, second=0, microsecond=0)
+
+    class FakeDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return base.astimezone(tz) if tz else base.replace(tzinfo=None)
+    monkeypatch.setattr(dashboard, "datetime", FakeDT)
+    monkeypatch.setitem(dashboard.bot_status, "started_at",
+                        (base.astimezone(timezone.utc) - timedelta(hours=2)).isoformat())
     c = dashboard.app.test_client()
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat()
+    stale = (base.astimezone(timezone.utc) - timedelta(minutes=12)).isoformat()
     _seed(mc, cutloss_last_tick_ts=stale)
     (tmp_path / "x.json").write_text("{}")   # non-empty state dir
     r = c.get("/ready")
     assert r.status_code == 503
     assert any("heartbeat" in p for p in r.get_json()["problems"])
-    _seed(mc, cutloss_last_tick_ts=datetime.now(timezone.utc).isoformat())
+    _seed(mc, cutloss_last_tick_ts=(base.astimezone(timezone.utc) - timedelta(seconds=10)).isoformat())
     r2 = c.get("/ready")
     assert not any("heartbeat" in p for p in r2.get_json()["problems"])
 

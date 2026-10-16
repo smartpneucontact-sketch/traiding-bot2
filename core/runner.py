@@ -242,7 +242,7 @@ def run_single_model(
             f"  Skipping rebalance — portfolio_stop circuit breaker tripped "
             f"earlier today ({today_iso}). Staying in cash until next session."
         )
-        _stamp_last_run(state, stage)
+        _stamp_last_run(state, stage, dry_run)
         _save_state_merged(state, mc)
         logger.info(report.format_summary())
         return
@@ -323,7 +323,7 @@ def run_single_model(
                         "  [FREEZE] Market closed — liquidation deferred to "
                         "the next run during market hours."
                     )
-                _stamp_last_run(state, stage)
+                _stamp_last_run(state, stage, dry_run)
                 _save_state_merged(state, mc)
                 logger.info(report.format_summary())
                 return
@@ -351,7 +351,7 @@ def run_single_model(
             f"  Skipping rebalance — re-entry cool-down after portfolio stop "
             f"active through {cooldown_until}."
         )
-        _stamp_last_run(state, stage)
+        _stamp_last_run(state, stage, dry_run)
         _save_state_merged(state, mc)
         logger.info(report.format_summary())
         return
@@ -400,7 +400,7 @@ def run_single_model(
                 journal, logger, report,
                 min_stocks_required=MIN_STOCKS_REQUIRED, dry_run=dry_run,
             )
-        _stamp_last_run(state, stage)
+        _stamp_last_run(state, stage, dry_run)
         _save_state_merged(state, mc)
         logger.info(report.format_summary())
         return
@@ -788,13 +788,15 @@ def run_single_model(
             # second set and orphan the first (review 2026-10-15).
             logger.warning("  Auction stage already submitted today — not resubmitting")
             outcome = "skipped:already_submitted"
-        elif prev_stage.get("date") == session_iso and prev_stage.get("outcome") == "submitting":
-            # An earlier stage run died mid-submission with nothing persisted
-            # yet: orders may still exist at the venue (a persist callback can
-            # fail after a successful POST). Never submit a second book; the
-            # 09:35 run adopts whatever the venue holds (review round 5).
-            logger.error("  Auction stage: an earlier run today is marked 'submitting' with no "
-                         "persisted orders — NOT resubmitting; the 09:35 run reconciles with the venue")
+        elif (prev_stage.get("date") == session_iso and prev_stage.get("outcome") == "submitting"
+                and not _venue_clear_for_resubmit(mc, session_iso, prev_stage, logger)):
+            # An earlier stage run died mid-submission: unless the venue
+            # provably holds NO order of today's book, never submit a second
+            # one — the 09:35 run adopts whatever the venue holds. The
+            # provisional record (plan, persisted pending) is kept on disk
+            # for that adoption (review rounds 5-6).
+            logger.error("  Auction stage: an earlier run today is marked 'submitting' and the venue "
+                         "is not provably empty — NOT resubmitting; the 09:35 run reconciles with the venue")
             report.add_warning("auction stage skipped: prior run died mid-submission")
             outcome = "skipped:prior_submitting"
         elif not is_auction_window():
@@ -883,8 +885,7 @@ def run_single_model(
                 if result is not None:
                     summ = (result or {}).get("auction") or {}
                     outcome = "submitted" if int(summ.get("n_submitted", 0) or 0) > 0 else "skipped:nothing_submitted"
-                    n_stale_traded = sum(1 for sk in (summ.get("skipped") or [])
-                                         if sk.get("reason") == "stale_close")
+                    n_stale_traded = int(summ.get("n_stale_close", 0) or 0)
                     state["auction_stage"] = {
                         "date": session_iso,
                         "prev_session": expected_prev,
@@ -903,14 +904,16 @@ def run_single_model(
                         "pending": summ.get("pending", []),
                         "orphans": carry_orphans,
                     }
-        if outcome and outcome != "submitted" and outcome != "skipped:already_submitted":
+        if outcome and outcome not in ("submitted", "skipped:already_submitted",
+                                       "skipped:prior_submitting"):
             # A fresh, minimal record for today — NEVER inherit an earlier
-            # day's plan / n_submitted / run_id (review round 2).
+            # day's plan / n_submitted / run_id (review round 2). A dead
+            # 'submitting' record is deliberately left intact (round 6).
             state["auction_stage"] = {"date": session_iso, "outcome": outcome,
                                       "n_submitted": 0, "n_skipped": 0,
                                       "pending": [], "plan": None,
                                       "orphans": carry_orphans}
-        _stamp_last_run(state, stage)
+        _stamp_last_run(state, stage, dry_run)
         _save_state_merged(state, mc)
         logger.info(report.format_summary())
         return
@@ -918,6 +921,7 @@ def run_single_model(
     # Auction day completion: finish THIS MORNING'S plan, not a re-plan.
     auction_run_id = None
     auction_pending_live = False
+    auction_stage_missed = False
     if stage == "main" and not dry_run:
         st_auction = state.get("auction_stage") or {}
         if _auction_pending_live(state, session_iso):
@@ -929,10 +933,19 @@ def run_single_model(
             auction_pending_live = True
             logger.warning("  Auction orders still live (pre-open) — completion deferred")
         elif plan_main is not None:
-            auction_run_id = st_auction.get("run_id")
+            auction_run_id = (st_auction.get("run_id")
+                              or f"{mc.name}_auction_{session_iso.replace('-', '')}_recovered")
             logger.info(f"  Completing this morning's auction plan "
                         f"({len(target_symbols)} names, run_id {auction_run_id}) "
                         f"instead of re-planning")
+        elif str(getattr(mc, "exec_style", "") or "") == "auction":
+            # An auction slot rebalancing WITHOUT today's plan: the stage
+            # never ran / died before submitting. Recorded so the journal and
+            # the AUCTION1 report see a non-auction day (review round 6).
+            auction_stage_missed = True
+            logger.warning("  Auction slot rebalancing via the marketable-limit path — "
+                           "no auction plan for today (stage missed)")
+            report.add_warning("auction stage missed today: rebalanced via marketable-limit")
 
     # Avoid submitting `time_in_force=day` orders after market close — they
     # would expire unfilled. Skip the trading step on closed days; the
@@ -984,6 +997,8 @@ def run_single_model(
             )
             if isinstance(result, dict) and auction_run_id:
                 _merge_auction_into_result(result, state.get("auction_stage") or {}, session_iso)
+            if isinstance(result, dict) and auction_stage_missed:
+                result["auction_stage_missed"] = True
 
     # -- Save state ---------------------------------------------------------
     # Only update last_rebalance if a rebalance actually happened. Skipping
@@ -1079,7 +1094,7 @@ def run_single_model(
                     report.set("tracking", snap)
             except Exception as e:
                 logger.warning(f"  tracking snapshot failed (non-fatal): {e}")
-    _stamp_last_run(state, stage)
+    _stamp_last_run(state, stage, dry_run)
     state["run_count"] = state.get("run_count", 0) + 1
     history_entry: dict = {
         "date": datetime.now().isoformat(),
@@ -1156,10 +1171,15 @@ def _todays_auction_plan(state: dict, today_iso: str) -> dict | None:
     return None
 
 
-def _stamp_last_run(state: dict, stage: str) -> None:
-    """The persisted last_run is the MAIN stage's; the pre-open stage keeps
-    its own key so the dashboard's persisted-last-run fallback never shows
-    a 09:06 stage as the day's run (review round 2)."""
+def _stamp_last_run(state: dict, stage: str, dry_run: bool = False) -> None:
+    """The persisted last_run is the MAIN stage's LIVE run; the pre-open
+    stage keeps its own key so the dashboard's persisted-last-run fallback
+    never shows a 09:06 stage as the day's run (review round 2), and a dry
+    run stamps last_dry_run only — the boot catch-up decides 'ran today'
+    from last_run (review round 6)."""
+    if dry_run:
+        state["last_dry_run"] = datetime.now().isoformat()
+        return
     key = "last_run" if stage == "main" else "auction_last_run"
     state[key] = datetime.now().isoformat()
 
@@ -1178,14 +1198,16 @@ def _merge_auction_into_result(result: dict, st: dict, today_iso: str) -> None:
         flow = recon.get("flow") or {}
         a = st.get("summary") if isinstance(st.get("summary"), dict) else {}
         a_n = int(a.get("n", 0) or 0)
+        a_sub_check = float(a.get("submitted_notional_usd", 0) or 0)
         submitted_any = int(st.get("n_submitted", 0) or 0) > 0 or bool(st.get("pending"))
-        if a_n <= 0:
+        if a_n <= 0 or a_sub_check <= 0:
             if submitted_any:
                 # Orders went to the auction but none could be measured
-                # (finalize failed / every entry unreadable): the protocol's
-                # fill-rate criterion must read NA, not the completion's
-                # ~100% residue rate (review round 5).
-                flow["fill_rate_notional_completion"] = flow.get("fill_rate_notional")
+                # (finalize failed / every entry unreadable / no anchor
+                # price): the protocol's fill-rate criterion must read NA,
+                # not the completion's ~100% residue rate (review round 5).
+                if "fill_rate_notional_completion" not in flow:
+                    flow["fill_rate_notional_completion"] = flow.get("fill_rate_notional")
                 flow["fill_rate_notional"] = None
                 flow["auction_unmeasured"] = True
                 recon["flow"] = flow
@@ -1203,7 +1225,8 @@ def _merge_auction_into_result(result: dict, st: dict, today_iso: str) -> None:
         # the naive combined rate fired a false K3a on a fully executed book).
         overlap = min(c_sub, max(0.0, a_sub - a_fill))
         plan_notional = a_sub + c_sub - overlap
-        flow["fill_rate_notional_completion"] = flow.get("fill_rate_notional")
+        if "fill_rate_notional_completion" not in flow:
+            flow["fill_rate_notional_completion"] = flow.get("fill_rate_notional")
         flow["fill_rate_notional_auction"] = a.get("fill_rate_notional")
         flow["n_orders"] = int(flow.get("n_orders", 0) or 0) + a_n
         flow["n_filled"] = int(flow.get("n_filled", 0) or 0) + a_filled
@@ -1326,27 +1349,56 @@ def _finalize_auction_if_any(mc: ModelConfig, state: dict, journal, logger,
     pending = st.get("pending") or []
     orphans = st.get("orphans") or []
     changed = False
-    if st.get("date") == session_iso and st.get("outcome") == "submitting" and _after_open_et():
-        # The stage died mid-submission: adopt whatever the venue holds under
-        # today's client_order_id prefix, then treat the record as submitted
-        # (review round 5).
+    rec_date = str(st.get("date") or "")
+    past_open = bool(rec_date) and (rec_date != session_iso or _after_open_et())
+    if (st.get("outcome") in ("submitting", "submitted") and past_open
+            and not st.get("recovery_checked")):
+        # Reconcile the record with the venue once per record (review
+        # rounds 5-6): a run that died mid-submission ('submitting') or a
+        # POST whose response AND by-id lookup were lost ('submitted' with
+        # error skips) can leave live opg orders the bot never recorded.
+        # Every auction order carries that session's client_order_id
+        # prefix, so the venue's own list is the source of truth. A failed
+        # listing keeps the record open and is retried next run.
         try:
             from core.orders import recover_unpersisted_auction_orders
             known = {p.get("order_id") for p in pending}
-            extra = recover_unpersisted_auction_orders(mc, session_iso, known, logger)
+            extra = recover_unpersisted_auction_orders(mc, rec_date, known, logger)
         except Exception as e:
             logger.error(f"  auction recovery failed: {e}")
-            extra = []
-        pending = list(pending) + list(extra)
-        st["pending"] = pending
-        st["n_submitted"] = len(pending)
-        st["submitted_notional_usd"] = round(sum(float(p.get("notional_est") or 0) for p in pending), 2)
-        st["outcome"] = "submitted" if pending else "skipped:nothing_submitted"
-        st["recovered_from_submitting"] = True
-        st["n_recovered"] = len(extra)
-        logger.error(f"  auction stage record was 'submitting' (run died mid-loop): "
-                     f"{len(pending)} order(s) adopted ({len(extra)} recovered from the venue)")
-        changed = True
+            extra = None
+        if extra is None:
+            st["recovery_error"] = datetime.now(timezone.utc).isoformat()
+            logger.error("  auction venue reconciliation unavailable — record kept open for retry")
+            report.add_warning("auction venue reconciliation unavailable (retry next run)")
+            changed = True
+        else:
+            if extra:
+                _fill_recovered_anchors(extra, stock_data, rec_date, mc, logger)
+                pending = list(pending) + list(extra)
+                st["pending"] = pending
+            was_submitting = st.get("outcome") == "submitting"
+            st["n_submitted"] = len(pending)
+            st["submitted_notional_usd"] = round(sum(float(p.get("notional_est") or 0) for p in pending), 2)
+            if was_submitting:
+                st["outcome"] = "submitted" if pending else "skipped:nothing_submitted"
+                st["recovered_from_submitting"] = True
+            st["n_recovered"] = int(st.get("n_recovered", 0) or 0) + len(extra)
+            st["recovery_checked"] = datetime.now(timezone.utc).isoformat()
+            st.pop("recovery_error", None)
+            if pending and not st.get("run_id"):
+                # A record that never got its run_id (the persist callback
+                # never ran) still needs one shared by every row and the
+                # completion leg (review round 6).
+                st["run_id"] = f"{mc.name}_auction_{rec_date.replace('-', '')}_recovered"
+            for p in pending:
+                if not p.get("run_id"):
+                    p["run_id"] = st.get("run_id")
+            if was_submitting or extra:
+                logger.error(f"  auction venue reconciliation: {len(pending)} order(s) on record "
+                             f"({len(extra)} recovered from the venue"
+                             f"{', record was mid-submission' if was_submitting else ''})")
+            changed = True
     if not pending and not orphans:
         if changed:
             state["auction_stage"] = st
@@ -1440,17 +1492,20 @@ def _fetch_today_opens(symbols: list, session_iso: str, logger) -> dict:
     if not symbols:
         return out
     try:
+        import pandas as pd
         import yfinance as yf
         from datetime import date, timedelta
         start = session_iso
         end = (date.fromisoformat(session_iso) + timedelta(days=1)).isoformat()
-        df = yf.download(sorted(symbols), start=start, end=end, interval="1d",
+        queries = {sym: str(sym).replace(".", "-") for sym in symbols}
+        df = yf.download(sorted(set(queries.values())), start=start, end=end, interval="1d",
                          progress=False, threads=False, group_by="ticker", auto_adjust=False)
         if df is None or len(df) == 0:
             return out
-        for sym in symbols:
+        multi = isinstance(df.columns, pd.MultiIndex)
+        for sym, q in queries.items():
             try:
-                col = df[sym]["Open"] if len(symbols) > 1 else df["Open"]
+                col = df[q]["Open"] if multi else df["Open"]
                 col = col.dropna()
                 if len(col) and str(col.index[-1])[:10] == session_iso and float(col.iloc[-1]) > 0:
                     out[sym] = float(col.iloc[-1])
@@ -1468,11 +1523,69 @@ def _repair_history_reconciliation(state: dict, st: dict, session_iso: str, logg
         rid = st.get("run_id")
         for h in reversed(state.get("history") or []):
             if rid and h.get("auction_run_id") == rid and isinstance(h.get("result"), dict):
-                _merge_auction_into_result(h["result"], st, session_iso)
+                _merge_auction_into_result(h["result"], st, st.get("date") or session_iso)
                 logger.info("  repaired the completed run's reconciliation with the auction leg")
                 return
     except Exception as e:
         logger.warning(f"  history reconciliation repair failed: {e}")
+
+
+def _fill_recovered_anchors(entries: list, stock_data: dict | None, session_iso: str,
+                            mc, logger) -> None:
+    """Venue-recovered entries lack the anchor (prior-session close) the
+    fill-rate statistics need: take it from the panel (prior-session bar,
+    dash form), else from the Alpaca snapshot's previous daily bar (valid
+    after the open). Entries that stay without an anchor keep
+    notional_est 0 and are excluded from the anchor-priced rate."""
+    missing = [e for e in entries if not e.get("prev_close")]
+    if not missing:
+        return
+    prev = _previous_session_iso(session_iso)
+    for e in missing:
+        sym = str(e.get("symbol") or "").replace(".", "-")
+        try:
+            df = (stock_data or {}).get(sym)
+            if df is not None:
+                c = df["close"].dropna()
+                c = c[[str(i)[:10] <= prev for i in c.index]]
+                if len(c) and str(c.index[-1])[:10] == prev and float(c.iloc[-1]) > 0:
+                    e["prev_close"] = float(c.iloc[-1])
+        except Exception:
+            pass
+    still = [e for e in missing if not e.get("prev_close")]
+    if still:
+        try:
+            from core.orders import fetch_snapshots
+            snaps = fetch_snapshots(sorted({str(e.get("symbol")) for e in still}), mc, logger) or {}
+            for e in still:
+                snap = snaps.get(str(e.get("symbol"))) or snaps.get(str(e.get("symbol")).replace(".", "-")) or {}
+                if snap.get("prev_close") and float(snap["prev_close"]) > 0:
+                    e["prev_close"] = float(snap["prev_close"])
+        except Exception as ex:
+            logger.warning(f"  recovered-anchor snapshot failed (non-fatal): {ex}")
+    for e in missing:
+        if e.get("prev_close"):
+            e["notional_est"] = round(float(e.get("qty") or 0) * float(e["prev_close"]), 2)
+
+
+def _venue_clear_for_resubmit(mc, session_iso: str, prev_stage: dict, logger) -> bool:
+    """True only when the venue PROVABLY holds no opg order of today's
+    book (empty listing) and nothing was persisted: then a stage that died
+    before any POST may submit after all. A failed listing or any order
+    found means 'do not resubmit' (review round 6)."""
+    if prev_stage.get("pending"):
+        return False
+    try:
+        from core.orders import recover_unpersisted_auction_orders
+        found = recover_unpersisted_auction_orders(mc, session_iso, set(), logger)
+    except Exception as e:
+        logger.warning(f"  venue check failed: {e}")
+        return False
+    if found is None or found:
+        return False
+    logger.warning("  Auction stage: the earlier 'submitting' run left nothing at the venue — "
+                   "submitting the book now")
+    return True
 
 
 def _run_plan_only_slots(models: list, logger, *, dry_run: bool, force: bool,
@@ -1579,7 +1692,7 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
                     if should_rebalance(st, horizon_days=horizon, force=False):
                         due.append(m.name)
                     else:
-                        _stamp_last_run(st, "auction")
+                        _stamp_last_run(st, "auction", dry_run)
                         _save_state_merged(st, m)
                 except Exception as e:
                     logger.warning(f"Auction stage: due-check failed for {m.name} ({e}) — treated as due")

@@ -1,9 +1,8 @@
 """US equity market hours and holiday calendar.
 
-Half-days (early closes — typically the day before Thanksgiving and
-Christmas Eve) are deliberately treated as full open: orders submitted
-within 09:30–16:00 ET will fill before the early close at 13:00, and the
-later cron ticks no-op naturally.
+Half-days (early closes — the day after Thanksgiving and Christmas Eve)
+close at 13:00 ET (EARLY_CLOSE_DATES / session_close); is_market_open and
+the dashboard's catch-up / wait cutoffs honour that close (review round 6).
 """
 
 from __future__ import annotations
@@ -29,7 +28,28 @@ US_MARKET_HOLIDAYS: frozenset[str] = frozenset({
 })
 
 
+# NYSE early closes (13:00 ET): the day after Thanksgiving and Christmas
+# Eve when it falls on a weekday (plus July 3 when it is a weekday and
+# July 4 is not observed on it). Review round 6: the boot catch-up and the
+# main run's wait cutoff must not submit into a closed half-day session.
+EARLY_CLOSE_DATES: frozenset[str] = frozenset({
+    "2025-07-03", "2025-11-28", "2025-12-24",
+    "2026-11-27", "2026-12-24",
+    "2027-11-26",
+})
+
 _NY = ZoneInfo("America/New_York")
+
+
+def session_close(now: Optional[datetime] = None) -> datetime:
+    """The regular-session close for `now`'s date in ET: 13:00 on early-close
+    dates, 16:00 otherwise (the caller decides whether the day is open)."""
+    if now is None:
+        now = datetime.now(_NY)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_NY)
+    hour = 13 if now.strftime("%Y-%m-%d") in EARLY_CLOSE_DATES else 16
+    return now.replace(hour=hour, minute=0, second=0, microsecond=0)
 
 
 def is_auction_window(now: Optional[datetime] = None) -> bool:
@@ -64,5 +84,5 @@ def is_market_open(now: Optional[datetime] = None) -> bool:
     if now.strftime("%Y-%m-%d") in US_MARKET_HOLIDAYS:
         return False
     open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    close_t = session_close(now)
     return open_t <= now <= close_t

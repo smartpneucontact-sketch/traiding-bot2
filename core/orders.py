@@ -494,6 +494,46 @@ def _auction_qty(order: dict, prev_close: float, buy_limit_mult: float = 1.0) ->
     return float(max(qty, 0))
 
 
+def cancel_open_orders(mc: "ModelConfig", logger, exclude_tif: tuple = ("opg",),
+                       max_wait: float = 20.0) -> dict:
+    """Cancel every open order of the account except the excluded
+    time-in-force kinds, then wait (bounded) until none is still open.
+    Returns {n_open, n_cancelled, n_still_open, ids}. Never raises."""
+    out = {"n_open": 0, "n_cancelled": 0, "n_still_open": 0, "ids": []}
+    try:
+        open_orders = alpaca_request("GET", "v2/orders?status=open&limit=500", mc, logger=logger) or []
+    except Exception as e:
+        logger.warning(f"  open-order list failed: {e}")
+        return out
+    targets = [o for o in (open_orders if isinstance(open_orders, list) else [])
+               if str(o.get("time_in_force") or "") not in exclude_tif and o.get("id")]
+    out["n_open"] = len(targets)
+    if not targets:
+        return out
+    logger.warning(f"  {len(targets)} resting non-opg order(s) found before the rebalance — cancelling")
+    for o in targets:
+        try:
+            alpaca_request("DELETE", f"v2/orders/{o['id']}", mc, logger=logger)
+            out["n_cancelled"] += 1
+            out["ids"].append(o["id"])
+        except Exception as e:
+            logger.warning(f"  cancel {o.get('symbol')} ({o['id']}) failed: {e}")
+    deadline = time.monotonic() + max_wait
+    still = targets
+    while still and time.monotonic() < deadline:
+        time.sleep(1.0)
+        try:
+            cur = alpaca_request("GET", "v2/orders?status=open&limit=500", mc, logger=None) or []
+            cur_ids = {o.get("id") for o in (cur if isinstance(cur, list) else [])}
+            still = [o for o in targets if o["id"] in cur_ids]
+        except Exception:
+            break
+    out["n_still_open"] = len(still)
+    if still:
+        logger.error(f"  {len(still)} order(s) still open after cancel — sizing may double-count them")
+    return out
+
+
 def _auction_client_order_id(run_id: str, sym: str) -> str:
     """Deterministic idempotency key per (rebalance day, symbol): lets a
     POST whose response was lost be recovered by GET
@@ -627,6 +667,8 @@ def submit_auction_orders(orders: list[dict], mc: "ModelConfig",
     summary = {
         "n_planned": len(orders), "n_submitted": len(pending),
         "n_skipped": len(skipped), "skipped": skipped[:40],
+        "n_stale_close": sum(1 for sk in skipped if sk.get("reason") == "stale_close"),
+        "n_error": sum(1 for sk in skipped if str(sk.get("reason", "")).startswith("error:")),
         "submitted_notional_usd": round(submitted_notional, 2),
         "run_id": run_id, "pending": pending,
     }
@@ -647,23 +689,31 @@ _AUCTION_TERMINAL_STATES = ("filled", "canceled", "expired", "rejected",
 
 
 def recover_unpersisted_auction_orders(mc: "ModelConfig", session_iso: str,
-                                       known_ids: set[str], logger) -> list[dict]:
-    """Orders POSTed by today's auction stage whose record was lost (process
-    death between the POST and the state save): every auction order carries
-    a client_order_id starting with "a<YYYYMMDD>_", so the venue's own
-    order list is the source of truth (review round 5). Returns pending
-    entries for the unknown ones (prev_close unknown -> derived from the
-    limit price for buys, None for sells)."""
+                                       known_ids: set[str], logger) -> list[dict] | None:
+    """Orders POSTed by that session's auction stage whose record was lost
+    (process death between the POST and the state save): every auction
+    order carries a client_order_id starting with "a<YYYYMMDD>_", so the
+    venue's own order list is the source of truth (review round 5).
+    Returns pending entries for the unknown ones (prev_close derived from
+    the limit price for buys, None for sells — the runner fills it from
+    the panel), or None when the venue could not be listed."""
     try:
-        from datetime import date
+        from zoneinfo import ZoneInfo
         day = session_iso.replace("-", "")
-        after = f"{session_iso}T08:00:00-04:00"
+        # 08:00 New York of that session, with the right UTC offset (EST
+        # days are -05:00 — review round 6).
+        after_dt = datetime.fromisoformat(f"{session_iso}T08:00:00").replace(
+            tzinfo=ZoneInfo("America/New_York"))
+        after = after_dt.isoformat()
         orders = alpaca_request(
             "GET", f"v2/orders?status=all&limit=500&direction=asc&after={after}",
             mc, logger=logger) or []
     except Exception as e:
+        # Unknown venue state is NOT 'nothing at the venue': the caller
+        # keeps the record open and retries (review round 6).
         logger.warning(f"  auction recovery: order list unavailable: {e}")
-        return []
+        return None
+    buffer_mult = 1.0 + float(getattr(mc, "exec_auction_buffer_bps", 100.0) or 100.0) / 1e4
     found: list[dict] = []
     for o in orders if isinstance(orders, list) else []:
         try:
@@ -675,7 +725,7 @@ def recover_unpersisted_auction_orders(mc: "ModelConfig", session_iso: str,
             lp = float(o["limit_price"]) if o.get("limit_price") else None
             side = str(o.get("side") or "buy")
             qty = float(o.get("qty") or 0)
-            prev_close = round(lp / 1.01, 4) if (lp and side == "buy") else None
+            prev_close = round(lp / buffer_mult, 4) if (lp and side == "buy") else None
             found.append({
                 "symbol": str(o.get("symbol") or "").replace(".", "-"), "side": side,
                 "trade_action": "recovered", "order_type": str(o.get("type") or "limit"),
@@ -841,10 +891,12 @@ def finalize_auction_orders(mc: "ModelConfig", pending: list[dict],
                 logger.warning(f"  auction finalize: {sym} ({p['order_id']}) "
                                f"unreadable — kept pending for retry")
                 continue
-            cancelled_here = 1 if p.get("cancel_sent") else 0
+            cancel_attempted = bool(p.get("cancel_sent"))
+            cancelled_here = 0
             if status in _AUCTION_OPEN_STATES:
                 # Still open: cancel and re-read the FINAL state.
                 trade.order_status = status
+                cancel_attempted = True
                 final = _cancel_order_and_get_final(trade, mc, logger) or {}
                 fstatus = str(final.get("status") or "unknown")
                 if fstatus not in _AUCTION_TERMINAL_STATES:
@@ -858,13 +910,17 @@ def finalize_auction_orders(mc: "ModelConfig", pending: list[dict],
                                    f"{fstatus!r} is not terminal — kept pending for retry")
                     continue
                 state, status = final, fstatus
-                cancelled_here = 1
             elif status not in _AUCTION_TERMINAL_STATES:
                 # Neither open nor terminal (a venue state we do not model):
                 # retry later rather than journal a guess.
                 remaining.append(p)
                 logger.warning(f"  auction finalize: {sym} state {status!r} unmodelled — kept pending")
                 continue
+            # A cancel is counted only when it took effect (the order ended
+            # canceled/expired); a fill in the cancel race is just a fill
+            # (review round 6).
+            if cancel_attempted and status in ("canceled", "expired"):
+                cancelled_here = 1
             _apply_order_fill(trade, state)
             trade.order_status = status
             if status == "filled" and not trade.fill_price and state.get("filled_avg_price"):
@@ -979,6 +1035,17 @@ def rebalance_portfolio(
     completing_plan = bool(run_id)
     run_id = run_id or f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
 
+    if not dry_run and not auction:
+        # A rebalance interrupted mid-loop (redeploy / OOM) can leave DAY
+        # limit orders resting at the venue; a re-run (boot catch-up or
+        # manual) that sized deltas from positions alone would submit a
+        # second buy on top of them (review round 6). Cancel every
+        # non-opg open order and wait for it to settle BEFORE reading
+        # positions. opg orders are the auction leg and are never touched.
+        try:
+            rb_data["open_orders_cancelled"] = cancel_open_orders(mc, logger)
+        except Exception as e:
+            logger.warning(f"  open-order sweep failed (non-fatal): {e}")
     acct = get_account(mc, logger, report)
     portfolio_value = float(acct["portfolio_value"])
     cash_available = float(acct["cash"])
@@ -1571,6 +1638,14 @@ def rebalance_portfolio(
                 limit_stats["n_unfilled_cancelled"])
         try:
             positions_after = get_positions(mc, logger)
+            # Equity read at the SAME moment as the achieved book, so the
+            # shortfall derivation never divides a post-fill gross by a
+            # pre-trade equity (review round 6).
+            try:
+                acct_after = get_account(mc, logger, report)
+                rb_data["portfolio_value_after"] = round(float(acct_after["portfolio_value"]), 2)
+            except Exception as e:
+                logger.warning(f"  post-rebalance account read failed (non-fatal): {e}")
             achieved_gross = sum(
                 abs(float(p.get("market_value", 0) or 0))
                 for p in positions_after.values()

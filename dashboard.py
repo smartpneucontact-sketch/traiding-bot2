@@ -33,6 +33,7 @@ import yfinance as yf
 
 from flask import Flask, jsonify, Response, request as flask_request
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, EVENT_JOB_MISSED
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
@@ -634,8 +635,10 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
         # timeout) and a late main run can still rebalance in-hours.
         try:
             from zoneinfo import ZoneInfo
+            from core.market import session_close
             _now_et = datetime.now(ZoneInfo("America/New_York"))
-            _before_cutoff = (_now_et.hour, _now_et.minute) < (15, 30)
+            # 30 minutes before the session close (13:00 on early closes).
+            _before_cutoff = _now_et < session_close(_now_et) - timedelta(minutes=30)
             _before_stage_cutoff = (_now_et.hour, _now_et.minute) < (9, 20)
         except Exception:
             _before_cutoff = waited < 900
@@ -779,8 +782,17 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
                 bot_status["models"][mn]["state"] = "error"
                 bot_status["models"][mn]["last_run_status"] = "error"
             if failed is not None and model_filter is None:
-                # The other slots DID complete a full pass.
-                bot_status["last_full_run_at"] = _utc_now_iso()
+                bot_status["last_failed_slots"] = sorted(failed)
+                try:
+                    auction_failed = any(
+                        str(getattr(mc, "exec_style", "") or "") == "auction" and mc.name in failed
+                        for mc in pipeline.get_active_models())
+                except Exception:
+                    auction_failed = True
+                if not auction_failed:
+                    # The other slots DID complete a full pass; an auction
+                    # slot that failed must not read as 'recovered' (round 6).
+                    bot_status["last_full_run_at"] = _utc_now_iso()
 
         logging.getLogger("dashboard").error(f"Pipeline failed: {full_error}")
 
@@ -964,20 +976,24 @@ def _et_today_iso() -> str:
 def _boot_catchup_plan(now_et, slot_states: dict, auction_slots: set) -> dict:
     """Which missed cron fires to replay right after boot (pure function).
 
-    main: a trading day, 09:35 <= now < 15:45 ET, and some active slot has
-    not run today (its persisted last_run is not dated today in New York)
-    or holds today's submitted auction plan without a completion.
+    main: a trading day, 09:35 ET <= now < session close - 40 min, and some
+    active slot has not had a LIVE main run today (last_run — dry runs
+    stamp last_dry_run instead) or holds today's open auction plan.
     auction: a trading day, 09:06 <= now < 09:19 ET, an auction slot is
-    due and has no stage record for today."""
-    plan = {"main": False, "auction": False, "reasons": []}
+    due and has no usable stage record for today (a provisional
+    'submitting' record with no orders counts as none).
+    lost_auction: 09:19 <= now < 09:50 ET, an auction slot is due with no
+    usable stage record — too late to re-fire, recorded for /ready."""
+    plan = {"main": False, "auction": False, "lost_auction": [], "reasons": []}
     try:
-        from core.market import US_MARKET_HOLIDAYS
+        from core.market import US_MARKET_HOLIDAYS, session_close
         from core.state import should_rebalance
         today = now_et.strftime("%Y-%m-%d")
         if now_et.weekday() >= 5 or today in US_MARKET_HOLIDAYS:
             return plan
         hm = (now_et.hour, now_et.minute)
-        if (9, 35) <= hm < (15, 45):
+        main_end = session_close(now_et) - timedelta(minutes=40)
+        if (9, 35) <= hm and now_et < main_end:
             for name, st in slot_states.items():
                 lr = st.get("last_run")
                 ran_today = bool(lr) and _stamp_et_date(lr) == today
@@ -989,22 +1005,103 @@ def _boot_catchup_plan(now_et, slot_states: dict, auction_slots: set) -> dict:
                 if not ran_today or open_plan:
                     plan["main"] = True
                     plan["reasons"].append(f"{name}: " + ("open auction plan" if open_plan
-                                                         else f"no main run today (last_run {lr})"))
-        if (9, 6) <= hm < (9, 19):
+                                                         else f"no live main run today (last_run {lr})"))
+
+        def _usable_stage_record(stg: dict) -> bool:
+            if stg.get("date") != today or not stg.get("outcome"):
+                return False
+            if stg.get("outcome") == "submitting" and not stg.get("pending") \
+                    and int(stg.get("n_submitted", 0) or 0) == 0:
+                return False      # died before the first POST
+            return True
+
+        if (9, 6) <= hm < (9, 50):
             for name in auction_slots:
                 st = slot_states.get(name) or {}
-                stg = st.get("auction_stage") or {}
-                if stg.get("date") == today and stg.get("outcome"):
+                if _usable_stage_record(st.get("auction_stage") or {}):
                     continue
                 try:
                     due = should_rebalance(st, horizon_days=_rebalance_horizon())
                 except Exception:
                     due = True
-                if due:
+                if not due:
+                    continue
+                if hm < (9, 19):
                     plan["auction"] = True
                     plan["reasons"].append(f"{name}: auction slot due, no stage record today")
+                else:
+                    plan["lost_auction"].append(name)
+                    plan["reasons"].append(f"{name}: auction stage window passed with no record — "
+                                           f"measurement day lost")
     except Exception as e:
         plan["reasons"].append(f"check errored: {e}")
+    return plan
+
+
+def _schedule_boot_catchup(scheduler, now_et, logger) -> dict:
+    """Apply _boot_catchup_plan at boot: schedule the one-shot replays with
+    a real misfire grace, record a lost auction stage so /ready can report
+    it, and never double-fire a main run the cron is about to run anyway
+    (review round 6)."""
+    _models = pipeline.get_active_models()
+    plan = _boot_catchup_plan(
+        now_et,
+        {mc.name: (_load_model_state(mc.name) or {}) for mc in _models},
+        {mc.name for mc in _models if str(getattr(mc, "exec_style", "") or "") == "auction"},
+    )
+    plan["fired"] = []
+    plan["missed"] = []
+    # The cron will fire within 3 minutes anyway: no replay needed.
+    try:
+        job = scheduler.get_job("trading_pipeline")
+        nxt = job.next_run_time if job else None
+        if nxt is not None and plan.get("main"):
+            delta = (nxt - now_et).total_seconds()
+            # The cron is about to fire (or fired seconds ago and is being
+            # picked up): a replay would only collide with it.
+            if -120 <= delta <= 180:
+                plan["main"] = False
+                plan["reasons"].append(f"main replay skipped: cron fires in {int(delta)} s")
+    except Exception:
+        pass
+    with status_lock:
+        bot_status["boot_catchup"] = plan
+        if plan.get("lost_auction"):
+            bot_status["auction_last_run_at"] = _utc_now_iso()
+            bot_status["auction_last_run_status"] = "skipped"
+            bot_status["auction_last_error"] = ("skipped: container booted after the 09:06-09:19 "
+                                                "window with no stage record")
+            bot_status["auction_skipped_due"] = list(plan["lost_auction"])
+
+    def _mark(event):
+        try:
+            with status_lock:
+                bc = bot_status.get("boot_catchup") or {}
+                key = "missed" if getattr(event, "code", None) == EVENT_JOB_MISSED else "fired"
+                if getattr(event, "exception", None) is not None:
+                    key = "missed"
+                bc.setdefault(key, []).append(str(getattr(event, "job_id", "?")))
+                bot_status["boot_catchup"] = bc
+        except Exception:
+            pass
+    try:
+        scheduler.add_listener(_mark, EVENT_JOB_MISSED | EVENT_JOB_ERROR | EVENT_JOB_EXECUTED)
+    except Exception:
+        pass
+    if plan.get("auction"):
+        scheduler.add_job(run_trading_pipeline,
+                          DateTrigger(run_date=now_et + timedelta(seconds=10)),
+                          id="catchup_auction", name="Boot catch-up: auction stage",
+                          kwargs={"stage": "auction"}, misfire_grace_time=300)
+        logger.warning(f"BOOT CATCH-UP: re-firing the auction stage in 10 s — {plan['reasons']}")
+    if plan.get("main"):
+        scheduler.add_job(run_trading_pipeline,
+                          DateTrigger(run_date=now_et + timedelta(seconds=45)),
+                          id="catchup_main", name="Boot catch-up: main run",
+                          misfire_grace_time=900)
+        logger.warning(f"BOOT CATCH-UP: re-firing the main run in 45 s — {plan['reasons']}")
+    if plan.get("lost_auction"):
+        logger.error(f"BOOT: auction stage LOST for {plan['lost_auction']} (booted after the window)")
     return plan
 
 
@@ -3256,6 +3353,9 @@ def ready():
     memory lost to an unmounted volume), or no run has completed in days.
     """
     problems = []
+    # Non-blocking notes that ride along in "warnings" (defined up front:
+    # the per-slot loop below appends to it — review round 6).
+    inv_warnings_extra: list[str] = []
     if bot_status.get("last_run_status") == "error":
         problems.append(f"last run errored: {bot_status.get('last_error')}")
     # Repeating data-guard aborts: runs "complete" (refreshing the last-run
@@ -3274,10 +3374,21 @@ def ready():
             # live at run time) and never completed by a later main run.
             if _mst.get("auction_completion_deferred") == _et_today_iso():
                 problems.append(f"{mc.name}: auction completion deferred today and not yet completed")
-            # Today's auction plan exists but no main run completed it by
-            # 10:00 ET (a restart straddling 09:35 drops the cron fire —
-            # review round 5).
+            # A stage that died before submitting (restart) and was then
+            # rebalanced via the non-auction path; or no stage record at all
+            # on a day the slot rebalanced (review round 6).
             _stg = _mst.get("auction_stage") or {}
+            if str(getattr(mc, "exec_style", "") or "") == "auction":
+                if (_stg.get("date") == _et_today_iso() and _stg.get("recovered_from_submitting")
+                        and int(_stg.get("n_recovered", 0) or 0) == 0
+                        and _stg.get("outcome") == "skipped:nothing_submitted"):
+                    problems.append(f"{mc.name}: auction stage died before submitting; slot "
+                                    f"rebalanced via the non-auction path (measurement day lost)")
+                _lr = _mst.get("last_rebalance")
+                if (_lr and _stamp_et_date(_lr) == _et_today_iso()
+                        and _stg.get("date") != _et_today_iso()):
+                    inv_warnings_extra.append(f"{mc.name}: rebalanced today with no auction stage "
+                                              f"record (stage did not run — restart?)")
             if (_stg.get("date") == _et_today_iso()
                     and _stg.get("outcome") in ("submitted", "submitting")
                     and (int(_stg.get("n_submitted", 0) or 0) > 0 or _stg.get("pending"))
@@ -3296,7 +3407,12 @@ def ready():
     # the committed spec (spec_manifest.json) is exactly the fault class
     # that has bitten five times — surface it here so external alerting
     # (and the deploy healthcheck) sees it.
-    inv_warnings_extra: list[str] = []
+    try:
+        _bc = bot_status.get("boot_catchup") or {}
+        if _bc.get("missed"):
+            problems.append(f"boot catch-up job(s) did not execute: {_bc['missed']}")
+    except Exception:
+        pass
     # A dropped 09:35 main run (another stage still running) is a readiness
     # problem for the whole day.
     try:
@@ -5805,29 +5921,11 @@ if __name__ == "__main__":
     scheduler.start()
     _scheduler = scheduler  # expose to /api/status for LIVE next-run reads
 
-    # Boot-time catch-up (review round 5): a container that came up after a
-    # cron fire time it missed re-fires the missed stage once.
+    # Boot-time catch-up (review rounds 5-6): a container that came up after
+    # a cron fire time it missed re-fires the missed stage once.
     try:
         from zoneinfo import ZoneInfo
-        _now_et = datetime.now(ZoneInfo("America/New_York"))
-        _models = pipeline.get_active_models()
-        _plan = _boot_catchup_plan(
-            _now_et,
-            {mc.name: (_load_model_state(mc.name) or {}) for mc in _models},
-            {mc.name for mc in _models if str(getattr(mc, "exec_style", "") or "") == "auction"},
-        )
-        bot_status["boot_catchup"] = _plan
-        if _plan.get("auction"):
-            scheduler.add_job(run_trading_pipeline,
-                              DateTrigger(run_date=_now_et + timedelta(seconds=10)),
-                              id="catchup_auction", name="Boot catch-up: auction stage",
-                              kwargs={"stage": "auction"})
-            logger.warning(f"BOOT CATCH-UP: re-firing the auction stage in 10 s — {_plan['reasons']}")
-        if _plan.get("main"):
-            scheduler.add_job(run_trading_pipeline,
-                              DateTrigger(run_date=_now_et + timedelta(seconds=60)),
-                              id="catchup_main", name="Boot catch-up: main run")
-            logger.warning(f"BOOT CATCH-UP: re-firing the main run in 60 s — {_plan['reasons']}")
+        _schedule_boot_catchup(scheduler, datetime.now(ZoneInfo("America/New_York")), logger)
     except Exception as e:
         logger.error(f"boot catch-up check failed (non-fatal): {e}")
 

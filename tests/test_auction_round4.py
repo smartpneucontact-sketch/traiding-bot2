@@ -388,6 +388,7 @@ def _wire_runner(monkeypatch, weights, rebalance_result=None, calls=None):
     monkeypatch.setattr("core.market.is_auction_window", lambda now=None: True)
     monkeypatch.setattr("core.risk.refresh_daily_book_anchor_after_rebalance", lambda *a, **kw: None)
     monkeypatch.setattr("core.protocol.bind_forward_test_start", lambda *a, **kw: False)
+    monkeypatch.setattr("core.orders.recover_unpersisted_auction_orders", lambda *a, **kw: None)   # never hit the venue
 
     def fake_rebalance(target_symbols, rankings, mc, journal, lg, report, **kw):
         calls.append({"target_symbols": list(target_symbols), **kw})
@@ -401,7 +402,8 @@ def _wire_runner(monkeypatch, weights, rebalance_result=None, calls=None):
             for e in pend:
                 cb(e, "RID")
         return {"dry_run": False, "auction": {"n_submitted": 2 - len(stale), "n_skipped": len(skipped),
-                                               "skipped": skipped, "submitted_notional_usd": 1000.0,
+                                               "skipped": skipped, "n_stale_close": len(stale),
+                                               "submitted_notional_usd": 1000.0,
                                                "run_id": "RID", "pending": pend},
                 "run_id": "RID"}
     monkeypatch.setattr(runner_mod, "rebalance_portfolio", fake_rebalance)
@@ -683,6 +685,12 @@ def test_dashboard_single_slot_manual_run_keeps_the_skipped_alarm(monkeypatch):
 def test_dashboard_auction_stage_yielding_to_a_manual_run_leaves_a_trace(monkeypatch):
     import dashboard
     monkeypatch.setattr(dashboard.pipeline, "run_pipeline", lambda **kw: None)
+    monkeypatch.setattr(dashboard.pipeline, "get_active_models", lambda: [])
+    # Past the 09:20 start cutoff the stage yields instead of waiting; never
+    # let this test touch the real clock or the real sleep (round 6: it hung
+    # the suite before 09:20 ET).
+    monkeypatch.setattr(dashboard.time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("real sleep")))
+    _dash_clock(monkeypatch, dashboard, 9, 21)
     with dashboard.status_lock:
         dashboard.bot_status["state"] = "running"
         dashboard.bot_status["running_stage"] = "main"
