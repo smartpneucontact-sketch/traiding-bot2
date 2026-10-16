@@ -3410,9 +3410,11 @@ def ready():
                 problems.append(f"{mc.name}: rebalance aborted today — orders still open at the venue; "
                                 f"retry once they settle")
             _blk = _mst.get("rebalance_blocked_symbols") or {}
-            if _blk.get("date") == _et_today_iso() and _blk.get("symbols"):
-                inv_warnings_extra.append(f"{mc.name}: rebalanced today with {len(_blk['symbols'])} name(s) "
-                                          f"left untouched (live orders): {_blk['symbols'][:8]}")
+            if _blk.get("symbols"):
+                # Until a later rebalance trades without any (round 9).
+                inv_warnings_extra.append(f"{mc.name}: {len(_blk['symbols'])} name(s) not traded at the "
+                                          f"{_blk.get('date')} rebalance (live orders) — re-run the slot "
+                                          f"once they settle: {_blk['symbols'][:8]}")
             if str(getattr(mc, "exec_style", "") or "") == "auction":
                 # Persisted by the runner: survives a restart (round 8).
                 if _mst.get("auction_stage_missed_date") == _et_today_iso():

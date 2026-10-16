@@ -149,7 +149,9 @@ def test_sweep_waits_for_inflight_market_orders_and_blocks_only_their_symbol(tmp
     monkeypatch.setattr(orders_mod, "alpaca_request", fake2)
     rb2 = orders_mod.rebalance_portfolio(["AAA"], [("AAA", 1.0)], make_mc(tmp_path, exec_style="market"),
                                          StubJournal(), logger, RunReport(), target_weights={"AAA": 0.05})
-    assert not rb2.get("aborted_open_orders") and rb2["blocked_symbols"] == ["CCC"]
+    # CCC is not in the plan: nothing was left untouched; the live order is recorded for diagnostics.
+    assert not rb2.get("aborted_open_orders") and rb2["live_order_symbols"] == ["CCC"]
+    assert "blocked_symbols" not in rb2
     assert any(c[0] == "POST" for c in calls2)                           # AAA was traded
     # The plan's own name has the live order: nothing tradeable -> abort.
     mkt_aaa = dict(mkt, symbol="AAA")

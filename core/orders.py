@@ -540,14 +540,22 @@ def cancel_open_orders(mc: "ModelConfig", logger, exclude_tif: tuple = ("opg",),
         logger.warning(f"  {len(targets)} resting non-opg limit order(s) found before the rebalance — cancelling")
     if inflight:
         logger.warning(f"  {len(inflight)} in-flight market order(s) (scanner?) — waiting for them to settle")
-    for o in targets:
+    attempts: dict = {}
+
+    def _cancel(o) -> None:
+        attempts[o["id"]] = attempts.get(o["id"], 0) + 1
         try:
             alpaca_request("DELETE", f"v2/orders/{o['id']}", mc, logger=logger)
-            out["n_cancel_requested"] += 1
-            out["ids"].append(o["id"])
+            if o["id"] not in out["ids"]:
+                out["n_cancel_requested"] += 1
+                out["ids"].append(o["id"])
         except Exception as e:
-            logger.warning(f"  cancel {o.get('symbol')} ({o['id']}) failed: {e}")
+            logger.warning(f"  cancel {o.get('symbol')} ({o['id']}) failed "
+                           f"(attempt {attempts[o['id']]}): {e}")
+    for o in targets:
+        _cancel(o)
     target_ids = {o["id"] for o in targets}
+    by_target = {o["id"]: o for o in targets}
     inflight_ids = {o["id"] for o in inflight}
     wait_ids = target_ids | inflight_ids
     still = set(wait_ids)
@@ -563,6 +571,11 @@ def cancel_open_orders(mc: "ModelConfig", logger, exclude_tif: tuple = ("opg",),
         except Exception:
             last_ok = False      # retry until the deadline instead of trusting a stale list
             continue
+        # A cancel that failed transiently is re-sent (at most 3 tries per
+        # order — review round 9); a request already accepted is not.
+        for oid in still & target_ids:
+            if oid not in out["ids"] and attempts.get(oid, 0) < 3:
+                _cancel(by_target[oid])
     out["n_still_open"] = len(still & target_ids)
     out["n_inflight_unsettled"] = len(still & inflight_ids)
     out["settle_unverified"] = bool(still) and not last_ok
@@ -1137,6 +1150,44 @@ def rebalance_portfolio(
     to_buy = sorted(target_set - current_set)
     to_hold = sorted(current_set & target_set)
 
+    # Names with an order still live at the venue (a resting limit that
+    # would not cancel, the scanner's unsettled market order) come out of
+    # the plan BEFORE sizing (review round 9): their position is in flux,
+    # so trading them would double-count that order, and counting them in
+    # the buying-power pre-flight would scale the other buys down for
+    # nothing. They keep their current position this run.
+    rb_data["live_order_symbols"] = sorted(blocked_symbols)
+    blocked_held: set = set()
+    blocked_unheld: set = set()
+    if blocked_symbols:
+        def _is_blocked(x) -> bool:
+            return str(x).replace(".", "-") in blocked_symbols
+        planned_before = set(to_sell) | set(to_buy) | set(to_hold)
+        skipped_names = sorted(x for x in planned_before if _is_blocked(x))
+        blocked_held = {x for x in skipped_names if x in current_set}
+        blocked_unheld = {x for x in skipped_names if x not in current_set}
+        to_sell = [x for x in to_sell if not _is_blocked(x)]
+        to_buy = [x for x in to_buy if not _is_blocked(x)]
+        to_hold = [x for x in to_hold if not _is_blocked(x)]
+        if skipped_names:
+            rb_data["blocked_symbols"] = skipped_names
+            msg = (f"{len(skipped_names)} name(s) not traded this run — an order is still live "
+                   f"at the venue: {skipped_names[:10]}")
+            logger.warning(f"  [REBALANCE] {mc.name}: {msg}")
+            report.add_warning(msg)
+        if planned_before and not (to_sell or to_buy or to_hold):
+            if completing_plan:
+                # The auction leg already traded the book: an all-blocked
+                # residue is still a completed rebalance (review round 9).
+                rb_data["completion_residue_blocked"] = skipped_names
+            else:
+                msg = "rebalance aborted: every name in the plan has a live order at the venue"
+                logger.error(f"  [REBALANCE] {mc.name}: {msg}")
+                report.add_error(msg)
+                rb_data["aborted_open_orders"] = True
+                report.end_step("rebalance")
+                return rb_data
+
     # Per-symbol target dollar allocations
     #
     # `target_leverage` (default 1.0) multiplies the total book size.
@@ -1164,6 +1215,10 @@ def rebalance_portfolio(
         rb_data["sizing_mode"] = "equal" if leverage == 1.0 else f"equal × {leverage}x"
 
     rb_data["target_leverage"] = leverage
+    for x in blocked_held:
+        sym_allocations[x] = abs(float(current_positions[x].get("market_value", 0) or 0))
+    for x in blocked_unheld:
+        sym_allocations.pop(x, None)
 
     # Pre-flight (rewritten 2026-10-15): compare the INCREMENTAL buying this
     # rebalance needs — new positions plus up-sizes of held names — against
@@ -1341,32 +1396,6 @@ def rebalance_portfolio(
         f"{n_rebalanced} rebalanced, {n_held_unchanged} held, "
         f"turnover: {turnover:.0%}"
     )
-
-    if blocked_symbols:
-        # A live order for a name (a resting limit that would not cancel,
-        # the scanner's unsettled market order) means its position is in
-        # flux: sizing it from positions alone would double-count that
-        # order. Leave those names untouched this run and rebalance the
-        # rest (review round 8 — a whole-book abort lost the day).
-        n_planned = len(orders)
-        kept = [o for o in orders if str(o["symbol"]).replace(".", "-") not in blocked_symbols]
-        skipped = sorted({o["symbol"] for o in orders} - {o["symbol"] for o in kept})
-        orders = kept
-        rb_data["blocked_symbols"] = sorted(blocked_symbols)
-        rb_data["n_orders_blocked"] = n_planned - len(kept)
-        if skipped:
-            msg = (f"{len(skipped)} name(s) left untouched — an order is still live at the venue: "
-                   f"{skipped[:10]}")
-            logger.warning(f"  [REBALANCE] {mc.name}: {msg}")
-            report.add_warning(msg)
-        if n_planned > 0 and not kept:
-            # Nothing tradeable at all: not a rebalance (the slot stays due).
-            msg = "rebalance aborted: every planned order's symbol has a live order at the venue"
-            logger.error(f"  [REBALANCE] {mc.name}: {msg}")
-            report.add_error(msg)
-            rb_data["aborted_open_orders"] = True
-            report.end_step("rebalance")
-            return rb_data
 
     if dry_run:
         logger.info("  MODE: DRY RUN - no orders sent, no trades logged")

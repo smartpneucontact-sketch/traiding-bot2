@@ -107,8 +107,10 @@ def test_blocked_names_are_left_untouched_and_the_rest_trades(tmp_path, monkeypa
                                         make_mc(tmp_path, exec_style="market"), StubJournal(), logger, report,
                                         target_weights={"AAA": 0.05, "BBB": 0.05})
     assert not rb.get("aborted_open_orders")
-    assert rb["blocked_symbols"] == ["AAA"] and rb["n_orders_blocked"] == 1
+    assert rb["blocked_symbols"] == ["AAA"] and rb["live_order_symbols"] == ["AAA"]
     assert [p["symbol"] for p in posted] == ["BBB"]
+    # The blocked new buy is out of the sizing too: the target book is BBB only.
+    assert rb["target_gross_usd"] == pytest.approx(100_000 * 0.05 * 2.0)
 
 
 # ───────────────────────── runner ────────────────────────────────────────
@@ -313,7 +315,7 @@ def test_ready_warns_on_a_failed_venue_reconciliation_and_blocked_names(tmp_path
         monkeypatch.delitem(dashboard.bot_status, k, raising=False)
     monkeypatch.setitem(dashboard.bot_status, "auction_last_run_status", None)
     w = dashboard.app.test_client().get("/ready").get_json()["warnings"]
-    assert any("venue reconciliation failed" in x for x in w) and any("left untouched" in x for x in w)
+    assert any("venue reconciliation failed" in x for x in w) and any("not traded at the" in x for x in w)
 
 
 def test_protocol_recons_skip_non_trading_entries(tmp_path, monkeypatch):

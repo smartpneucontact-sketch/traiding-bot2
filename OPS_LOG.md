@@ -553,3 +553,27 @@ resting-order sweep does not run today.
   so it survives a container restart; a failed venue reconciliation today
   is a /ready warning.
 Tests: 398.
+
+## 2026-10-16 (06:15 ET) — Compact review round 9 (7 agents, 9 confirmed / 1 refuted; regression critic: none) fixed
+
+- Names with a live order at the venue now come out of the plan BEFORE the
+  buying-power pre-flight (a blocked buy's reservation is already out of
+  buying power; counting it again auto-scaled the other buys and set a
+  false sticky funding floor on gated slots). A held blocked name is pinned
+  at its market value in the book target; an unheld one is dropped.
+- An auction completion whose whole residue is blocked still completes the
+  plan (the auction leg already traded the book); only an ordinary
+  rebalance with every name blocked aborts.
+- A cancel that fails transiently is re-sent inside the 20 s settle loop
+  (at most 3 tries).
+- A missed-stage rebalance (re-planned at marketable-limit) spends today's
+  stage record, so a venue order adopted later can never resurrect the
+  morning plan and trade the book back to it; a same-day completion never
+  clears today's missed-stage alarm.
+- The blocked-names warning stays on /ready until a later rebalance trades
+  without any (it used to expire at midnight and never clear on a clean
+  re-run). Accepted limitation: blocked names are NOT retried automatically
+  — the operator re-runs the slot once the order settles, otherwise the
+  next scheduled rebalance corrects them; this needs a live order on a
+  planned name at 09:35 on a rebalance day (rare).
+Tests: 404.

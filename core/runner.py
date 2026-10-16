@@ -1073,11 +1073,23 @@ def run_single_model(
             # Persisted (not just in-memory) so /ready keeps the lost
             # measurement day red across a container restart (round 8).
             state["auction_stage_missed_date"] = session_iso
-        elif auction_run_id:
+            # Today's record (if any) is spent by this re-planned rebalance:
+            # a venue order adopted later must never resurrect the morning
+            # plan and trade the book back to it (review round 9).
+            rec = state.get("auction_stage")
+            if (isinstance(rec, dict) and rec.get("date") == session_iso
+                    and isinstance(rec.get("plan"), dict) and not rec.get("completed_at")):
+                rec["completed_at"] = datetime.now(timezone.utc).isoformat()
+                rec["superseded_by_missed_rebalance"] = True
+        elif auction_run_id and state.get("auction_stage_missed_date") != session_iso:
             state.pop("auction_stage_missed_date", None)
+        # Names left untouched because an order was live: kept until a later
+        # rebalance trades without any (review rounds 8-9).
         if result.get("blocked_symbols"):
             state["rebalance_blocked_symbols"] = {"date": session_iso,
                                                   "symbols": list(result.get("blocked_symbols") or [])}
+        else:
+            state.pop("rebalance_blocked_symbols", None)
     if rebalanced:
         state["last_rebalance"] = datetime.now().isoformat()
         state.pop("auction_completion_deferred", None)
