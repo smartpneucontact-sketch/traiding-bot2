@@ -27,6 +27,18 @@ import pickle
 import traceback
 from datetime import datetime, timezone
 
+
+class SlotFailures(RuntimeError):
+    """One or more slots raised inside run_pipeline's per-model loop. The
+    other slots ran normally; the dashboard marks only `failed` as errored
+    (review round 5) while the run itself still reads as errored for
+    /ready."""
+
+    def __init__(self, failed: dict):
+        self.failed = dict(failed)
+        super().__init__(f"{len(failed)} slot(s) failed: "
+                         + "; ".join(f"{k}: {v}" for k, v in failed.items()))
+
 from core.combo_strategy import ComboConfig, ComboStrategy
 from core.config import ModelConfig, get_active_models
 from core.data import download_bars, download_macro
@@ -426,7 +438,7 @@ def run_single_model(
             # and a bare save of it here would clobber them
             # (2026-08-31 audit). Counted for the MAIN stage only — the
             # pre-open auction stage must not double the alarm.
-            if stage == "main":
+            if stage == "main" and not dry_run:
                 with state_lock:
                     disk = load_state(mc)
                     disk["data_guard_aborts"] = int(disk.get("data_guard_aborts", 0)) + 1
@@ -776,6 +788,15 @@ def run_single_model(
             # second set and orphan the first (review 2026-10-15).
             logger.warning("  Auction stage already submitted today — not resubmitting")
             outcome = "skipped:already_submitted"
+        elif prev_stage.get("date") == session_iso and prev_stage.get("outcome") == "submitting":
+            # An earlier stage run died mid-submission with nothing persisted
+            # yet: orders may still exist at the venue (a persist callback can
+            # fail after a successful POST). Never submit a second book; the
+            # 09:35 run adopts whatever the venue holds (review round 5).
+            logger.error("  Auction stage: an earlier run today is marked 'submitting' with no "
+                         "persisted orders — NOT resubmitting; the 09:35 run reconciles with the venue")
+            report.add_warning("auction stage skipped: prior run died mid-submission")
+            outcome = "skipped:prior_submitting"
         elif not is_auction_window():
             logger.warning(
                 "  Auction stage outside the 09:00-09:27 ET submission "
@@ -815,21 +836,59 @@ def run_single_model(
                     outcome = "skipped:stale_panel"
                     result = None
                 else:
-                    if stale:
-                        logger.warning(f"  Auction stage: {len(stale)} names with a stale last "
-                                       f"bar (!= {expected_prev}) left to the 09:35 completion")
+                    stale_traded = stale & set(target_symbols)
+                    if stale_traded:
+                        logger.warning(f"  Auction stage: {len(stale_traded)} target names with a "
+                                       f"stale last bar (!= {expected_prev}) left to the 09:35 "
+                                       f"completion: {sorted(stale_traded)[:10]}")
+                    plan_record = {
+                        "target_symbols": list(target_symbols),
+                        "rankings": [[s, float(w)] for s, w in rankings],
+                        "target_weights": (dict(target_weights) if target_weights else None),
+                        # The submitting run's diagnostics travel with the
+                        # plan so the completion's gate-state write and
+                        # history entry describe the book that was traded.
+                        "diagnostics": (getattr(model, "last_diagnostics", None) or None),
+                    }
+                    # Provisional record BEFORE the first POST, then every
+                    # accepted order is appended to disk as it is submitted:
+                    # a process death mid-loop must never leave live opg
+                    # orders the bot does not know about (review round 5).
+                    state["auction_stage"] = {
+                        "date": session_iso, "prev_session": expected_prev,
+                        "outcome": "submitting", "run_id": None, "n_submitted": 0,
+                        "n_skipped": 0, "plan": plan_record, "pending": [],
+                        "orphans": carry_orphans,
+                    }
+                    _save_state_merged(state, mc)
+
+                    def _persist_submitted(entry: dict, rid: str) -> None:
+                        with state_lock:
+                            d = load_state(mc)
+                            rec = d.get("auction_stage") or {}
+                            if rec.get("date") != session_iso:
+                                return
+                            rec.setdefault("pending", []).append(dict(entry))
+                            rec["run_id"] = rid
+                            rec["n_submitted"] = len(rec["pending"])
+                            d["auction_stage"] = rec
+                            save_state(d, mc)
+
                     result = rebalance_portfolio(
                         target_symbols, rankings, mc, journal, logger, report,
                         dry_run=False, target_weights=target_weights, auction=True,
                         last_close=last_close, stale_close=stale,
+                        on_submitted=_persist_submitted,
                     )
                 if result is not None:
                     summ = (result or {}).get("auction") or {}
                     outcome = "submitted" if int(summ.get("n_submitted", 0) or 0) > 0 else "skipped:nothing_submitted"
+                    n_stale_traded = sum(1 for sk in (summ.get("skipped") or [])
+                                         if sk.get("reason") == "stale_close")
                     state["auction_stage"] = {
                         "date": session_iso,
                         "prev_session": expected_prev,
-                        "n_stale_close": len(stale),
+                        "n_stale_close": n_stale_traded,
                         "run_id": (result or {}).get("run_id") or summ.get("run_id"),
                         "outcome": outcome,
                         "n_submitted": int(summ.get("n_submitted", 0) or 0),
@@ -840,15 +899,7 @@ def run_single_model(
                         "buy_scale": (result or {}).get("buy_scale"),
                         # The plan the 09:35 completion must finish (never
                         # re-plan against a second download — review 2026-10-15).
-                        "plan": {
-                            "target_symbols": list(target_symbols),
-                            "rankings": [[s, float(w)] for s, w in rankings],
-                            "target_weights": (dict(target_weights) if target_weights else None),
-                            # The submitting run's diagnostics travel with the
-                            # plan so the completion's gate-state write and
-                            # history entry describe the book that was traded.
-                            "diagnostics": (getattr(model, "last_diagnostics", None) or None),
-                        },
+                        "plan": plan_record,
                         "pending": summ.get("pending", []),
                         "orphans": carry_orphans,
                     }
@@ -886,20 +937,24 @@ def run_single_model(
     # Avoid submitting `time_in_force=day` orders after market close — they
     # would expire unfilled. Skip the trading step on closed days; the
     # predictions and history are still saved.
-    if not dry_run and not is_market_open():
+    result: dict
+    if auction_pending_live:
+        # Checked BEFORE the market-closed test: a pre-open manual run on a
+        # plan day is a deferred completion, not a closed-market skip
+        # (review round 5).
+        report.add_warning("Rebalance deferred: opening-auction orders still pending")
+        result = {"dry_run": False, "skipped_auction_pending": True}
+        # Surfaced by /ready until a later main run completes the day
+        # (review round 3).
+        state["auction_completion_deferred"] = session_iso
+    elif not dry_run and not is_market_open():
         logger.warning(
             "  Market is closed (weekend, holiday, or outside 9:30–16:00 ET); "
             "skipping order submission. Predictions saved; rebalance will "
             "retry on the next scheduled run during market hours."
         )
         report.add_warning("Rebalance skipped: market closed")
-        result: dict = {"dry_run": False, "skipped_market_closed": True}
-    elif auction_pending_live:
-        report.add_warning("Rebalance deferred: opening-auction orders still pending")
-        result = {"dry_run": False, "skipped_auction_pending": True}
-        # Surfaced by /ready until a later main run completes the day
-        # (review round 3).
-        state["auction_completion_deferred"] = session_iso
+        result = {"dry_run": False, "skipped_market_closed": True}
     else:
         # The scanner may have tripped the portfolio stop while this run
         # was computing (data download + weights can take minutes). The
@@ -1034,6 +1089,10 @@ def run_single_model(
         "result": {k: v for k, v in result.items()
                    if k not in ("sells_detail", "buys_detail")},
     }
+    if auction_run_id:
+        # Lets a later finalize pass repair this entry's merged
+        # reconciliation when the auction leg was unmeasured at 09:35.
+        history_entry["auction_run_id"] = auction_run_id
     # For ml_ranker, `rankings` is (sym, predicted_return); for
     # direct_weights it's (sym, weight). Same dict shape — different
     # semantics. Store under the right key so downstream readers
@@ -1083,9 +1142,14 @@ def _after_open_et() -> bool:
 
 
 def _todays_auction_plan(state: dict, today_iso: str) -> dict | None:
+    """Today's stored, not-yet-completed auction plan. A record left in
+    'submitting' by a run that died mid-loop counts once it holds persisted
+    (or venue-recovered) orders — those orders executed at the open and the
+    plan must be completed, not re-planned (review round 5)."""
     st = state.get("auction_stage") or {}
-    if (st.get("date") == today_iso and st.get("outcome") == "submitted"
-            and int(st.get("n_submitted", 0) or 0) > 0
+    if (st.get("date") == today_iso
+            and st.get("outcome") in ("submitted", "submitting")
+            and (int(st.get("n_submitted", 0) or 0) > 0 or st.get("pending"))
             and isinstance(st.get("plan"), dict)
             and not st.get("completed_at")):
         return st["plan"]
@@ -1105,17 +1169,28 @@ def _merge_auction_into_result(result: dict, st: dict, today_iso: str) -> None:
     reconciliation so protocol fill-rate criteria and the gate-state
     funding check see the WHOLE rebalance, not just the residue."""
     try:
-        if st.get("date") != today_iso or not isinstance(st.get("summary"), dict):
+        if st.get("date") != today_iso:
             return
-        a = st["summary"]
         recon = result.get("reconciliation")
         if not isinstance(recon, dict):
             recon = {"flow": {}, "book": None}
             result["reconciliation"] = recon
         flow = recon.get("flow") or {}
+        a = st.get("summary") if isinstance(st.get("summary"), dict) else {}
         a_n = int(a.get("n", 0) or 0)
+        submitted_any = int(st.get("n_submitted", 0) or 0) > 0 or bool(st.get("pending"))
         if a_n <= 0:
+            if submitted_any:
+                # Orders went to the auction but none could be measured
+                # (finalize failed / every entry unreadable): the protocol's
+                # fill-rate criterion must read NA, not the completion's
+                # ~100% residue rate (review round 5).
+                flow["fill_rate_notional_completion"] = flow.get("fill_rate_notional")
+                flow["fill_rate_notional"] = None
+                flow["auction_unmeasured"] = True
+                recon["flow"] = flow
             return
+        flow.pop("auction_unmeasured", None)
         a_filled = int(a.get("n_filled", 0) or 0)
         a_sub = float(a.get("submitted_notional_usd", 0) or 0)
         # Anchor-priced fills (shares executed x prev close) so a gap
@@ -1199,8 +1274,11 @@ def _accumulate_auction_summary(prev: dict | None, new: dict) -> dict:
         out[k] = round(float(prev.get(k, 0) or 0) + float(new.get(k, 0) or 0), 2)
     est = out["submitted_notional_usd"]
     out["fill_rate_notional"] = round(out["filled_notional_anchor_usd"] / est, 4) if est else None
-    pw = float(prev.get("filled_notional_usd", 0) or 0)
-    nw = float(new.get("filled_notional_usd", 0) or 0)
+    # Weight each pass's vw cost by the dollars it was measured over (rows
+    # WITH a reference open), not by all filled dollars (review round 5);
+    # summaries written before the field existed fall back to filled $.
+    pw = float(prev.get("vw_cost_weight_usd", prev.get("filled_notional_usd", 0)) or 0)
+    nw = float(new.get("vw_cost_weight_usd", new.get("filled_notional_usd", 0)) or 0)
     pc, nc = prev.get("vw_cost_vs_open_bps"), new.get("vw_cost_vs_open_bps")
     num = den = 0.0
     if pc is not None and pw:
@@ -1210,6 +1288,7 @@ def _accumulate_auction_summary(prev: dict | None, new: dict) -> dict:
         num += float(nc) * nw
         den += nw
     out["vw_cost_vs_open_bps"] = round(num / den, 2) if den else (pc if pc is not None else nc)
+    out["vw_cost_weight_usd"] = round(den, 2)
     out["n_remaining_unread"] = int(new.get("n_remaining_unread", 0) or 0)
     rs = dict(prev.get("reference_sources") or {})
     for k, v in (new.get("reference_sources") or {}).items():
@@ -1228,6 +1307,9 @@ def _days_between_iso(a: str, b: str) -> int:
 
 
 ORPHAN_MAX_AGE_DAYS = 7
+# Today's official opens for the auction rows are fetched from yfinance at
+# finalize time (the panel ends at the prior session). Tests disable it.
+FETCH_TODAY_OPENS = os.environ.get("AUCTION_FETCH_TODAY_OPENS", "1") != "0"
 
 
 def _finalize_auction_if_any(mc: ModelConfig, state: dict, journal, logger,
@@ -1243,7 +1325,32 @@ def _finalize_auction_if_any(mc: ModelConfig, state: dict, journal, logger,
     st = state.get("auction_stage") or {}
     pending = st.get("pending") or []
     orphans = st.get("orphans") or []
+    changed = False
+    if st.get("date") == session_iso and st.get("outcome") == "submitting" and _after_open_et():
+        # The stage died mid-submission: adopt whatever the venue holds under
+        # today's client_order_id prefix, then treat the record as submitted
+        # (review round 5).
+        try:
+            from core.orders import recover_unpersisted_auction_orders
+            known = {p.get("order_id") for p in pending}
+            extra = recover_unpersisted_auction_orders(mc, session_iso, known, logger)
+        except Exception as e:
+            logger.error(f"  auction recovery failed: {e}")
+            extra = []
+        pending = list(pending) + list(extra)
+        st["pending"] = pending
+        st["n_submitted"] = len(pending)
+        st["submitted_notional_usd"] = round(sum(float(p.get("notional_est") or 0) for p in pending), 2)
+        st["outcome"] = "submitted" if pending else "skipped:nothing_submitted"
+        st["recovered_from_submitting"] = True
+        st["n_recovered"] = len(extra)
+        logger.error(f"  auction stage record was 'submitting' (run died mid-loop): "
+                     f"{len(pending)} order(s) adopted ({len(extra)} recovered from the venue)")
+        changed = True
     if not pending and not orphans:
+        if changed:
+            state["auction_stage"] = st
+            _save_state_merged(state, mc)
         return
     try:
         from core.orders import finalize_auction_orders
@@ -1251,7 +1358,6 @@ def _finalize_auction_if_any(mc: ModelConfig, state: dict, journal, logger,
         logger.error(f"  auction finalize unavailable: {e}")
         return
     panel_open = _panel_open_today(stock_data, session_iso)
-    changed = False
     if orphans:
         keep, dropped = [], []
         for o in orphans:
@@ -1281,6 +1387,14 @@ def _finalize_auction_if_any(mc: ModelConfig, state: dict, journal, logger,
         if st.get("date") == session_iso and not _after_open_et():
             logger.info("  auction orders pending; finalize deferred until after the open")
         else:
+            if st.get("date") == session_iso and FETCH_TODAY_OPENS:
+                # The 09:35 panel ends at the prior session (yfinance `end`
+                # is exclusive), so fetch today's bar for the pending names
+                # only (review round 5). Best-effort; the IEX snapshot
+                # remains the fallback inside finalize.
+                missing = sorted({p.get("symbol") for p in pending if p.get("symbol")} - set(panel_open))
+                if missing:
+                    panel_open.update(_fetch_today_opens(missing, session_iso, logger))
             try:
                 stats = finalize_auction_orders(mc, pending, journal, logger, panel_open=panel_open)
                 new_summary = {k: v for k, v in stats.items() if k != "remaining"}
@@ -1300,6 +1414,13 @@ def _finalize_auction_if_any(mc: ModelConfig, state: dict, journal, logger,
                 st["pending"] = list(stats.get("remaining") or [])
                 st.pop("summary_error", None)
                 report.set("auction_fills", st["summary"])
+                if (not (prev_summary and int(prev_summary.get("n", 0) or 0) > 0)
+                        and st.get("completed_at") and int(stats.get("n", 0) or 0) > 0):
+                    # First real measurement AFTER the completion already
+                    # ran (09:35 finalize failed): repair the completed
+                    # run's merged reconciliation so the protocol's
+                    # fill-rate criterion sees the whole rebalance.
+                    _repair_history_reconciliation(state, st, session_iso, logger)
             except Exception as e:
                 # Keep the list AND any earlier summary intact for the next
                 # attempt (round 3/4).
@@ -1311,6 +1432,49 @@ def _finalize_auction_if_any(mc: ModelConfig, state: dict, journal, logger,
         _save_state_merged(state, mc)
 
 
+def _fetch_today_opens(symbols: list, session_iso: str, logger) -> dict:
+    """Today's official open for a few symbols from yfinance (daily bar of
+    the current session). Best-effort: {} on any failure or when the bar
+    returned is not dated today."""
+    out: dict = {}
+    if not symbols:
+        return out
+    try:
+        import yfinance as yf
+        from datetime import date, timedelta
+        start = session_iso
+        end = (date.fromisoformat(session_iso) + timedelta(days=1)).isoformat()
+        df = yf.download(sorted(symbols), start=start, end=end, interval="1d",
+                         progress=False, threads=False, group_by="ticker", auto_adjust=False)
+        if df is None or len(df) == 0:
+            return out
+        for sym in symbols:
+            try:
+                col = df[sym]["Open"] if len(symbols) > 1 else df["Open"]
+                col = col.dropna()
+                if len(col) and str(col.index[-1])[:10] == session_iso and float(col.iloc[-1]) > 0:
+                    out[sym] = float(col.iloc[-1])
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"  today's opens fetch failed (non-fatal): {e}")
+    return out
+
+
+def _repair_history_reconciliation(state: dict, st: dict, session_iso: str, logger) -> None:
+    """Re-run the auction merge onto the history entry of today's completed
+    run (matched by auction_run_id) once a real auction summary exists."""
+    try:
+        rid = st.get("run_id")
+        for h in reversed(state.get("history") or []):
+            if rid and h.get("auction_run_id") == rid and isinstance(h.get("result"), dict):
+                _merge_auction_into_result(h["result"], st, session_iso)
+                logger.info("  repaired the completed run's reconciliation with the auction leg")
+                return
+    except Exception as e:
+        logger.warning(f"  history reconciliation repair failed: {e}")
+
+
 def _run_plan_only_slots(models: list, logger, *, dry_run: bool, force: bool,
                          top_n: int, horizon: int, reason: str) -> list[str]:
     """The shared data phase failed on a MAIN run: any slot holding TODAY's
@@ -1319,6 +1483,9 @@ def _run_plan_only_slots(models: list, logger, *, dry_run: bool, force: bool,
     panel is needed (review round 4, the one major finding). A slot whose
     completion fails here is flagged for /ready. Returns the names run."""
     import pandas as pd
+    if dry_run:
+        logger.info("plan-only completion skipped: dry run has nothing to complete")
+        return []
     session_iso = _session_iso()
     ran: list[str] = []
     for mc in models:
@@ -1367,6 +1534,16 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
                                           datefmt="%Y-%m-%d %H:%M:%S"))
         logger.addHandler(_h)
         logger.setLevel(logging.INFO)
+    # Capture the pre-check lines so they can be replayed into the run's
+    # log file once it exists (a 'treated as due' decision must be
+    # auditable from the downloadable log — review round 5).
+    _pre_records: list = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            _pre_records.append((record.levelno, record.getMessage()))
+    _cap = _Capture()
+    logger.addHandler(_cap)
     _log_file = None
 
     # -- Discover models ----------------------------------------------------
@@ -1379,6 +1556,7 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
             "No active models found. Set MODEL_V4_ALPACA_KEY/SECRET "
             "(or ALPACA_API_KEY/SECRET) and ensure model files exist."
         )
+        logger.removeHandler(_cap)
         return
 
     if stage == "auction":
@@ -1386,6 +1564,7 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
                   if str(getattr(m, "exec_style", "") or "") == "auction"]
         if not models:
             logger.info("Auction stage: no slot uses exec_style='auction' — nothing to do")
+            logger.removeHandler(_cap)
             return
         # 20 of every 21 sessions no auction slot is due: skip the whole
         # (yfinance) data phase instead of downloading a panel to discover
@@ -1408,6 +1587,7 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
             if not due:
                 logger.info(f"Auction stage: no auction slot is due to rebalance today "
                             f"({[m.name for m in models]}) — data phase skipped")
+                logger.removeHandler(_cap)
                 return
             models = [m for m in models if m.name in due]
         # Time-box: the data phase takes minutes; starting it after 09:20
@@ -1419,10 +1599,14 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
             now_et = datetime.now(ZoneInfo("America/New_York"))
             if not is_auction_window(now_et) or (now_et.hour, now_et.minute) >= (9, 20):
                 logger.warning("Auction stage: outside the 09:00-09:20 ET start window — skipped")
+                logger.removeHandler(_cap)
                 return
         except Exception:
             pass
+    logging.getLogger("pipeline.pre").removeHandler(_cap)
     logger, _log_file = setup_logging("auction" if stage == "auction" else "main")
+    for _lvl, _msg in _pre_records:
+        logger.log(_lvl, f"[pre-check] {_msg}")
     logger.info(f"Active models ({stage}): {[m.name for m in models]}")
 
     # Spec-manifest invariant sweep (2026-08-30): compare the running
@@ -1501,7 +1685,7 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
         raise
 
     # -- Run each model -----------------------------------------------------
-    failures: list[str] = []
+    failures: dict = {}
     for mc in models:
         logger.info(f"\n{'=' * 70}")
         logger.info(f"  Running model: {mc.name.upper()}")
@@ -1515,7 +1699,7 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
             )
         except Exception as e:
             logger.error(f"Model {mc.name} FAILED: {e}\n{traceback.format_exc()}")
-            failures.append(f"{mc.name}: {str(e).splitlines()[0][:200] if str(e) else type(e).__name__}")
+            failures[mc.name] = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
 
     logger.info("\nAll models complete.")
     if failures:
@@ -1523,4 +1707,4 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
         # slot must be LOUD: the dashboard marks the run errored and
         # /ready turns red (review round 4 — an auction stage that failed
         # before submitting used to read as 'success').
-        raise RuntimeError(f"{len(failures)} slot(s) failed: " + "; ".join(failures))
+        raise SlotFailures(failures)

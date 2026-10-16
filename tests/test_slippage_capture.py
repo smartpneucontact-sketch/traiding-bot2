@@ -22,7 +22,7 @@ from dataclasses import fields as dc_fields
 from pathlib import Path
 
 # Must be set before any core.* import — modules resolve DATA_DIR at import time.
-os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="combo_test_data_"))
+os.environ.setdefault("DATA_DIR", os.environ.get("DATA_DIR") or tempfile.mkdtemp(prefix="combo_test_data_"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest

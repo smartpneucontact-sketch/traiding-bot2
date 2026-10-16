@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="combo_test_r4_"))
+os.environ.setdefault("DATA_DIR", os.environ.get("DATA_DIR") or tempfile.mkdtemp(prefix="combo_test_r4_"))
 
 import pandas as pd
 import pytest
@@ -393,9 +393,16 @@ def _wire_runner(monkeypatch, weights, rebalance_result=None, calls=None):
         calls.append({"target_symbols": list(target_symbols), **kw})
         if rebalance_result is not None:
             return dict(rebalance_result)
-        return {"dry_run": False, "auction": {"n_submitted": 2, "n_skipped": 0, "skipped": [],
-                                               "submitted_notional_usd": 1000.0, "run_id": "RID",
-                                               "pending": [{"order_id": "o1", "symbol": "AAA"}]},
+        stale = sorted((kw.get("stale_close") or set()) & set(target_symbols))
+        skipped = [{"symbol": s, "reason": "stale_close"} for s in stale]
+        cb = kw.get("on_submitted")
+        pend = [{"order_id": "o1", "symbol": "AAA", "notional_est": 500.0}]
+        if cb is not None:
+            for e in pend:
+                cb(e, "RID")
+        return {"dry_run": False, "auction": {"n_submitted": 2 - len(stale), "n_skipped": len(skipped),
+                                               "skipped": skipped, "submitted_notional_usd": 1000.0,
+                                               "run_id": "RID", "pending": pend},
                 "run_id": "RID"}
     monkeypatch.setattr(runner_mod, "rebalance_portfolio", fake_rebalance)
     return calls
@@ -454,7 +461,9 @@ def test_stage1_flags_individual_stale_names(tmp_path, monkeypatch):
     panel = _panel([prev2, prev])
     panel["BBB"] = panel["BBB"].iloc[:1]                     # BBB's last bar is two sessions old
     runner_mod.run_single_model(mc, panel, pd.DataFrame(), macro_data={}, stage="auction")
-    assert calls[0]["stale_close"] == {"BBB"} and load_state(mc)["auction_stage"]["n_stale_close"] == 1
+    assert calls[0]["stale_close"] == {"BBB"}
+    st = load_state(mc)["auction_stage"]
+    assert st["n_stale_close"] == 1 and st["n_submitted"] == 1 and st["outcome"] == "submitted"
 
 
 def _plan_state(today, pending=()):
@@ -479,14 +488,20 @@ def test_main_completes_stored_plan_without_any_panel(tmp_path, monkeypatch):
                                                             "orders_notional_usd": 100.0, "filled_notional_usd": 100.0},
                                                    "book": None}}
     calls = _wire_runner(monkeypatch, {"ZZZ": 1.0}, rebalance_result=result)    # a re-plan would pick ZZZ
+    # Production guard levels: without the plan bypass both would abort.
+    monkeypatch.setattr(runner_mod, "MIN_STOCKS_REQUIRED", 400)
+    monkeypatch.setattr(runner_mod, "MIN_MACRO_FEATURES", 15)
     monkeypatch.setattr(runner_mod, "_after_open_et", lambda: True)
-    save_state(_plan_state(today), mc)
+    st0 = _plan_state(today)
+    st0["data_guard_aborts"] = 3                 # a running outage alarm must survive the plan-only completion
+    save_state(st0, mc)
     runner_mod.run_single_model(mc, {}, pd.DataFrame(), macro_data={}, stage="main")
     assert len(calls) == 1 and calls[0]["run_id"] == "RID" and calls[0]["target_symbols"] == ["AAA", "BBB"]
     assert calls[0]["target_weights"] == {"AAA": 0.6, "BBB": 0.4} and not calls[0].get("auction")
     st = load_state(mc)
     assert st["auction_stage"]["completed_at"] and str(st["last_rebalance"])[:10] == datetime.now().strftime("%Y-%m-%d")
-    assert "auction_completion_deferred" not in st
+    assert "auction_completion_deferred" not in st and st["data_guard_aborts"] == 3
+    assert st["history"][-1]["auction_run_id"] == "RID"
     assert st["history"][-1]["regime_exposure"] == pytest.approx(0.7)
     assert st["history"][-1]["strategy_diagnostics"]["exposure_multiplier"] == 0.7
     assert st["history"][-1]["result"]["reconciliation"]["auction"]["n"] == 2
@@ -596,7 +611,7 @@ def test_auction_stage_no_op_creates_no_log_file_and_respects_cutoff(tmp_path, m
     save_state({"last_rebalance": None}, a)
     _fake_clock(monkeypatch, 9, 21)
     runner_mod.run_pipeline(stage="auction")
-    assert fetched == [1]
+    assert fetched == [1] and names == ["auction"]          # no log file for the late fire either
 
 
 # ───────────────────────── dashboard ─────────────────────────────────────
@@ -711,18 +726,26 @@ def test_ready_auction_alarms(tmp_path, monkeypatch):
     monkeypatch.setitem(dashboard.bot_status, "last_run_at", (now - timedelta(hours=1)).isoformat())
     r = c.get("/ready")
     assert r.status_code == 503 and any("auction stage errored" in p for p in r.get_json()["problems"])
-    # (b) a later successful main run demotes it to a warning
+    # (b) a later successful FULL main run demotes it to a warning (a
+    # single-slot run does not — round 5)
     monkeypatch.setitem(dashboard.bot_status, "last_run_at", (now + timedelta(minutes=1)).isoformat())
     r = c.get("/ready")
-    assert r.status_code == 200 and any("auction stage errored" in w for w in r.get_json()["warnings"])
-    # (c) a stage skipped today while an auction slot was due (last_rebalance None) -> 503
-    monkeypatch.setitem(dashboard.bot_status, "auction_last_run_status", "skipped")
-    monkeypatch.setitem(dashboard.bot_status, "last_run_at", (now - timedelta(hours=1)).isoformat())
+    assert r.status_code == 503
+    monkeypatch.setitem(dashboard.bot_status, "last_full_run_at", (now + timedelta(minutes=1)).isoformat())
     r = c.get("/ready")
-    assert r.status_code == 503 and any("auction stage skipped" in p for p in r.get_json()["problems"])
-    # (d) same, but no slot was due -> warning only
+    assert r.status_code == 200 and any("auction stage errored" in w for w in r.get_json()["warnings"])
+    monkeypatch.delitem(dashboard.bot_status, "last_full_run_at", raising=False)
+    # (c) a stage skipped today while an auction slot was due (recorded at skip time) -> 503,
+    #     even though the slot has since been rebalanced the other way
+    monkeypatch.setitem(dashboard.bot_status, "auction_last_run_status", "skipped")
+    monkeypatch.setitem(dashboard.bot_status, "auction_skipped_due", ["combo_v2_process"])
+    monkeypatch.setitem(dashboard.bot_status, "last_run_at", (now - timedelta(hours=1)).isoformat())
     monkeypatch.setattr(dashboard, "_load_model_state",
                         lambda name: {"last_rebalance": datetime.now().isoformat()})
+    r = c.get("/ready")
+    assert r.status_code == 503 and any("measurement day lost" in p for p in r.get_json()["problems"])
+    # (d) same, but no slot was due at skip time -> warning only
+    monkeypatch.setitem(dashboard.bot_status, "auction_skipped_due", [])
     r = c.get("/ready")
     assert r.status_code == 200 and any("no auction slot was due" in w for w in r.get_json()["warnings"])
     # (e) ET session date: a stamp from 02:00 UTC today is YESTERDAY evening in New York -> ignored
@@ -746,11 +769,12 @@ def test_run_endpoint_refuses_manual_runs_in_the_submission_window_when_due(tmp_
     monkeypatch.setattr("core.market.is_auction_window", lambda now=None: True)
     monkeypatch.setattr(dashboard, "_load_model_state", lambda name: {"last_rebalance": None})
     assert dashboard._auction_window_block_reason(dry=False)
-    assert dashboard._auction_window_block_reason(dry=True) is None
-    monkeypatch.setattr(dashboard, "_load_model_state",
-                        lambda name: {"last_rebalance": None,
-                                      "auction_stage": {"date": _today_ny(), "outcome": "submitted"}})
-    assert dashboard._auction_window_block_reason(dry=False) is None     # already submitted
+    assert dashboard._auction_window_block_reason(dry=True)              # dry runs hold the guard too (round 5)
+    for outcome in ("submitted", "skipped:stale_panel", "skipped:nothing_submitted"):
+        monkeypatch.setattr(dashboard, "_load_model_state",
+                            lambda name, o=outcome: {"last_rebalance": None,
+                                                     "auction_stage": {"date": _today_ny(), "outcome": o}})
+        assert dashboard._auction_window_block_reason(dry=False) is None  # the stage already ran today
     monkeypatch.setattr("core.market.is_auction_window", lambda now=None: False)
     monkeypatch.setattr(dashboard, "_load_model_state", lambda name: {"last_rebalance": None})
     assert dashboard._auction_window_block_reason(dry=False) is None     # outside the window

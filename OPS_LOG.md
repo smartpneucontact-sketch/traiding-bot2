@@ -386,3 +386,48 @@ a log file on no-op mornings. Fixed, all with regression tests (322 total):
   mocks now mirror the client (rejected POST raises; poll never raises).
 Calendar label for Dec 28 corrected (21st weekday after Nov 27; no
 holiday skip involved).
+
+## 2026-10-16 (early) — Auction execution: review round 5 (19 agents, 27 confirmed / 8 refuted + 4 gaps) fixed
+
+Two findings mattered beyond the auction path:
+- The rebalance result never carried the account equity, so the realized
+  shortfall / sticky funding-floor logic shipped on 2026-10-15 was DEAD
+  in production (_shortfall_from_result returned nothing) — and the
+  one-time reconciliation the gated slots were about to run at the next
+  daily pass would have been a no-op. rebalance_portfolio now writes
+  portfolio_value into its result. (The Sep 29 history entries still lack
+  it; the reconciliation falls back to the book's achieved_leverage if
+  the Oct 16 gate pass shows it did not apply — verify.)
+- A container restart straddling 09:35 ET silently lost the day's main
+  run (the in-memory job store computes the next fire from boot; misfire
+  grace never applied). Boot-time catch-up now re-fires a missed main
+  run (09:35-15:45 ET, any slot without a main run today or with an open
+  auction plan) and a missed auction stage (09:06-09:19 ET, a due slot
+  with no stage record); /ready flags a plan not completed by 10:00 ET.
+
+Auction path: the stage writes a provisional 'submitting' record before
+the first POST and persists every accepted order as it is submitted; a
+run that died mid-loop is never resubmitted and the 09:35 run adopts
+whatever the venue holds under today's client_order_id prefix; LOO buys
+are sized at the limit price so reserved buying power never exceeds the
+allocation; dot-form exits (BRK.B) match the stale-close and panel-open
+lookups; after a cancel only a TERMINAL state is journaled (anything
+else stays pending with cancel_sent); the vw cost is merged across
+finalize passes by the dollars it was measured over; the journal never
+glues a row onto a truncated line and the dedupe scan recovers ids from
+one; an unmeasured auction leg sets the merged fill rate to NA (the
+protocol's K3a must not read the completion's ~100%), and a later first
+measurement repairs the completed run's history entry; the deferred-
+completion branch wins over 'market closed' for a pre-open manual run;
+dry runs never drive the data-guard outage counter; today's official
+opens for the auction rows are fetched for the pending names (the 09:35
+panel ends at the prior session); pre-check decisions are replayed into
+the run's log file; per-slot failures raise a typed SlotFailures and the
+dashboard marks only the failed slot. Dashboard: the auction stage waits
+for a concurrent manual/dry run until its 09:20 start cutoff instead of
+yielding; due-ness is recorded at skip time; only a full-slot main run
+can "recover" an errored/skipped stage; manual runs — dry included — are
+refused in the 09:00-09:27 window while an auction slot is due and the
+stage has not run; the stale-name count reports target names only.
+Tests: 346 (session conftest makes the suite runnable under bare pytest
+and cleans its temp dir).

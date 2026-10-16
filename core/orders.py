@@ -474,17 +474,21 @@ def liquidate_all_positions(
     return result
 
 
-def _auction_qty(order: dict, prev_close: float) -> float:
+def _auction_qty(order: dict, prev_close: float, buy_limit_mult: float = 1.0) -> float:
     """Whole-share quantity for an opening-auction order (opg orders cannot
     be fractional/notional). Full exits sell the whole-share part of the
-    position; trims and buys floor notional / prev_close; sells never
-    exceed the held quantity."""
+    position; trims floor notional / prev_close; BUYS floor notional over
+    the LIMIT price (prev_close x buy_limit_mult) so the venue's reserved
+    buying power (qty x limit) never exceeds the allocation — the
+    pre-flight scales buys to exactly the buying power (review round 5);
+    sells never exceed the held quantity."""
     import math
     if prev_close <= 0:
         return 0.0
     if order["action"] == "sell":
         return float(math.floor(float(order["qty"])))
-    qty = math.floor(float(order["notional"]) / prev_close)
+    px = prev_close * (buy_limit_mult if order["side"] == "buy" else 1.0)
+    qty = math.floor(float(order["notional"]) / px)
     if order["side"] == "sell" and order.get("held_qty") is not None:
         qty = min(qty, math.floor(float(order["held_qty"])))
     return float(max(qty, 0))
@@ -503,7 +507,8 @@ def _auction_client_order_id(run_id: str, sym: str) -> str:
 def submit_auction_orders(orders: list[dict], mc: "ModelConfig",
                           last_close: dict, logger, rb_data: dict,
                           run_id: str | None = None,
-                          stale_close: set | None = None) -> dict:
+                          stale_close: set | None = None,
+                          on_submitted=None) -> dict:
     """Stage 1 of exec_style="auction": submit every planned order for the
     opening auction (time_in_force "opg", whole shares).
 
@@ -531,7 +536,8 @@ def submit_auction_orders(orders: list[dict], mc: "ModelConfig",
         sym = order["symbol"]
         lc = last_close or {}
         prev_close = lc.get(sym) or lc.get(sym.replace(".", "-")) or lc.get(_to_alpaca_symbol(sym))
-        if stale_close and (sym in stale_close or _to_alpaca_symbol(sym) in stale_close):
+        if stale_close and (sym in stale_close or sym.replace(".", "-") in stale_close
+                            or _to_alpaca_symbol(sym) in stale_close):
             # The panel's last bar for this name is not the prior session's
             # close: an LOO limit / fill-rate anchor off a two-session-old
             # price is wrong by the overnight gap (review round 4). The
@@ -541,7 +547,7 @@ def submit_auction_orders(orders: list[dict], mc: "ModelConfig",
         if not prev_close or float(prev_close) <= 0:
             skipped.append({"symbol": sym, "reason": "no_prev_close"})
             continue
-        qty = _auction_qty(order, float(prev_close))
+        qty = _auction_qty(order, float(prev_close), buy_limit_mult=1.0 + buffer / 1e4)
         if qty <= 0:
             skipped.append({"symbol": sym, "reason": "sub_share",
                             "notional": round(float(order.get("notional", 0) or 0), 2)})
@@ -607,6 +613,14 @@ def submit_auction_orders(orders: list[dict], mc: "ModelConfig",
                         f"{'MOO' if lp is None else 'LOO @' + str(lp)} "
                         f"(prev close {float(prev_close):.2f}) "
                         f"[{order.get('trade_action')}] id={resp.get('id')}")
+            if on_submitted is not None:
+                # Persist each live order as soon as the venue has it: a
+                # process death mid-loop must never leave opg orders the
+                # bot does not know about (review round 5).
+                try:
+                    on_submitted(pending[-1], run_id)
+                except Exception as e:
+                    logger.warning(f"    AUCTION {sym}: persist callback failed: {e}")
         except Exception as e:
             skipped.append({"symbol": sym, "reason": f"error:{e}"})
             logger.error(f"    AUCTION {sym}: submit failed: {e}")
@@ -626,6 +640,59 @@ def submit_auction_orders(orders: list[dict], mc: "ModelConfig",
 _AUCTION_OPEN_STATES = ("new", "accepted", "partially_filled", "pending_new",
                         "accepted_for_bidding", "held", "pending_cancel",
                         "pending_replace")
+# States in which an opg order will never change again (journal it).
+_AUCTION_TERMINAL_STATES = ("filled", "canceled", "expired", "rejected",
+                            "suspended", "replaced", "done_for_day",
+                            "not_found", "stopped", "calculated")
+
+
+def recover_unpersisted_auction_orders(mc: "ModelConfig", session_iso: str,
+                                       known_ids: set[str], logger) -> list[dict]:
+    """Orders POSTed by today's auction stage whose record was lost (process
+    death between the POST and the state save): every auction order carries
+    a client_order_id starting with "a<YYYYMMDD>_", so the venue's own
+    order list is the source of truth (review round 5). Returns pending
+    entries for the unknown ones (prev_close unknown -> derived from the
+    limit price for buys, None for sells)."""
+    try:
+        from datetime import date
+        day = session_iso.replace("-", "")
+        after = f"{session_iso}T08:00:00-04:00"
+        orders = alpaca_request(
+            "GET", f"v2/orders?status=all&limit=500&direction=asc&after={after}",
+            mc, logger=logger) or []
+    except Exception as e:
+        logger.warning(f"  auction recovery: order list unavailable: {e}")
+        return []
+    found: list[dict] = []
+    for o in orders if isinstance(orders, list) else []:
+        try:
+            coid = str(o.get("client_order_id") or "")
+            if not coid.startswith(f"a{day}_") or str(o.get("time_in_force") or "") != "opg":
+                continue
+            if o.get("id") in known_ids:
+                continue
+            lp = float(o["limit_price"]) if o.get("limit_price") else None
+            side = str(o.get("side") or "buy")
+            qty = float(o.get("qty") or 0)
+            prev_close = round(lp / 1.01, 4) if (lp and side == "buy") else None
+            found.append({
+                "symbol": str(o.get("symbol") or "").replace(".", "-"), "side": side,
+                "trade_action": "recovered", "order_type": str(o.get("type") or "limit"),
+                "qty": qty, "limit_price": lp, "prev_close": prev_close,
+                "notional_est": round(qty * prev_close, 2) if prev_close else 0.0,
+                "order_id": o.get("id"), "order_status": str(o.get("status") or "unknown"),
+                "client_order_id": coid, "recovered": True,
+                "submitted_at": str(o.get("submitted_at") or o.get("created_at")
+                                    or f"{session_iso}T13:06:00+00:00"),
+                "run_id": None,
+            })
+        except Exception:
+            continue
+    if found:
+        logger.warning(f"  auction recovery: {len(found)} live opg order(s) found at the venue "
+                       f"that the stage never persisted — adopted as pending")
+    return found
 
 
 def _existing_auction_trade_ids(journal: "TradeJournal", prefix: str) -> set[str]:
@@ -644,11 +711,14 @@ def _existing_auction_trade_ids(journal: "TradeJournal", prefix: str) -> set[str
                     continue
                 try:
                     rec = json.loads(line)
+                    tids = [str(rec.get("trade_id") or "")]
                 except Exception:
-                    continue
-                tid = str(rec.get("trade_id") or "")
-                if tid.startswith(prefix):
-                    ids.add(tid)
+                    # A glued/truncated physical line: recover every id on it.
+                    import re
+                    tids = re.findall(r'"trade_id":\s*"([^"]+)"', line)
+                for tid in tids:
+                    if tid.startswith(prefix):
+                        ids.add(tid)
     except Exception:
         pass
     return ids
@@ -718,8 +788,8 @@ def finalize_auction_orders(mc: "ModelConfig", pending: list[dict],
             ref = None
             src = "none"
             if not late:
-                po = (panel_open or {}).get(sym)
-                snap = snapshots.get(sym) or {}
+                po = (panel_open or {}).get(sym) or (panel_open or {}).get(sym.replace(".", "-"))
+                snap = snapshots.get(sym) or snapshots.get(sym.replace(".", "-")) or {}
                 bar_date = snap.get("day_bar_date")
                 if po and float(po) > 0:
                     ref, src = float(po), "panel"
@@ -771,22 +841,30 @@ def finalize_auction_orders(mc: "ModelConfig", pending: list[dict],
                 logger.warning(f"  auction finalize: {sym} ({p['order_id']}) "
                                f"unreadable — kept pending for retry")
                 continue
-            cancelled_here = 0
+            cancelled_here = 1 if p.get("cancel_sent") else 0
             if status in _AUCTION_OPEN_STATES:
                 # Still open: cancel and re-read the FINAL state.
                 trade.order_status = status
                 final = _cancel_order_and_get_final(trade, mc, logger) or {}
                 fstatus = str(final.get("status") or "unknown")
-                if fstatus == "unknown":
-                    # Cancel sent but the final read failed: a partial fill
-                    # may exist — keep pending, never journal a guess
-                    # (review round 4).
+                if fstatus not in _AUCTION_TERMINAL_STATES:
+                    # Cancel sent but no TERMINAL state read back (failed
+                    # read, or still partially_filled/pending_cancel): a
+                    # partial fill may exist — keep pending, never journal
+                    # a non-final row (review rounds 4-5).
+                    p["cancel_sent"] = True
                     remaining.append(p)
-                    logger.warning(f"  auction finalize: {sym} cancelled but final state "
-                                   f"unreadable — kept pending for retry")
+                    logger.warning(f"  auction finalize: {sym} cancel sent but state "
+                                   f"{fstatus!r} is not terminal — kept pending for retry")
                     continue
                 state, status = final, fstatus
                 cancelled_here = 1
+            elif status not in _AUCTION_TERMINAL_STATES:
+                # Neither open nor terminal (a venue state we do not model):
+                # retry later rather than journal a guess.
+                remaining.append(p)
+                logger.warning(f"  auction finalize: {sym} state {status!r} unmodelled — kept pending")
+                continue
             _apply_order_fill(trade, state)
             trade.order_status = status
             if status == "filled" and not trade.fill_price and state.get("filled_avg_price"):
@@ -845,6 +923,9 @@ def finalize_auction_orders(mc: "ModelConfig", pending: list[dict],
         "filled_notional_anchor_usd": round(filled_anchor, 2),
         "filled_notional_usd": round(filled_notional, 2),
         "vw_cost_vs_open_bps": round(cost_num / cost_den, 2) if cost_den else None,
+        # The dollars the vw cost is weighted over (rows WITH a reference),
+        # so a retry pass can be merged with the right weight (round 5).
+        "vw_cost_weight_usd": round(cost_den, 2),
         "reference_sources": ref_src,
     }
     logger.info(f"  AUCTION fills: {n_filled}/{len(pending)} filled "
@@ -868,6 +949,7 @@ def rebalance_portfolio(
     last_close: dict | None = None,
     run_id: str | None = None,
     stale_close: set | None = None,
+    on_submitted=None,
 ):
     """Rebalance the live portfolio to match `target_symbols` (+ optional
     conviction weights), placing Alpaca orders and logging each trade.
@@ -900,6 +982,10 @@ def rebalance_portfolio(
     acct = get_account(mc, logger, report)
     portfolio_value = float(acct["portfolio_value"])
     cash_available = float(acct["cash"])
+    # The gate-state shortfall derivation (core/gate_update.py
+    # _shortfall_from_result) divides the achieved gross by THIS equity;
+    # it was never written into the result before (review round 5).
+    rb_data["portfolio_value"] = round(portfolio_value, 2)
     current_positions = get_positions(mc, logger)
     rb_data["positions_before"] = len(current_positions)
 
@@ -1148,7 +1234,8 @@ def rebalance_portfolio(
     # and return; the 09:35 run finalizes fills and completes shortfalls.
     if auction:
         submit_auction_orders(orders, mc, last_close or {}, logger, rb_data,
-                              run_id=run_id, stale_close=stale_close)
+                              run_id=run_id, stale_close=stale_close,
+                              on_submitted=on_submitted)
         rb_data["n_orders_planned"] = len(orders)
         rb_data["run_id"] = run_id
         report.end_step("rebalance")

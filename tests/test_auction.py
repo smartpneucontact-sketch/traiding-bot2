@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="combo_test_data_"))
+os.environ.setdefault("DATA_DIR", os.environ.get("DATA_DIR") or tempfile.mkdtemp(prefix="combo_test_data_"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
@@ -143,8 +143,10 @@ def test_auction_uses_official_close_moo_sells_loo_buys(tmp_path, monkeypatch):
     assert {k: v for k, v in by["AAA"].items() if k != "client_order_id"} == {
         "symbol": "AAA", "side": "sell", "type": "market", "qty": "10", "time_in_force": "opg"}
     assert by["CCC"]["type"] == "market" and by["CCC"]["qty"] == "25"
-    # Buys are LIMIT-on-open at last_close + 100bp (not the snapshot's 1.0).
-    assert by["BBB"]["type"] == "limit" and by["BBB"]["qty"] == "100"
+    # Buys are LIMIT-on-open at last_close + 100bp (not the snapshot's 1.0),
+    # sized at the LIMIT price so qty x limit never exceeds the allocation
+    # (10,000 / 101 -> 99 shares; review round 5).
+    assert by["BBB"]["type"] == "limit" and by["BBB"]["qty"] == "99"
     assert by["BBB"]["limit_price"] == pytest.approx(101.0)
     assert "DDD" not in by and "EEE" not in by
     a = rb["auction"]
@@ -367,7 +369,8 @@ def test_dashboard_auction_stage_keeps_main_run_fields(monkeypatch):
 # ───────────── review round 2 regressions ───────────────────────────────
 
 def test_finalize_keeps_unreadable_orders_pending(tmp_path, monkeypatch):
-    monkeypatch.setattr(orders_mod.time, "sleep", lambda s: None)
+    sleeps = []
+    monkeypatch.setattr(orders_mod.time, "sleep", lambda s: sleeps.append(s))
     """A failed read must never cancel or journal an order: it stays pending."""
     polls = []
 
@@ -393,6 +396,7 @@ def test_finalize_keeps_unreadable_orders_pending(tmp_path, monkeypatch):
     assert [p["order_id"] for p in stats["remaining"]] == ["o2"]
     assert not deletes and [r.symbol for r in journal.records] == ["AAA"]
     assert polls.count("o2") == 3                                   # three polled reads, then kept pending
+    assert sleeps == [1.5, 3.0]                                     # no sleep after the last attempt
     assert journal.records[0].trade_id.endswith("_20261028_buy_AAA")
 
 

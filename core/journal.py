@@ -208,7 +208,20 @@ class TradeJournal:
                 pass
         data = asdict(record)
         with self._lock_for(self.model_name):
+            # A crash mid-append can leave a last line without its newline;
+            # the next row must not be glued onto it (review round 5).
+            try:
+                if self.jsonl_path.exists() and self.jsonl_path.stat().st_size > 0:
+                    with open(self.jsonl_path, "rb") as fb:
+                        fb.seek(-1, 2)
+                        needs_nl = fb.read(1) != b"\n"
+                else:
+                    needs_nl = False
+            except Exception:
+                needs_nl = False
             with open(self.jsonl_path, "a") as f:
+                if needs_nl:
+                    f.write("\n")
                 f.write(json.dumps(data, default=str) + "\n")
 
             self._roll_csv_if_schema_changed(list(data.keys()))

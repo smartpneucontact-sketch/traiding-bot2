@@ -34,6 +34,7 @@ import yfinance as yf
 from flask import Flask, jsonify, Response, request as flask_request
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 import pipeline
 
@@ -635,25 +636,49 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
             from zoneinfo import ZoneInfo
             _now_et = datetime.now(ZoneInfo("America/New_York"))
             _before_cutoff = (_now_et.hour, _now_et.minute) < (15, 30)
+            _before_stage_cutoff = (_now_et.hour, _now_et.minute) < (9, 20)
         except Exception:
             _before_cutoff = waited < 900
+            _before_stage_cutoff = waited < 600
         if stage == "main" and running_stage == "auction" and _before_cutoff:
+            time.sleep(15); waited += 15
+            continue
+        if stage == "auction" and _before_stage_cutoff:
+            # A manual/dry run holding the guard at 09:06 must not turn a
+            # pre-registered auction rebalance into a marketable-limit one:
+            # wait for it until the stage's own 09:20 start cutoff (review
+            # round 5), then record the skip below.
             time.sleep(15); waited += 15
             continue
         logging.getLogger("dashboard").warning(
             f"Pipeline already running ({running_stage}), skipping {stage} run")
+        due_slots: list[str] = []
+        if stage != "main":
+            # Due-ness is recorded AT SKIP TIME: a later rebalance via the
+            # non-auction path makes it unrecoverable (review round 5).
+            try:
+                from core.state import should_rebalance
+                for mc in pipeline.get_active_models():
+                    if str(getattr(mc, "exec_style", "") or "") != "auction":
+                        continue
+                    st = _load_model_state(mc.name) or {}
+                    stg = st.get("auction_stage") or {}
+                    if stg.get("date") == _et_today_iso() and stg.get("outcome"):
+                        continue
+                    if should_rebalance(st, horizon_days=_rebalance_horizon()):
+                        due_slots.append(mc.name)
+            except Exception:
+                due_slots = ["unknown"]
         with status_lock:
             if stage == "main":
                 bot_status["skipped_main_run_at"] = _utc_now_iso()
                 bot_status["skipped_main_run_blocker"] = running_stage
             else:
-                # The pre-open stage yielded to a manual/dry run: on a due
-                # day that silently turns an AUCTION1 measurement rebalance
-                # into a marketable-limit one — leave a trace for /ready
-                # (review round 4).
                 bot_status["auction_last_run_at"] = _utc_now_iso()
                 bot_status["auction_last_run_status"] = "skipped"
-                bot_status["auction_last_error"] = f"skipped: {running_stage} run in progress"
+                bot_status["auction_last_error"] = (f"skipped: {running_stage} run in progress"
+                                                    + (f"; due: {due_slots}" if due_slots else ""))
+                bot_status["auction_skipped_due"] = due_slots
         return
 
     start_time = time.time()
@@ -688,6 +713,9 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
             if model_filter is None:
                 bot_status.pop("skipped_main_run_at", None)
                 bot_status.pop("skipped_main_run_blocker", None)
+                # Only a run that covered every slot can "recover" an
+                # errored/skipped auction stage in /ready (round 5).
+                bot_status["last_full_run_at"] = _utc_now_iso()
 
             targets = [model_filter] if model_filter else list(bot_status["models"].keys())
             for mn in targets:
@@ -726,11 +754,33 @@ def run_trading_pipeline(force=False, model_filter=None, stage="main"):
             bot_status["current_step"] = None
             bot_status["total_runs"] += 1
 
+            failed = getattr(e, "failed", None)
+            failed = set(failed) if isinstance(failed, dict) else None
             targets = [model_filter] if model_filter else list(bot_status["models"].keys())
             for mn in targets:
-                if mn in bot_status["models"]:
-                    bot_status["models"][mn]["state"] = "error"
-                    bot_status["models"][mn]["last_run_status"] = "error"
+                if mn not in bot_status["models"]:
+                    continue
+                if failed is not None and mn not in failed:
+                    # core.runner.SlotFailures: this slot ran fine — refresh
+                    # it like a success so its badge/run_count stay honest
+                    # (review round 5). The run itself still reads errored.
+                    try:
+                        state = _load_model_state(mn)
+                    except Exception:
+                        state = {}
+                    bot_status["models"][mn].update({
+                        "state": "idle",
+                        "run_count": state.get("run_count", 0),
+                        "last_run_status": "success",
+                        "last_run_at": _utc_now_iso(),
+                        "last_run_duration": round(elapsed, 1),
+                    })
+                    continue
+                bot_status["models"][mn]["state"] = "error"
+                bot_status["models"][mn]["last_run_status"] = "error"
+            if failed is not None and model_filter is None:
+                # The other slots DID complete a full pass.
+                bot_status["last_full_run_at"] = _utc_now_iso()
 
         logging.getLogger("dashboard").error(f"Pipeline failed: {full_error}")
 
@@ -911,6 +961,53 @@ def _et_today_iso() -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
 
+def _boot_catchup_plan(now_et, slot_states: dict, auction_slots: set) -> dict:
+    """Which missed cron fires to replay right after boot (pure function).
+
+    main: a trading day, 09:35 <= now < 15:45 ET, and some active slot has
+    not run today (its persisted last_run is not dated today in New York)
+    or holds today's submitted auction plan without a completion.
+    auction: a trading day, 09:06 <= now < 09:19 ET, an auction slot is
+    due and has no stage record for today."""
+    plan = {"main": False, "auction": False, "reasons": []}
+    try:
+        from core.market import US_MARKET_HOLIDAYS
+        from core.state import should_rebalance
+        today = now_et.strftime("%Y-%m-%d")
+        if now_et.weekday() >= 5 or today in US_MARKET_HOLIDAYS:
+            return plan
+        hm = (now_et.hour, now_et.minute)
+        if (9, 35) <= hm < (15, 45):
+            for name, st in slot_states.items():
+                lr = st.get("last_run")
+                ran_today = bool(lr) and _stamp_et_date(lr) == today
+                stg = st.get("auction_stage") or {}
+                open_plan = (stg.get("date") == today
+                             and stg.get("outcome") in ("submitted", "submitting")
+                             and (int(stg.get("n_submitted", 0) or 0) > 0 or stg.get("pending"))
+                             and not stg.get("completed_at"))
+                if not ran_today or open_plan:
+                    plan["main"] = True
+                    plan["reasons"].append(f"{name}: " + ("open auction plan" if open_plan
+                                                         else f"no main run today (last_run {lr})"))
+        if (9, 6) <= hm < (9, 19):
+            for name in auction_slots:
+                st = slot_states.get(name) or {}
+                stg = st.get("auction_stage") or {}
+                if stg.get("date") == today and stg.get("outcome"):
+                    continue
+                try:
+                    due = should_rebalance(st, horizon_days=_rebalance_horizon())
+                except Exception:
+                    due = True
+                if due:
+                    plan["auction"] = True
+                    plan["reasons"].append(f"{name}: auction slot due, no stage record today")
+    except Exception as e:
+        plan["reasons"].append(f"check errored: {e}")
+    return plan
+
+
 def _rebalance_horizon() -> int:
     """The runner's rebalance cadence (trading days); the dashboard's
     `pipeline` import is the thin shim, so read it from core.runner."""
@@ -934,13 +1031,12 @@ def _stamp_et_date(stamp) -> str:
 
 
 def _auction_window_block_reason(dry: bool) -> str | None:
-    """Refuse a NON-dry manual run inside the 09:00-09:27 ET submission
+    """Refuse a manual run (dry or not — both hold the run guard for the
+    minutes the data phase takes) inside the 09:00-09:27 ET submission
     window when an auction slot is due today and the pre-open stage has
-    not submitted yet: the manual run would take the run guard and the
-    stage would yield — turning a pre-registered AUCTION1 rebalance into
-    a marketable-limit one (review round 4)."""
-    if dry:
-        return None
+    not run yet: the stage would have to wait or yield, turning a
+    pre-registered AUCTION1 rebalance into a marketable-limit one (review
+    rounds 4-5)."""
     try:
         from core.market import is_auction_window
         from core.state import should_rebalance
@@ -952,12 +1048,12 @@ def _auction_window_block_reason(dry: bool) -> str | None:
                 continue
             st = _load_model_state(mc.name) or {}
             stg = st.get("auction_stage") or {}
-            if stg.get("date") == today and stg.get("outcome") == "submitted":
-                continue
+            if stg.get("date") == today and stg.get("outcome"):
+                continue   # the stage already ran today (one-shot per session)
             if should_rebalance(st, horizon_days=_rebalance_horizon()):
-                return (f"{mc.name} is due for an opening-auction rebalance; manual runs are "
-                        f"refused during the 09:00-09:27 ET submission window (use ?dry, or "
-                        f"wait for the 09:35 main run)")
+                return (f"{mc.name} is due for an opening-auction rebalance; manual runs "
+                        f"(including dry runs) are refused during the 09:00-09:27 ET "
+                        f"submission window — wait for the 09:35 main run")
     except Exception:
         return None
     return None
@@ -2718,17 +2814,20 @@ def trigger_run():
             global bot_status
             with status_lock:
                 bot_status["state"] = "running"
+                bot_status["running_stage"] = "dry"
                 bot_status["current_step"] = "dry run"
             try:
                 pipeline.run_pipeline(dry_run=True, force=True, model_filter=model_filter)
                 with status_lock:
                     bot_status["state"] = "idle"
+                    bot_status["running_stage"] = None
                     bot_status["last_run_at"] = _utc_now_iso()
                     bot_status["last_run_status"] = "success (dry)"
                     bot_status["current_step"] = None
             except Exception as e:
                 with status_lock:
                     bot_status["state"] = "error"
+                    bot_status["running_stage"] = None
                     bot_status["last_error"] = str(e)
                     bot_status["current_step"] = None
         threading.Thread(target=_dry, daemon=True).start()
@@ -3175,6 +3274,22 @@ def ready():
             # live at run time) and never completed by a later main run.
             if _mst.get("auction_completion_deferred") == _et_today_iso():
                 problems.append(f"{mc.name}: auction completion deferred today and not yet completed")
+            # Today's auction plan exists but no main run completed it by
+            # 10:00 ET (a restart straddling 09:35 drops the cron fire —
+            # review round 5).
+            _stg = _mst.get("auction_stage") or {}
+            if (_stg.get("date") == _et_today_iso()
+                    and _stg.get("outcome") in ("submitted", "submitting")
+                    and (int(_stg.get("n_submitted", 0) or 0) > 0 or _stg.get("pending"))
+                    and not _stg.get("completed_at")):
+                try:
+                    from zoneinfo import ZoneInfo
+                    _now_et = datetime.now(ZoneInfo("America/New_York"))
+                    if (_now_et.hour, _now_et.minute) >= (10, 0):
+                        problems.append(f"{mc.name}: auction plan submitted at 09:06 but not "
+                                        f"completed by a main run (restart around 09:35?)")
+                except Exception:
+                    pass
     except Exception:
         pass
     # Spec-manifest invariants: a divergence between the running config and
@@ -3195,28 +3310,27 @@ def ready():
         a_at = bot_status.get("auction_last_run_at")
         a_status = bot_status.get("auction_last_run_status")
         if a_status in ("error", "skipped") and a_at and _stamp_et_date(a_at) == _et_today_iso():
-            m_at = bot_status.get("last_run_at")
-            recovered = (bot_status.get("last_run_status") == "success" and m_at
-                         and str(m_at) > str(a_at))
+            # Recovery means a later main run that covered EVERY slot
+            # (a single-slot manual run proves nothing about the auction
+            # slot — review round 5).
+            m_at = bot_status.get("last_full_run_at")
+            recovered = bool(m_at and str(m_at) > str(a_at))
             msg = f"auction stage {'errored' if a_status == 'error' else 'skipped'} today: " \
                   f"{bot_status.get('auction_last_error')}"
             if a_status == "skipped":
-                # Only a problem when an auction slot was actually due.
-                due = False
-                try:
-                    from core.state import should_rebalance
-                    for mc in pipeline.get_active_models():
-                        if str(getattr(mc, "exec_style", "") or "") != "auction":
-                            continue
-                        if should_rebalance(_load_model_state(mc.name) or {},
-                                            horizon_days=_rebalance_horizon()):
-                            due = True
-                except Exception:
-                    due = True
-                (problems if (due and not recovered) else inv_warnings_extra).append(
-                    msg + ("" if due else " (no auction slot was due)"))
+                # Due-ness was recorded AT SKIP TIME (recomputing it after
+                # the slot was rebalanced the other way would read 'not
+                # due' exactly when the measurement day was lost).
+                due_slots = bot_status.get("auction_skipped_due")
+                if due_slots is None:
+                    due_slots = ["unknown"]
+                if due_slots:
+                    problems.append(msg + f" — due slot(s) {due_slots} were rebalanced via the "
+                                    f"non-auction path (AUCTION1 measurement day lost)")
+                else:
+                    inv_warnings_extra.append(msg + " (no auction slot was due)")
             elif recovered:
-                inv_warnings_extra.append(msg + " (main run succeeded afterwards)")
+                inv_warnings_extra.append(msg + " (full main run succeeded afterwards)")
             else:
                 problems.append(msg)
     except Exception:
@@ -5654,8 +5768,11 @@ if __name__ == "__main__":
         CronTrigger(hour=9, minute=35, day_of_week="mon-fri", timezone=TZ),
         id="trading_pipeline",
         name="Daily ML Trading Pipeline",
-        # Survive a container that was asleep/redeploying at 09:35 ET: still
-        # fire if we come up within the hour, and collapse missed runs into one.
+        # misfire_grace only covers an in-process stall (the scheduler
+        # thread blocked at 09:35): with the in-memory job store a REDEPLOY
+        # computes the next fire time from boot, so a restart straddling
+        # 09:35 would silently lose the day — _boot_catchup_plan below
+        # re-fires the run (review round 5).
         misfire_grace_time=3600,
         coalesce=True,
     )
@@ -5687,6 +5804,32 @@ if __name__ == "__main__":
 
     scheduler.start()
     _scheduler = scheduler  # expose to /api/status for LIVE next-run reads
+
+    # Boot-time catch-up (review round 5): a container that came up after a
+    # cron fire time it missed re-fires the missed stage once.
+    try:
+        from zoneinfo import ZoneInfo
+        _now_et = datetime.now(ZoneInfo("America/New_York"))
+        _models = pipeline.get_active_models()
+        _plan = _boot_catchup_plan(
+            _now_et,
+            {mc.name: (_load_model_state(mc.name) or {}) for mc in _models},
+            {mc.name for mc in _models if str(getattr(mc, "exec_style", "") or "") == "auction"},
+        )
+        bot_status["boot_catchup"] = _plan
+        if _plan.get("auction"):
+            scheduler.add_job(run_trading_pipeline,
+                              DateTrigger(run_date=_now_et + timedelta(seconds=10)),
+                              id="catchup_auction", name="Boot catch-up: auction stage",
+                              kwargs={"stage": "auction"})
+            logger.warning(f"BOOT CATCH-UP: re-firing the auction stage in 10 s — {_plan['reasons']}")
+        if _plan.get("main"):
+            scheduler.add_job(run_trading_pipeline,
+                              DateTrigger(run_date=_now_et + timedelta(seconds=60)),
+                              id="catchup_main", name="Boot catch-up: main run")
+            logger.warning(f"BOOT CATCH-UP: re-firing the main run in 60 s — {_plan['reasons']}")
+    except Exception as e:
+        logger.error(f"boot catch-up check failed (non-fatal): {e}")
 
     next_run = scheduler.get_job("trading_pipeline").next_run_time
     # ISO with explicit offset ("2026-07-22T09:35:00-04:00") — str() produced
