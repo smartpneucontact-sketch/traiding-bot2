@@ -468,3 +468,56 @@ and dot-form symbols are handled; a SlotFailures run whose failed slot is
 the auction slot never reads as a full run. Tests: 370; two tests that
 depended on the wall clock (one hung the suite before 09:20 ET) are
 pinned.
+
+## 2026-10-16 (05:00 ET) — Auction execution: review round 7 (18 of 19 agents, 21 confirmed / 0 refuted) fixed; one earlier claim corrected
+
+CORRECTION to the 2026-10-16 round-5 entry: the rebalance result DID carry
+the account equity all along — core/alpaca.get_account() writes
+portfolio_value / cash / buying_power into report.data["rebalance"], which
+IS the result dict. The round-5 finding ("shortfall / sticky-floor logic
+dead in production") came from mocks that replaced get_account without
+that side effect; the live Sep 29 records carry portfolio_value (primary
+$88,248.34, Candidate X $110,851.23). The round-5 line and the
+achieved-leverage fallback are harmless and kept. Today's reconciliation
+is expected to land at applied 0.685 / floor 0.799 (primary) and 0.712 /
+0.831 (Candidate X), bookkeeping only.
+
+Round-7 fixes (one cross-cutting critic agent did not run — spend limit):
+- Pre-existing, on today's branch: a gate pass that writes
+  last_rebalance=None (book gated ~flat / full de-lever re-entry request)
+  was overwritten by the runner's merged save with the stale value; the
+  not-due branch now adopts the disk value after the gate pass.
+- Live since the round-6 deploy: the boot catch-up listener recorded EVERY
+  scheduler job (the 60 s scanner grew bot_status each minute, and a
+  single scanner misfire would have turned /ready red until restart). It
+  now records only the catch-up one-shots and is registered only when one
+  was scheduled.
+- The resting-order sweep now ABORTS the rebalance (slot stays due, /ready
+  flags it) when a resting limit order will not cancel or an in-flight
+  market order (the scanner's) does not settle within 20 s, instead of
+  sizing on top of a live order; a failed settle listing is retried; a
+  cancel is counted only on a confirmed terminal state; a failed initial
+  listing (3 tries) proceeds as before the sweep existed.
+- The post-trade equity read no longer overwrites the result's pre-trade
+  cash / buying power.
+- _after_open_et uses the session close (13:00 on early closes): opg
+  orders are terminal after a half-day close.
+- The auction stage checks the submission window before touching the
+  venue, and a dead 'submitting' record is never overwritten by a skip.
+- Venue reconciliation keys "known" orders on every id the record ever
+  held (persistent order_ids + journal rows), so a retry after a failed
+  listing never re-adopts already-finalized orders; only a changed record
+  is re-counted.
+- Recovered anchors use the snapshot's previous close only when the
+  snapshot's daily bar is the record's own session.
+- The auction merge is idempotent (completion-only flow snapshotted once,
+  merged flow rebuilt in place) and re-runs on every measuring pass after
+  the completion, so a late or venue-adopted order reaches the completed
+  run's reconciliation exactly once.
+- A forced re-run after a completed plan is marked
+  auction_rerun_after_completion, not auction_stage_missed; a missed stage
+  carries the stage's own outcome.
+- Lost-stage detection at boot now covers the whole window in which a
+  non-auction rebalance of the due slot will still happen (it stopped at
+  09:50).
+Tests: 388.

@@ -1015,7 +1015,10 @@ def _boot_catchup_plan(now_et, slot_states: dict, auction_slots: set) -> dict:
                 return False      # died before the first POST
             return True
 
-        if (9, 6) <= hm < (9, 50):
+        # Lost-stage detection runs for as long as a NON-auction rebalance of
+        # the due slot will still happen today: the 09:35 cron (boot before
+        # it) or the main replay (review round 7: it used to stop at 09:50).
+        if (9, 6) <= hm and now_et < main_end:
             for name in auction_slots:
                 st = slot_states.get(name) or {}
                 if _usable_stage_record(st.get("auction_stage") or {}):
@@ -1029,13 +1032,16 @@ def _boot_catchup_plan(now_et, slot_states: dict, auction_slots: set) -> dict:
                 if hm < (9, 19):
                     plan["auction"] = True
                     plan["reasons"].append(f"{name}: auction slot due, no stage record today")
-                else:
+                elif hm < (9, 35) or plan["main"]:
                     plan["lost_auction"].append(name)
                     plan["reasons"].append(f"{name}: auction stage window passed with no record — "
                                            f"measurement day lost")
     except Exception as e:
         plan["reasons"].append(f"check errored: {e}")
     return plan
+
+
+_boot_catchup_listener = None
 
 
 def _schedule_boot_catchup(scheduler, now_et, logger) -> dict:
@@ -1073,21 +1079,35 @@ def _schedule_boot_catchup(scheduler, now_et, logger) -> dict:
                                                 "window with no stage record")
             bot_status["auction_skipped_due"] = list(plan["lost_auction"])
 
+    catchup_ids = ("catchup_auction", "catchup_main")
+
     def _mark(event):
+        # ONLY the catch-up one-shots: the 60 s scanner and the crons share
+        # this scheduler (review round 7 — an unfiltered listener grew
+        # bot_status every minute and turned a scanner misfire into a
+        # false /ready problem).
+        jid = str(getattr(event, "job_id", "") or "")
+        if jid not in catchup_ids:
+            return
         try:
             with status_lock:
                 bc = bot_status.get("boot_catchup") or {}
                 key = "missed" if getattr(event, "code", None) == EVENT_JOB_MISSED else "fired"
                 if getattr(event, "exception", None) is not None:
                     key = "missed"
-                bc.setdefault(key, []).append(str(getattr(event, "job_id", "?")))
+                lst = bc.setdefault(key, [])
+                if jid not in lst:
+                    lst.append(jid)
                 bot_status["boot_catchup"] = bc
         except Exception:
             pass
-    try:
-        scheduler.add_listener(_mark, EVENT_JOB_MISSED | EVENT_JOB_ERROR | EVENT_JOB_EXECUTED)
-    except Exception:
-        pass
+    global _boot_catchup_listener
+    _boot_catchup_listener = _mark       # exposed for tests only
+    if plan.get("auction") or plan.get("main"):
+        try:
+            scheduler.add_listener(_mark, EVENT_JOB_MISSED | EVENT_JOB_ERROR | EVENT_JOB_EXECUTED)
+        except Exception:
+            pass
     if plan.get("auction"):
         scheduler.add_job(run_trading_pipeline,
                           DateTrigger(run_date=now_et + timedelta(seconds=10)),
@@ -3374,6 +3394,12 @@ def ready():
             # live at run time) and never completed by a later main run.
             if _mst.get("auction_completion_deferred") == _et_today_iso():
                 problems.append(f"{mc.name}: auction completion deferred today and not yet completed")
+            # A rebalance aborted because orders were still open at the
+            # venue (resting limits that would not cancel / unsettled
+            # in-flight market orders) — review round 7.
+            if _mst.get("rebalance_aborted_open_orders") == _et_today_iso():
+                problems.append(f"{mc.name}: rebalance aborted today — orders still open at the venue; "
+                                f"retry once they settle")
             # A stage that died before submitting (restart) and was then
             # rebalanced via the non-auction path; or no stage record at all
             # on a day the slot rebalanced (review round 6).

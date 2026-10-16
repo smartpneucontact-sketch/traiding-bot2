@@ -496,45 +496,88 @@ def _auction_qty(order: dict, prev_close: float, buy_limit_mult: float = 1.0) ->
 
 def cancel_open_orders(mc: "ModelConfig", logger, exclude_tif: tuple = ("opg",),
                        max_wait: float = 20.0) -> dict:
-    """Cancel every open order of the account except the excluded
-    time-in-force kinds, then wait (bounded) until none is still open.
-    Returns {n_open, n_cancelled, n_still_open, ids}. Never raises."""
-    out = {"n_open": 0, "n_cancelled": 0, "n_still_open": 0, "ids": []}
-    try:
-        open_orders = alpaca_request("GET", "v2/orders?status=open&limit=500", mc, logger=logger) or []
-    except Exception as e:
-        logger.warning(f"  open-order list failed: {e}")
+    """Before a live rebalance sizes its deltas: cancel every resting
+    non-opg LIMIT order (a dead rebalance leaves DAY limit orders behind),
+    wait — without cancelling — for any in-flight MARKET order (the cut-
+    loss scanner's) to settle, and confirm each cancel's terminal state.
+
+    Returns {n_open, n_cancel_requested, n_cancelled, n_filled_in_race,
+    n_still_open, n_inflight_market, n_inflight_unsettled,
+    settle_unverified, listing_failed, ids}. Never raises. The caller
+    aborts the rebalance when anything is still open or unverified
+    (review rounds 6-7): sizing from positions alone on top of a live
+    order is exactly the double-submit this guards against."""
+    out = {"n_open": 0, "n_cancel_requested": 0, "n_cancelled": 0, "n_filled_in_race": 0,
+           "n_still_open": 0, "n_inflight_market": 0, "n_inflight_unsettled": 0,
+           "settle_unverified": False, "listing_failed": False, "ids": []}
+    open_orders = None
+    for attempt in range(3):
+        try:
+            open_orders = alpaca_request("GET", "v2/orders?status=open&limit=500", mc, logger=logger) or []
+            break
+        except Exception as e:
+            logger.warning(f"  open-order list failed (attempt {attempt + 1}/3): {e}")
+            if attempt < 2:
+                time.sleep(1.0)
+    if open_orders is None:
+        # Unknown venue state: proceed as before the sweep existed (a
+        # resting order needs an interrupted run AND this failure).
+        out["listing_failed"] = True
         return out
-    # Only LIMIT orders: a dead rebalance leaves resting DAY limit orders,
-    # while the cut-loss scanner's in-flight orders are MARKET orders that
-    # fill within seconds and must never be cancelled from under it.
-    targets = [o for o in (open_orders if isinstance(open_orders, list) else [])
-               if str(o.get("time_in_force") or "") not in exclude_tif and o.get("id")
-               and str(o.get("type") or "") in ("limit", "stop_limit")]
+    orders = [o for o in (open_orders if isinstance(open_orders, list) else [])
+              if o.get("id") and str(o.get("time_in_force") or "") not in exclude_tif]
+    targets = [o for o in orders if str(o.get("type") or "") in ("limit", "stop_limit")]
+    inflight = [o for o in orders if str(o.get("type") or "") in ("market", "stop")]
     out["n_open"] = len(targets)
-    if not targets:
+    out["n_inflight_market"] = len(inflight)
+    if not targets and not inflight:
         return out
-    logger.warning(f"  {len(targets)} resting non-opg order(s) found before the rebalance — cancelling")
+    if targets:
+        logger.warning(f"  {len(targets)} resting non-opg limit order(s) found before the rebalance — cancelling")
+    if inflight:
+        logger.warning(f"  {len(inflight)} in-flight market order(s) (scanner?) — waiting for them to settle")
     for o in targets:
         try:
             alpaca_request("DELETE", f"v2/orders/{o['id']}", mc, logger=logger)
-            out["n_cancelled"] += 1
+            out["n_cancel_requested"] += 1
             out["ids"].append(o["id"])
         except Exception as e:
             logger.warning(f"  cancel {o.get('symbol')} ({o['id']}) failed: {e}")
+    target_ids = {o["id"] for o in targets}
+    inflight_ids = {o["id"] for o in inflight}
+    wait_ids = target_ids | inflight_ids
+    still = set(wait_ids)
+    last_ok = False
     deadline = time.monotonic() + max_wait
-    still = targets
     while still and time.monotonic() < deadline:
         time.sleep(1.0)
         try:
             cur = alpaca_request("GET", "v2/orders?status=open&limit=500", mc, logger=None) or []
             cur_ids = {o.get("id") for o in (cur if isinstance(cur, list) else [])}
-            still = [o for o in targets if o["id"] in cur_ids]
+            still = {i for i in wait_ids if i in cur_ids}
+            last_ok = True
         except Exception:
-            break
-    out["n_still_open"] = len(still)
+            last_ok = False      # retry until the deadline instead of trusting a stale list
+            continue
+    out["n_still_open"] = len(still & target_ids)
+    out["n_inflight_unsettled"] = len(still & inflight_ids)
+    out["settle_unverified"] = bool(still) and not last_ok
+    # Count a cancel only when it took effect (an order can fill in the
+    # cancel race — review round 7).
+    for oid in target_ids - still:
+        try:
+            st = alpaca_request("GET", f"v2/orders/{oid}", mc, logger=None) or {}
+            status = str(st.get("status") or "")
+            if status in ("canceled", "expired"):
+                out["n_cancelled"] += 1
+            elif status in ("filled", "partially_filled"):
+                out["n_filled_in_race"] += 1
+        except Exception:
+            pass
     if still:
-        logger.error(f"  {len(still)} order(s) still open after cancel — sizing may double-count them")
+        logger.error(f"  {out['n_still_open']} resting / {out['n_inflight_unsettled']} in-flight order(s) "
+                     f"still open after {max_wait:.0f}s"
+                     f"{' (last listing failed — unverified)' if out['settle_unverified'] else ''}")
     return out
 
 
@@ -1047,15 +1090,30 @@ def rebalance_portfolio(
         # non-opg open order and wait for it to settle BEFORE reading
         # positions. opg orders are the auction leg and are never touched.
         try:
-            rb_data["open_orders_cancelled"] = cancel_open_orders(mc, logger)
+            sweep = cancel_open_orders(mc, logger)
         except Exception as e:
             logger.warning(f"  open-order sweep failed (non-fatal): {e}")
+            sweep = {"error": str(e)}
+        rb_data["open_orders_cancelled"] = sweep
+        if sweep.get("n_still_open") or sweep.get("n_inflight_unsettled"):
+            # Sizing from positions alone on top of a live order would
+            # double-submit it (review round 7): abort; the slot stays due
+            # and the next run retries once the venue has settled.
+            msg = (f"rebalance aborted: {sweep.get('n_still_open', 0)} resting / "
+                   f"{sweep.get('n_inflight_unsettled', 0)} in-flight order(s) still open at the venue")
+            logger.error(f"  [REBALANCE] {mc.name}: {msg}")
+            report.add_error(msg)
+            rb_data["aborted_open_orders"] = True
+            report.end_step("rebalance")
+            return rb_data
     acct = get_account(mc, logger, report)
     portfolio_value = float(acct["portfolio_value"])
     cash_available = float(acct["cash"])
-    # The gate-state shortfall derivation (core/gate_update.py
-    # _shortfall_from_result) divides the achieved gross by THIS equity;
-    # it was never written into the result before (review round 5).
+    # get_account() already writes portfolio_value / cash / buying_power
+    # into this result (report.data["rebalance"] IS rb_data); kept
+    # explicit so the shortfall derivation (core/gate_update.py) never
+    # depends on that side effect. (The round-5 note that the key was
+    # missing was a mock artefact — corrected 2026-10-16.)
     rb_data["portfolio_value"] = round(portfolio_value, 2)
     current_positions = get_positions(mc, logger)
     rb_data["positions_before"] = len(current_positions)
@@ -1646,7 +1704,9 @@ def rebalance_portfolio(
             # shortfall derivation never divides a post-fill gross by a
             # pre-trade equity (review round 6).
             try:
-                acct_after = get_account(mc, logger, report)
+                # Direct read: get_account() would also overwrite the result's
+                # PRE-trade portfolio_value / cash / buying_power (review round 7).
+                acct_after = alpaca_request("GET", "v2/account", mc, logger=logger) or {}
                 rb_data["portfolio_value_after"] = round(float(acct_after["portfolio_value"]), 2)
             except Exception as e:
                 logger.warning(f"  post-rebalance account read failed (non-fatal): {e}")

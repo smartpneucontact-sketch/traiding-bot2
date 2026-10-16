@@ -80,6 +80,8 @@ def test_rebalance_sweeps_resting_non_opg_orders_before_sizing(tmp_path, monkeyp
         calls.append((method, endpoint))
         if method == "GET" and endpoint.startswith("v2/orders?status=open"):
             return listings.pop(0) if listings else []
+        if method == "GET" and endpoint == "v2/orders/rest1":
+            return {"id": "rest1", "status": "canceled"}
         if method == "DELETE":
             return {}
         if method == "POST" and endpoint == "v2/orders":
@@ -96,7 +98,9 @@ def test_rebalance_sweeps_resting_non_opg_orders_before_sizing(tmp_path, monkeyp
     mc = make_mc(tmp_path, exec_style="market")
     rb = orders_mod.rebalance_portfolio(["AAA"], [("AAA", 1.0)], mc, StubJournal(), logger, RunReport(),
                                         target_weights={"AAA": 0.05})
-    assert rb["open_orders_cancelled"]["n_open"] == 1 and rb["open_orders_cancelled"]["n_cancelled"] == 1
+    sw = rb["open_orders_cancelled"]
+    assert sw["n_open"] == 1 and sw["n_cancel_requested"] == 1 and sw["n_cancelled"] == 1
+    assert sw["n_inflight_market"] == 1 and sw["n_inflight_unsettled"] == 0 and not rb.get("aborted_open_orders")
     assert ("DELETE", "v2/orders/rest1") in calls and ("DELETE", "v2/orders/opg1") not in calls
     assert ("DELETE", "v2/orders/scan1") not in calls                     # market orders are never swept
     # The sweep precedes the sizing reads and the first POST.
@@ -111,8 +115,13 @@ def test_rebalance_result_carries_same_time_equity(tmp_path, monkeypatch):
         reads.append(1)
         return {"portfolio_value": "100000" if len(reads) == 1 else "98000", "cash": "100000",
                 "buying_power": "200000"}
-    monkeypatch.setattr(orders_mod, "alpaca_request", lambda m, e, mc, data=None, logger=None, **kw:
-                        {"id": "o1", "status": "accepted"} if m == "POST" else [])
+    def fake_request(m, e, mc, data=None, logger=None, **kw):
+        if m == "POST":
+            return {"id": "o1", "status": "accepted"}
+        if m == "GET" and e == "v2/account":
+            return {"portfolio_value": "98000", "cash": "1", "buying_power": "1"}
+        return []
+    monkeypatch.setattr(orders_mod, "alpaca_request", fake_request)
     monkeypatch.setattr(orders_mod, "get_account", fake_account)
     monkeypatch.setattr(orders_mod, "get_positions", lambda mc_, lg: {})
     monkeypatch.setattr(orders_mod, "fetch_snapshots", lambda syms, mc_, lg: {})
@@ -121,7 +130,9 @@ def test_rebalance_result_carries_same_time_equity(tmp_path, monkeypatch):
     _no_sleep(monkeypatch)
     rb = orders_mod.rebalance_portfolio(["AAA"], [("AAA", 1.0)], make_mc(tmp_path, exec_style="market"),
                                         StubJournal(), logger, RunReport(), target_weights={"AAA": 0.05})
+    # The post-trade read never overwrites the PRE-trade account fields (round 7).
     assert rb["portfolio_value"] == 100_000.0 and rb["portfolio_value_after"] == 98_000.0
+    assert len(reads) == 1
     res = {"target_gross_usd": 50_000.0, "portfolio_value": 100_000.0, "portfolio_value_after": 98_000.0}
     m_real, _, _ = _shortfall_from_result(res, gross_pre=1.0, applied_design=1.0, leverage=2.0)
     assert m_real == pytest.approx(50_000.0 / (98_000.0 * 2.0))          # same-time equity preferred
