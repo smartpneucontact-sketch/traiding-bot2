@@ -1083,11 +1083,13 @@ def run_single_model(
                 rec["superseded_by_missed_rebalance"] = True
         elif auction_run_id and state.get("auction_stage_missed_date") != session_iso:
             state.pop("auction_stage_missed_date", None)
-        # Names left untouched because an order was live: kept until a later
-        # rebalance trades without any (review rounds 8-9).
-        if result.get("blocked_symbols"):
-            state["rebalance_blocked_symbols"] = {"date": session_iso,
-                                                  "symbols": list(result.get("blocked_symbols") or [])}
+        # Names left untouched because an order was live, plus live orders on
+        # names outside the plan: kept until a later rebalance trades with
+        # none (review rounds 8-10).
+        live_now = sorted(set(result.get("blocked_symbols") or [])
+                          | set(result.get("live_orders_unplanned") or []))
+        if live_now:
+            state["rebalance_blocked_symbols"] = {"date": session_iso, "symbols": live_now}
         else:
             state.pop("rebalance_blocked_symbols", None)
     if rebalanced:
@@ -1364,7 +1366,14 @@ def _auction_pending_live(state: dict, session_iso: str) -> bool:
     ET). After the open every opg order is terminal and the completion is
     delta-based, so unreadable leftovers never block it (review round 3)."""
     st = state.get("auction_stage") or {}
-    return bool(st.get("date") == session_iso and st.get("pending") and not _after_open_et())
+    if st.get("date") != session_iso or _after_open_et():
+        return False
+    if st.get("pending"):
+        return True
+    # A dead 'submitting' record not yet reconciled with the venue may hide
+    # live opg orders until the open: a main run in the 09:30 minute must
+    # not size a marketable-limit rebalance on top of them (review round 10).
+    return st.get("outcome") == "submitting" and not st.get("recovery_checked")
 
 
 def _panel_open_today(stock_data: dict | None, session_iso: str) -> dict:

@@ -3411,10 +3411,18 @@ def ready():
                                 f"retry once they settle")
             _blk = _mst.get("rebalance_blocked_symbols") or {}
             if _blk.get("symbols"):
-                # Until a later rebalance trades without any (round 9).
-                inv_warnings_extra.append(f"{mc.name}: {len(_blk['symbols'])} name(s) not traded at the "
-                                          f"{_blk.get('date')} rebalance (live orders) — re-run the slot "
-                                          f"once they settle: {_blk['symbols'][:8]}")
+                # Until a later rebalance trades without any (round 9). The
+                # dashboard's re-run is a FORCE run that overrides a re-entry
+                # cool-down: never advise it while the risk layer holds the
+                # book flat (review round 10).
+                _today = _et_today_iso()
+                _held_flat = (_mst.get("portfolio_stop_tripped_date") in (_today, datetime.now().strftime("%Y-%m-%d"))
+                              or (_mst.get("reentry_cooldown_until") and _today <= str(_mst.get("reentry_cooldown_until")))
+                              or bool((_mst.get("freeze_state") or {}).get("active")))
+                _advice = ("moot while a stop / cool-down / freeze holds the book — do NOT force a re-run"
+                           if _held_flat else "re-run the slot once they settle")
+                inv_warnings_extra.append(f"{mc.name}: {len(_blk['symbols'])} name(s) with live orders at the "
+                                          f"{_blk.get('date')} rebalance — {_advice}: {_blk['symbols'][:8]}")
             if str(getattr(mc, "exec_style", "") or "") == "auction":
                 # Persisted by the runner: survives a restart (round 8).
                 if _mst.get("auction_stage_missed_date") == _et_today_iso():

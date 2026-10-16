@@ -1175,6 +1175,17 @@ def rebalance_portfolio(
                    f"at the venue: {skipped_names[:10]}")
             logger.warning(f"  [REBALANCE] {mc.name}: {msg}")
             report.add_warning(msg)
+        # A live order on a name OUTSIDE the plan (e.g. a stale resting buy
+        # that would not cancel) is reported too, so the alarm never goes
+        # quiet while something unplanned can still fill (review round 10).
+        planned_dash = {str(y).replace(".", "-") for y in planned_before}
+        unplanned = sorted(x for x in blocked_symbols if x not in planned_dash)
+        if unplanned:
+            rb_data["live_orders_unplanned"] = unplanned
+            msg = (f"{len(unplanned)} order(s) still live at the venue on name(s) outside the plan: "
+                   f"{unplanned[:10]}")
+            logger.warning(f"  [REBALANCE] {mc.name}: {msg}")
+            report.add_warning(msg)
         if planned_before and not (to_sell or to_buy or to_hold):
             if completing_plan:
                 # The auction leg already traded the book: an all-blocked

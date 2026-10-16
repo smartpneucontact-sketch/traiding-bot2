@@ -577,3 +577,20 @@ Tests: 398.
   next scheduled rebalance corrects them; this needs a live order on a
   planned name at 09:35 on a rebalance day (rare).
 Tests: 404.
+
+## 2026-10-16 (06:20 ET) — Narrow verification round 10 (4 agents, 3 confirmed / 2 refuted; regression critic: none) fixed
+
+- A dead 'submitting' record not yet reconciled with the venue now counts as
+  live auction orders until 09:31 ET, so a main run in the 09:30 minute can
+  never size a marketable-limit rebalance on top of hidden opg orders
+  (needs a crash in the sub-second window between an accepted POST and its
+  persist callback, plus a manual run in that minute).
+- A live order on a name outside the plan is reported and keeps the
+  /ready warning up (it was silent and cleared the earlier warning).
+- The live-orders warning never advises the dashboard's forced re-run while
+  a stop, re-entry cool-down or freeze holds the book flat (a forced run
+  overrides the cool-down).
+The regression critic confirmed the normal path (no open orders at the
+venue) trades exactly as before the round-9 changes. Review loop closed for
+now: rounds 9-10 produced no unrefuted defect that can occur without a
+compound failure. Tests: 407.

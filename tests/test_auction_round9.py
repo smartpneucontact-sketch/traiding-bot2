@@ -315,7 +315,7 @@ def test_ready_warns_on_a_failed_venue_reconciliation_and_blocked_names(tmp_path
         monkeypatch.delitem(dashboard.bot_status, k, raising=False)
     monkeypatch.setitem(dashboard.bot_status, "auction_last_run_status", None)
     w = dashboard.app.test_client().get("/ready").get_json()["warnings"]
-    assert any("venue reconciliation failed" in x for x in w) and any("not traded at the" in x for x in w)
+    assert any("venue reconciliation failed" in x for x in w) and any("with live orders at the" in x for x in w)
 
 
 def test_protocol_recons_skip_non_trading_entries(tmp_path, monkeypatch):

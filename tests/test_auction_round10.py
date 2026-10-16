@@ -238,3 +238,73 @@ def test_blocked_residue_warning_persists_until_a_clean_rebalance(tmp_path, monk
     assert load_state(mc)["rebalance_blocked_symbols"]["symbols"] == ["XYZ"]
     runner_mod.run_single_model(mc, _panel([prev]), pd.DataFrame(), macro_data={}, force=True, stage="main")
     assert "rebalance_blocked_symbols" not in load_state(mc)
+
+
+# ───────────── review round 10 regressions ──────────────────────────────
+
+def test_unplanned_live_order_is_reported_and_keeps_the_alarm(tmp_path, monkeypatch):
+    rest = [{"id": "z1", "symbol": "ZZZ", "time_in_force": "day", "type": "limit"}]
+    posted = []
+    _wire(monkeypatch, _broker(rest, posted, delete_fails=99))
+    rb = orders_mod.rebalance_portfolio(["AAA", "BBB"], [("AAA", 1.0), ("BBB", 1.0)],
+                                        make_mc(tmp_path, exec_style="market"), StubJournal(), logger, RunReport(),
+                                        target_weights={"AAA": 0.05, "BBB": 0.05})
+    assert rb["live_orders_unplanned"] == ["ZZZ"] and "blocked_symbols" not in rb
+    assert sorted(p["symbol"] for p in posted) == ["AAA", "BBB"]
+    # The runner keeps the alarm while the unplanned order is live.
+    mc = make_mc(tmp_path / "r", exec_style="marketable_limit", name="combo_v2")
+    _wire_runner(monkeypatch, {"AAA": 1.0}, rebalance_result={"dry_run": False, "live_orders_unplanned": ["ZZZ"]})
+    save_state({"last_rebalance": None, "history": [],
+                "rebalance_blocked_symbols": {"date": "2026-10-15", "symbols": ["XYZ"]}}, mc)
+    runner_mod.run_single_model(mc, _panel([runner_mod._previous_session_iso(_today_ny())]), pd.DataFrame(),
+                                macro_data={}, stage="main")
+    assert load_state(mc)["rebalance_blocked_symbols"]["symbols"] == ["ZZZ"]
+
+
+def test_unreconciled_dead_record_defers_a_main_run_until_the_open(tmp_path, monkeypatch):
+    today = _today_ny()
+    dead = {"auction_stage": {"date": today, "outcome": "submitting", "pending": [], "n_submitted": 0}}
+    monkeypatch.setattr(runner_mod, "_after_open_et", lambda: False)        # 09:30:30 ET
+    assert runner_mod._auction_pending_live(dead, today) is True
+    dead["auction_stage"]["recovery_checked"] = "x"
+    assert runner_mod._auction_pending_live(dead, today) is False
+    monkeypatch.setattr(runner_mod, "_after_open_et", lambda: True)
+    dead["auction_stage"].pop("recovery_checked")
+    assert runner_mod._auction_pending_live(dead, today) is False
+    # End to end: the 09:30 main run does not trade on top of the hidden orders.
+    mc = make_mc(tmp_path)
+    calls = _wire_runner(monkeypatch, {"BBB": 1.0})
+    monkeypatch.setattr(runner_mod, "_after_open_et", lambda: False)
+    monkeypatch.setattr("core.orders.recover_unpersisted_auction_orders", lambda *a, **kw: None)
+    save_state({"last_rebalance": None, "history": [],
+                "auction_stage": {"date": today, "outcome": "submitting", "pending": [], "n_submitted": 0,
+                                  "plan": {"target_symbols": ["AAA"]}}}, mc)
+    runner_mod.run_single_model(mc, _panel([runner_mod._previous_session_iso(today)]), pd.DataFrame(),
+                                macro_data={}, stage="main")
+    st = load_state(mc)
+    assert calls == [] and st["auction_completion_deferred"] == today
+    assert not st["auction_stage"].get("completed_at") and not st.get("auction_stage_missed_date")
+
+
+def test_blocked_warning_never_advises_a_forced_rerun_during_a_cooldown(tmp_path, monkeypatch):
+    import dashboard
+    mc = make_mc(tmp_path, exec_style="marketable_limit", name="combo_v2")
+    state = {"rebalance_blocked_symbols": {"date": "2026-10-14", "symbols": ["ABC"]},
+             "reentry_cooldown_until": "2099-01-01"}
+    monkeypatch.setattr(dashboard.pipeline, "get_active_models", lambda: [mc])
+    monkeypatch.setattr("core.market.is_market_open", lambda now=None: False)
+    monkeypatch.setattr(dashboard, "STATE_DIR", tmp_path)
+    (tmp_path / "x.json").write_text("{}")
+    monkeypatch.setattr(dashboard, "_load_model_state", lambda name: dict(state))
+    monkeypatch.setattr("core.invariants.load_last_status", lambda: None)
+    monkeypatch.setitem(dashboard.bot_status, "last_run_status", "success")
+    monkeypatch.setitem(dashboard.bot_status, "last_run_at", datetime.now(timezone.utc).isoformat())
+    for k in ("skipped_main_run_at", "auction_skipped_due", "last_full_run_at", "boot_catchup"):
+        monkeypatch.delitem(dashboard.bot_status, k, raising=False)
+    monkeypatch.setitem(dashboard.bot_status, "auction_last_run_status", None)
+    c = dashboard.app.test_client()
+    w = [x for x in c.get("/ready").get_json()["warnings"] if "ABC" in x]
+    assert w and "do NOT force a re-run" in w[0] and "re-run the slot once" not in w[0]
+    state.pop("reentry_cooldown_until")
+    w = [x for x in c.get("/ready").get_json()["warnings"] if "ABC" in x]
+    assert w and "re-run the slot once they settle" in w[0]
