@@ -694,3 +694,17 @@ def test_api_status_auction_block_exposes_counts_never_the_raw_pending_list(tmp_
     a = body["models"]["combo_v2_process"]["auction"]
     assert a["n_pending"] == 2 and a["n_orphans"] == 1 and a["completed_at"] == "x"
     assert a["completion_deferred"] == today and "pending" not in a and "plan" not in a
+
+
+def test_shortfall_recovers_equity_from_the_books_leverage_for_old_results():
+    """Sep 29 history results carry no portfolio_value; the book's
+    achieved_gross / achieved_leverage gives the equity back."""
+    from core.gate_update import _shortfall_from_result
+    res = {"target_gross_usd": 176_496.0, "auto_scaled_to_buying_power": True,
+           "reconciliation": {"book": {"achieved_gross_usd": 140_970.0, "achieved_leverage": 1.5974},
+                              "flow": {"fill_rate_notional": 0.99}}}
+    m_real, shortfall, funding = _shortfall_from_result(res, gross_pre=1.1667, applied_design=0.857, leverage=2.0)
+    equity = 140_970.0 / 1.5974
+    assert m_real == pytest.approx(140_970.0 / (equity * 2.0 * 1.1667), rel=1e-4)
+    assert shortfall == pytest.approx(m_real / 0.857, rel=1e-3) and funding is True
+    assert _shortfall_from_result({"target_gross_usd": 1.0, "reconciliation": {"book": {}}}, 1.0, 1.0, 2.0) == (None, None, False)

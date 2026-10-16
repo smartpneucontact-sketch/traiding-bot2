@@ -147,9 +147,20 @@ def _shortfall_from_result(result: dict, gross_pre, applied_design: float,
     try:
         res = result or {}
         recon = res.get("reconciliation") or {}
-        achieved = ((recon.get("book") or {}).get("achieved_gross_usd")
-                    or res.get("target_gross_usd"))
+        book = recon.get("book") or {}
+        achieved = (book.get("achieved_gross_usd") or res.get("target_gross_usd"))
         equity = res.get("portfolio_value")
+        if not equity:
+            # Results written before 2026-10-16 never carried the equity
+            # (review round 5): recover it from the book's own leverage
+            # ratio (achieved_gross / achieved_leverage) so the one-time
+            # reconciliation of the Sep 29 rebalance can still run.
+            try:
+                ag, al = book.get("achieved_gross_usd"), book.get("achieved_leverage")
+                if ag and al and float(al) > 0:
+                    equity = float(ag) / float(al)
+            except Exception:
+                equity = None
         if not (achieved and equity and leverage and gross_pre
                 and float(gross_pre) > 0 and float(equity) > 0
                 and applied_design > 0):
