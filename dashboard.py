@@ -982,8 +982,10 @@ def _boot_catchup_plan(now_et, slot_states: dict, auction_slots: set) -> dict:
     auction: a trading day, 09:06 <= now < 09:19 ET, an auction slot is
     due and has no usable stage record for today (a provisional
     'submitting' record with no orders counts as none).
-    lost_auction: 09:19 <= now < 09:50 ET, an auction slot is due with no
-    usable stage record — too late to re-fire, recorded for /ready."""
+    lost_auction: an auction slot is due with no usable stage record and a
+    NON-auction rebalance of it will still happen today — 09:19 <= now <
+    09:35 ET (the cron will run), or 09:35 <= now < session close - 40 min
+    with a main replay planned. Too late to re-fire; recorded for /ready."""
     plan = {"main": False, "auction": False, "lost_auction": [], "reasons": []}
     try:
         from core.market import US_MARKET_HOLIDAYS, session_close
@@ -2187,7 +2189,10 @@ def api_reconciliation(model_name):
         state = _load_model_state(model_name)
         recs = []
         for entry in state.get("history", []):
-            recon = (entry.get("result") or {}).get("reconciliation")
+            res_ = entry.get("result") or {}
+            if res_.get("aborted_open_orders") or res_.get("skipped_auction_pending"):
+                continue          # not a rebalance (review round 8)
+            recon = res_.get("reconciliation")
             if recon:
                 recs.append({
                     "date": entry.get("date"),
@@ -2556,6 +2561,10 @@ def _protocol_payload(model_name: str) -> Optional[dict]:
         recons = [
             (e.get("result") or {}).get("reconciliation")
             for e in state.get("history", [])
+            # A run that traded nothing is never scored as a rebalance
+            # (review round 8).
+            if not ((e.get("result") or {}).get("aborted_open_orders")
+                    or (e.get("result") or {}).get("skipped_auction_pending"))
         ]
         recons = [r for r in recons if r]
         tracking = _tracking_payload(model_name)  # None-safe for scorer
@@ -3400,6 +3409,19 @@ def ready():
             if _mst.get("rebalance_aborted_open_orders") == _et_today_iso():
                 problems.append(f"{mc.name}: rebalance aborted today — orders still open at the venue; "
                                 f"retry once they settle")
+            _blk = _mst.get("rebalance_blocked_symbols") or {}
+            if _blk.get("date") == _et_today_iso() and _blk.get("symbols"):
+                inv_warnings_extra.append(f"{mc.name}: rebalanced today with {len(_blk['symbols'])} name(s) "
+                                          f"left untouched (live orders): {_blk['symbols'][:8]}")
+            if str(getattr(mc, "exec_style", "") or "") == "auction":
+                # Persisted by the runner: survives a restart (round 8).
+                if _mst.get("auction_stage_missed_date") == _et_today_iso():
+                    problems.append(f"{mc.name}: rebalanced today WITHOUT its opening-auction plan "
+                                    f"(AUCTION1 measurement day lost)")
+                _stg0 = _mst.get("auction_stage") or {}
+                if _stg0.get("date") == _et_today_iso() and _stg0.get("recovery_error"):
+                    inv_warnings_extra.append(f"{mc.name}: auction venue reconciliation failed today "
+                                              f"(retried by the next main run)")
             # A stage that died before submitting (restart) and was then
             # rebalanced via the non-auction path; or no stage record at all
             # on a day the slot rebalanced (review round 6).

@@ -792,6 +792,9 @@ def run_single_model(
         if prev_stage.get("date") != session_iso:
             carry_orphans += list(prev_stage.get("pending") or [])
         outcome = None
+        dead_today = (prev_stage.get("date") == session_iso
+                      and prev_stage.get("outcome") == "submitting")
+        venue_clear = False
         if dry_run:
             logger.info("  AUCTION stage DRY RUN — nothing submitted")
             outcome = "dry_run"
@@ -806,8 +809,8 @@ def run_single_model(
                 "window — skipped; the 09:35 run will rebalance normally.")
             report.add_warning("auction stage skipped: outside submission window")
             outcome = "skipped:window"
-        elif (prev_stage.get("date") == session_iso and prev_stage.get("outcome") == "submitting"
-                and not _venue_clear_for_resubmit(mc, session_iso, prev_stage, logger)):
+        elif (dead_today
+              and not (venue_clear := _venue_clear_for_resubmit(mc, session_iso, prev_stage, logger))):
             # An earlier stage run died mid-submission: unless the venue
             # provably holds NO order of today's book, never submit a second
             # one — the 09:35 run adopts whatever the venue holds. The
@@ -885,6 +888,11 @@ def run_single_model(
                             rec.setdefault("pending", []).append(dict(entry))
                             if entry.get("order_id"):
                                 rec.setdefault("order_ids", []).append(entry["order_id"])
+                            # Running total: survives a finalize that drains
+                            # pending before the venue reconciliation (round 8).
+                            rec["submitted_notional_usd"] = round(
+                                float(rec.get("submitted_notional_usd") or 0)
+                                + float(entry.get("notional_est") or 0), 2)
                             rec["run_id"] = rid
                             rec["n_submitted"] = len(rec["pending"])
                             d["auction_stage"] = rec
@@ -922,8 +930,10 @@ def run_single_model(
                         "order_ids": [p.get("order_id") for p in summ.get("pending", []) if p.get("order_id")],
                         "orphans": carry_orphans,
                     }
-        keep_dead_record = (prev_stage.get("date") == session_iso
-                            and prev_stage.get("outcome") == "submitting")
+        # Keep a dead 'submitting' record for the 09:35 venue
+        # reconciliation — unless the venue was PROVEN clear, in which case
+        # this run's own outcome is the truth (review round 8).
+        keep_dead_record = dead_today and not venue_clear
         if (outcome and outcome not in ("submitted", "skipped:already_submitted",
                                         "skipped:prior_submitting")
                 and not keep_dead_record):
@@ -934,6 +944,8 @@ def run_single_model(
                                       "n_submitted": 0, "n_skipped": 0,
                                       "pending": [], "plan": None,
                                       "orphans": carry_orphans}
+            if dead_today:
+                state["auction_stage"]["replaced_dead_record"] = True
         _stamp_last_run(state, stage, dry_run)
         _save_state_merged(state, mc)
         logger.info(report.format_summary())
@@ -1027,7 +1039,11 @@ def run_single_model(
                 dry_run=dry_run, target_weights=target_weights,
                 run_id=auction_run_id,
             )
-            if isinstance(result, dict) and auction_run_id:
+            if (isinstance(result, dict) and auction_run_id
+                    and not result.get("aborted_open_orders")):
+                # Never merge onto a completion that traded nothing: the
+                # protocol and the gate reader would count it as a funded
+                # rebalance (review round 8).
                 _merge_auction_into_result(result, state.get("auction_stage") or {}, session_iso)
             if isinstance(result, dict) and auction_stage_missed:
                 result["auction_stage_missed"] = True
@@ -1052,6 +1068,16 @@ def run_single_model(
         # Orders still live at the venue: the slot stays due; /ready flags
         # it until a later run rebalances (review round 7).
         state["rebalance_aborted_open_orders"] = session_iso
+    if rebalanced and isinstance(result, dict):
+        if result.get("auction_stage_missed"):
+            # Persisted (not just in-memory) so /ready keeps the lost
+            # measurement day red across a container restart (round 8).
+            state["auction_stage_missed_date"] = session_iso
+        elif auction_run_id:
+            state.pop("auction_stage_missed_date", None)
+        if result.get("blocked_symbols"):
+            state["rebalance_blocked_symbols"] = {"date": session_iso,
+                                                  "symbols": list(result.get("blocked_symbols") or [])}
     if rebalanced:
         state["last_rebalance"] = datetime.now().isoformat()
         state.pop("auction_completion_deferred", None)
@@ -1145,9 +1171,10 @@ def run_single_model(
         "result": {k: v for k, v in result.items()
                    if k not in ("sells_detail", "buys_detail")},
     }
-    if auction_run_id:
+    if auction_run_id and rebalanced:
         # Lets a later finalize pass repair this entry's merged
-        # reconciliation when the auction leg was unmeasured at 09:35.
+        # reconciliation when the auction leg was unmeasured at 09:35
+        # (only for a completion that actually ran — review round 8).
         history_entry["auction_run_id"] = auction_run_id
     # For ml_ranker, `rankings` is (sym, predicted_return); for
     # direct_weights it's (sym, weight). Same dict shape — different
@@ -1445,17 +1472,20 @@ def _finalize_auction_if_any(mc: ModelConfig, state: dict, journal, logger,
                 st["order_ids"] = list(st.get("order_ids") or []) + [e.get("order_id") for e in extra
                                                                      if e.get("order_id")]
             was_submitting = st.get("outcome") == "submitting"
+            ids_all = set(st.get("order_ids") or []) | {p.get("order_id") for p in pending}
+            ids_all.discard(None)
             if was_submitting or extra:
-                # Only a record that changed is re-counted; a fully measured
-                # 'submitted' record keeps its stage-time figures.
-                ids_all = set(st.get("order_ids") or []) | {p.get("order_id") for p in pending}
-                ids_all.discard(None)
+                # Only a record that changed is re-counted. The submitted
+                # notional is a running total (persist callback + adopted
+                # orders), never re-summed from the CURRENT pending list —
+                # a finalize may already have drained it (review round 8).
                 st["n_submitted"] = max(len(ids_all), len(pending))
                 st["submitted_notional_usd"] = round(
-                    float(st.get("submitted_notional_usd") or 0) * (0 if was_submitting else 1)
-                    + sum(float(p.get("notional_est") or 0) for p in (pending if was_submitting else extra)), 2)
+                    float(st.get("submitted_notional_usd") or 0)
+                    + sum(float(p.get("notional_est") or 0) for p in extra), 2)
             if was_submitting:
-                st["outcome"] = "submitted" if pending else "skipped:nothing_submitted"
+                ever_held = bool(ids_all) or int((st.get("summary") or {}).get("n", 0) or 0) > 0
+                st["outcome"] = "submitted" if ever_held else "skipped:nothing_submitted"
                 st["recovered_from_submitting"] = True
             st["n_recovered"] = int(st.get("n_recovered", 0) or 0) + len(extra)
             st["recovery_checked"] = datetime.now(timezone.utc).isoformat()

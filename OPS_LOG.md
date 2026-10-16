@@ -521,3 +521,35 @@ Round-7 fixes (one cross-cutting critic agent did not run — spend limit):
   non-auction rebalance of the due slot will still happen (it stopped at
   09:50).
 Tests: 388.
+
+## 2026-10-16 (05:45 ET) — Compact review round 8 (7 agents, 8 confirmed / 2 refuted) fixed
+
+The walk-through of today's runs (09:06 stage with no slot due; 09:35 gate
+passes with the one-time reconciliation; process slot not due) found
+nothing that affects today. No slot is due before 2026-10-28, so the
+resting-order sweep does not run today.
+- MAJOR (my round-7 design): one unsettled order (e.g. the scanner's market
+  sell on a halted name) aborted the WHOLE book with no same-day retry; on
+  an auction day it would have left the book half-rebalanced. The guard is
+  now per-symbol: names with a live order at the venue are left untouched
+  this run and the rest of the book is rebalanced (rebalance_blocked_symbols
+  -> /ready warning). Only when every planned order is blocked is the run
+  aborted (slot stays due, /ready problem). Any non-limit open order type
+  (market, stop, trailing_stop, unknown) is waited on and blocks its name;
+  the bot never cancels a non-limit order.
+- An aborted completion no longer receives the auction merge (it would have
+  entered history as a funded rebalance with an auction-only fill rate);
+  the protocol scorer, /api/reconciliation and the gate's last-funded
+  reader skip aborted and deferred entries; auction_run_id is stamped on
+  history only for a completion that ran.
+- A dead 'submitting' record keeps a running submitted notional (persist
+  callback) and its outcome is decided from every order it ever held, so a
+  retry after a failed listing no longer turns an executed morning into
+  'nothing submitted / $0'.
+- A dead record is replaced by the stage's own outcome when the venue was
+  proven clear (replaced_dead_record), instead of masquerading as "died
+  before submitting".
+- The lost-measurement-day alarm is persisted (auction_stage_missed_date)
+  so it survives a container restart; a failed venue reconciliation today
+  is a /ready warning.
+Tests: 398.

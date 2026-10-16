@@ -193,7 +193,8 @@ def _last_funded_rebalance(history: list) -> dict:
     reconciliation and the target-weight book drawdown (review 2026-10-15)."""
     for h in reversed(history or []):
         res = h.get("result") or {}
-        if res.get("dry_run") or res.get("skipped_market_closed") or res.get("skipped_portfolio_stop"):
+        if (res.get("dry_run") or res.get("skipped_market_closed") or res.get("skipped_portfolio_stop")
+                or res.get("skipped_auction_pending") or res.get("aborted_open_orders")):
             continue
         if res.get("target_gross_usd") or res.get("reconciliation"):
             return h

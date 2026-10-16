@@ -128,7 +128,7 @@ def test_sweep_aborts_the_rebalance_when_a_resting_order_will_not_cancel(tmp_pat
     assert not [c for c in calls if c[0] == "POST"]                      # never sized on top of the live order
 
 
-def test_sweep_waits_for_inflight_market_orders_and_aborts_if_unsettled(tmp_path, monkeypatch):
+def test_sweep_waits_for_inflight_market_orders_and_blocks_only_their_symbol(tmp_path, monkeypatch):
     mkt = {"id": "scan1", "symbol": "CCC", "time_in_force": "day", "type": "market"}
     # Settles on the second re-listing -> the rebalance proceeds; the market order is NEVER cancelled.
     fake, calls = _sweep_broker([[mkt], [mkt], []])
@@ -138,14 +138,30 @@ def test_sweep_waits_for_inflight_market_orders_and_aborts_if_unsettled(tmp_path
                                         StubJournal(), logger, RunReport(), target_weights={"AAA": 0.05})
     assert not rb.get("aborted_open_orders") and ("DELETE", "v2/orders/scan1") not in calls
     assert rb["open_orders_cancelled"]["n_inflight_market"] == 1
-    # Never settles inside the wait -> abort.
+    # Never settles inside the wait: only CCC is blocked (review round 8) — AAA still trades.
     clock = [0.0]
     monkeypatch.setattr(orders_mod.time, "monotonic", lambda: clock.__setitem__(0, clock[0] + 5.0) or clock[0])
-    fake2, calls2 = _sweep_broker([[mkt]] * 50)
+
+    class Stuck(list):
+        def pop(self, i=-1):
+            return [dict(mkt)]
+    fake2, calls2 = _sweep_broker(Stuck([None]))
     monkeypatch.setattr(orders_mod, "alpaca_request", fake2)
     rb2 = orders_mod.rebalance_portfolio(["AAA"], [("AAA", 1.0)], make_mc(tmp_path, exec_style="market"),
                                          StubJournal(), logger, RunReport(), target_weights={"AAA": 0.05})
-    assert rb2["aborted_open_orders"] is True and rb2["open_orders_cancelled"]["n_inflight_unsettled"] == 1
+    assert not rb2.get("aborted_open_orders") and rb2["blocked_symbols"] == ["CCC"]
+    assert any(c[0] == "POST" for c in calls2)                           # AAA was traded
+    # The plan's own name has the live order: nothing tradeable -> abort.
+    mkt_aaa = dict(mkt, symbol="AAA")
+
+    class StuckAAA(list):
+        def pop(self, i=-1):
+            return [dict(mkt_aaa)]
+    fake3, calls3 = _sweep_broker(StuckAAA([None]))
+    monkeypatch.setattr(orders_mod, "alpaca_request", fake3)
+    rb3 = orders_mod.rebalance_portfolio(["AAA"], [("AAA", 1.0)], make_mc(tmp_path, exec_style="market"),
+                                         StubJournal(), logger, RunReport(), target_weights={"AAA": 0.05})
+    assert rb3["aborted_open_orders"] is True and not any(c[0] == "POST" for c in calls3)
 
 
 def test_sweep_settle_listing_failure_is_retried_and_counts_terminal_states(tmp_path, monkeypatch):
